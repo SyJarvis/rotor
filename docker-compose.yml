@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  rotor:
+    build: .
+    container_name: rotor
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://rotor:rotor@db:5432/rotor
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  db:
+    image: postgres:15-alpine
+    container_name: rotor-db
+    environment:
+      - POSTGRES_USER=rotor
+      - POSTGRES_PASSWORD=rotor
+      - POSTGRES_DB=rotor
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
