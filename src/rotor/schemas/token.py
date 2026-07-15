@@ -6,9 +6,9 @@ from datetime import datetime
 class TokenBase(BaseModel):
     """Base token schema."""
     key: str = Field(..., description="API token key", min_length=10)
-    name: str = Field(..., description="Token name")
+    name: str = Field(..., min_length=1, max_length=100, description="Token name")
     user_id: Optional[str] = Field(None, description="User ID")
-    quota: Optional[int] = Field(None, description="Token quota (null = unlimited)")
+    quota: Optional[int] = Field(None, ge=0, description="Token quota (null = unlimited)")
     group: str = Field(default="default", description="User group")
     allowed_channels: Optional[List[int]] = Field(None, description="Allowed channel IDs")
     enabled: bool = Field(default=True, description="Enable status")
@@ -23,9 +23,9 @@ class TokenCreate(TokenBase):
 class TokenUpdate(BaseModel):
     """Schema for updating a token."""
     key: Optional[str] = None
-    name: Optional[str] = None
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
     user_id: Optional[str] = None
-    quota: Optional[int] = None
+    quota: Optional[int] = Field(None, ge=0)
     group: Optional[str] = None
     allowed_channels: Optional[List[int]] = None
     enabled: Optional[bool] = None

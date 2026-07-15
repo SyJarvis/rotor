@@ -5,14 +5,14 @@ from datetime import datetime
 
 class ChannelBase(BaseModel):
     """Base channel schema."""
-    name: str = Field(..., description="Channel name")
-    type: str = Field(..., description="Provider type")
-    key: str = Field(..., description="API Key")
-    base_url: str = Field(..., description="Base URL")
+    name: str = Field(..., min_length=1, max_length=100, description="Channel name")
+    type: str = Field(..., min_length=1, max_length=50, description="Provider type")
+    key: str = Field(..., min_length=1, max_length=500, description="API Key")
+    base_url: str = Field(..., min_length=1, max_length=500, description="Base URL")
     models: List[str] = Field(default_factory=list, description="Available models")
     model_mapping: Dict[str, str] = Field(default_factory=dict, description="Model name mapping")
-    priority: int = Field(default=1, description="Channel priority")
-    weight: int = Field(default=1, description="Channel weight")
+    priority: int = Field(default=1, ge=0, description="Channel priority")
+    weight: int = Field(default=1, ge=1, description="Channel weight")
     enabled: bool = Field(default=True, description="Enable status")
     test_only: bool = Field(default=False, description="Test only flag")
     protocol: str = Field(default="openai", description="Protocol type")
@@ -28,14 +28,14 @@ class ChannelCreate(ChannelBase):
 
 class ChannelUpdate(BaseModel):
     """Schema for updating a channel."""
-    name: Optional[str] = None
-    type: Optional[str] = None
-    key: Optional[str] = None
-    base_url: Optional[str] = None
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    type: Optional[str] = Field(None, min_length=1, max_length=50)
+    key: Optional[str] = Field(None, min_length=1, max_length=500)
+    base_url: Optional[str] = Field(None, min_length=1, max_length=500)
     models: Optional[List[str]] = None
     model_mapping: Optional[Dict[str, str]] = None
-    priority: Optional[int] = None
-    weight: Optional[int] = None
+    priority: Optional[int] = Field(None, ge=0)
+    weight: Optional[int] = Field(None, ge=1)
     enabled: Optional[bool] = None
     test_only: Optional[bool] = None
     protocol: Optional[str] = None
@@ -69,6 +69,7 @@ class ChannelListItem(BaseModel):
     weight: int
     models: List[str]
     protocol: str
+    extra: Dict[str, Any]
     total_requests: int
     success_requests: int
     failed_requests: int

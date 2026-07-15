@@ -75,16 +75,17 @@ class LoadBalancer:
         Returns:
             Selected channel
         """
-        total_weight = sum(ch.weight for ch in channels)
-        if total_weight == 0:
+        weights = [max(ch.weight, 0) for ch in channels]
+        total_weight = sum(weights)
+        if total_weight <= 0:
             return random.choice(channels)
 
         # Weighted random selection
         rand = random.uniform(0, total_weight)
         current = 0
 
-        for channel in channels:
-            current += channel.weight
+        for channel, weight in zip(channels, weights):
+            current += weight
             if rand <= current:
                 return channel
 

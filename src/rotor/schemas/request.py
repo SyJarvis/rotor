@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List, Dict, Any, Union, Literal
 from enum import Enum
 
@@ -61,6 +61,9 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Union[Literal["none", "auto", "required"], Dict]] = None
     user: Optional[str] = None
+    # Preserve protocol-native fields when an Anthropic request is routed to
+    # an Anthropic upstream. Excluded from generic provider serialization.
+    anthropic_payload: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
 
 
 class Usage(BaseModel):
@@ -179,7 +182,7 @@ class AnthropicMessageRequest(BaseModel):
     model: str
     messages: List[AnthropicMessage]
     max_tokens: int
-    system: Optional[str] = None
+    system: Optional[Union[str, List[Dict[str, Any]]]] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
@@ -187,6 +190,51 @@ class AnthropicMessageRequest(BaseModel):
     stream: Optional[bool] = False
     tools: Optional[List[AnthropicToolDefinition]] = None
     tool_choice: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_system_messages(cls, data: Any) -> Any:
+        """Move non-standard messages[].role=system entries to top-level system."""
+        if not isinstance(data, dict):
+            return data
+
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return data
+
+        system_messages = [
+            message
+            for message in messages
+            if isinstance(message, dict) and message.get("role") == "system"
+        ]
+        if not system_messages:
+            return data
+
+        normalized = dict(data)
+        normalized["messages"] = [
+            message
+            for message in messages
+            if not (isinstance(message, dict) and message.get("role") == "system")
+        ]
+
+        system_blocks: List[Dict[str, Any]] = []
+
+        def append_system_content(content: Any) -> None:
+            if isinstance(content, str):
+                if content:
+                    system_blocks.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                system_blocks.extend(
+                    block for block in content if isinstance(block, dict)
+                )
+
+        append_system_content(data.get("system"))
+        for message in system_messages:
+            append_system_content(message.get("content"))
+
+        normalized["system"] = system_blocks or None
+        return normalized
 
 
 class AnthropicUsage(BaseModel):
