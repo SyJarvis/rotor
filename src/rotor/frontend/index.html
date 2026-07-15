@@ -1,136 +1,166 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Rotor 管理控制台</title>
-    <link rel="stylesheet" href="/styles.css?v=3">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+    <link rel="stylesheet" href="/styles.css?v=8">
+    <script>
+      // FOUC guard — must run before body paints.
+      (function () {
+        try {
+          var saved = localStorage.getItem("rotor.theme");
+          var dark = saved
+            ? saved === "dark"
+            : window.matchMedia("(prefers-color-scheme: dark)").matches;
+          document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+        } catch (e) {}
+      })();
+    </script>
+    <script
+      src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"
+      onerror="window.__chartFailed=true"
+      defer
+    ></script>
+    <script
+      src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"
+      onerror="window.__lucideFailed=true"
+      defer
+    ></script>
   </head>
   <body>
-    <header class="topbar">
-      <div>
-        <h1 data-i18n="pageTitle">Rotor 管理控制台</h1>
-        <p data-i18n="subtitle">模型渠道、API Key、用量与请求日志</p>
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">◆</div>
+          <div class="brand-text">
+            <strong>Rotor</strong>
+            <span>LLM Gateway</span>
+          </div>
+        </div>
+        <nav class="nav" aria-label="Sections">
+          <button class="nav-item active" data-tab="overview">
+            <i data-lucide="layout-dashboard"></i><span data-i18n="overview">接入信息</span>
+          </button>
+          <button class="nav-item" data-tab="channels">
+            <i data-lucide="layers"></i><span data-i18n="channels">模型渠道</span>
+          </button>
+          <button class="nav-item" data-tab="tokens">
+            <i data-lucide="key-round"></i><span data-i18n="apiKeys">API Key</span>
+          </button>
+          <button class="nav-item" data-tab="usage">
+            <i data-lucide="trending-up"></i><span data-i18n="usage">用量统计</span>
+          </button>
+          <button class="nav-item" data-tab="logs">
+            <i data-lucide="scroll-text"></i><span data-i18n="logs">请求日志</span>
+          </button>
+        </nav>
+        <div class="sidebar-footer">
+          <button class="nav-item" id="openSettings" type="button">
+            <i data-lucide="settings"></i><span data-i18n="settings">设置</span>
+          </button>
+          <div class="version-pill">v1.0.0</div>
+        </div>
+      </aside>
+
+      <div class="main">
+        <header class="topbar">
+          <button class="icon-btn menu-toggle" id="menuToggle" aria-label="Menu">
+            <i data-lucide="menu"></i>
+          </button>
+          <h1 class="page-title" id="pageTitle">接入信息</h1>
+          <div class="topbar-actions">
+            <div class="search-box" id="searchBox" hidden>
+              <i data-lucide="search"></i>
+              <input id="searchInput" placeholder="搜索..." data-i18n-placeholder="search">
+            </div>
+            <button class="icon-btn" id="refreshBtn" title="刷新">
+              <i data-lucide="refresh-cw"></i>
+            </button>
+            <button class="icon-btn" id="themeToggle" title="切换主题">
+              <i data-lucide="sun-moon"></i>
+            </button>
+            <button class="icon-btn" id="localeToggle" title="Language">
+              <span id="localeLabel">EN</span>
+            </button>
+          </div>
+        </header>
+
+        <main class="content" id="content">
+          <section id="overview" class="panel active"></section>
+          <section id="channels" class="panel"></section>
+          <section id="tokens" class="panel"></section>
+          <section id="usage" class="panel"></section>
+          <section id="logs" class="panel"></section>
+        </main>
       </div>
-      <button id="toggleLocale" class="secondary" data-i18n="language">English</button>
-    </header>
+    </div>
 
-    <main class="layout">
-      <nav class="tabs" aria-label="Admin sections">
-        <button class="tab active" data-tab="overview" data-i18n="overview">接入信息</button>
-        <button class="tab" data-tab="channels" data-i18n="channels">模型渠道</button>
-        <button class="tab" data-tab="tokens" data-i18n="apiKeys">API Key</button>
-        <button class="tab" data-tab="usage" data-i18n="usage">用量统计</button>
-        <button class="tab" data-tab="logs" data-i18n="logs">请求日志</button>
-      </nav>
+    <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
-      <section id="notice" class="notice hidden"></section>
-
-      <section id="overview" class="panel active">
-        <div class="panel-head">
-          <div>
-            <h2 data-i18n="gatewayTitle">统一 API 入口</h2>
-            <p data-i18n="gatewayDescription">使用 Rotor 创建的 API Key，即可通过以下兼容协议调用已接入的模型。</p>
-          </div>
-        </div>
-        <div class="gateway-base">
-          <span data-i18n="baseUrl">服务地址</span>
-          <code id="gatewayBaseUrl"></code>
-          <button class="secondary copy-button" data-copy-target="gatewayBaseUrl">复制</button>
-        </div>
-        <div id="gatewayEndpoints" class="endpoint-list"></div>
-      </section>
-
-      <section id="channels" class="panel">
-        <div class="panel-head">
-          <div>
-            <h2 data-i18n="channels">模型渠道</h2>
-            <p data-i18n="channelsDescription">管理上游服务的 API Key、模型和分发规则。</p>
-          </div>
-          <div class="actions">
-            <button id="refreshChannels" class="secondary" data-i18n="refresh">刷新</button>
-            <button id="openChannelModal" data-i18n="addChannel">新增渠道</button>
-          </div>
-        </div>
-        <div id="channelTestResult" class="inline-result hidden"></div>
-        <div id="channelsTable" class="table"></div>
-      </section>
-
-      <section id="tokens" class="panel">
-        <div class="panel-head">
-          <div>
-            <h2 data-i18n="createKey">创建 API Key</h2>
-            <p data-i18n="keyDescription">该 Key 用于客户端调用 Rotor 的统一 API，不是上游服务的 Key。</p>
-          </div>
-          <button id="refreshTokens" class="secondary" data-i18n="refresh">刷新</button>
-        </div>
-        <form id="tokenForm" class="grid-form compact">
-          <input name="name" data-i18n-placeholder="keyName" placeholder="Key 名称" required>
-          <input name="user_id" data-i18n-placeholder="userOptional" placeholder="用户标识（可选）">
-          <input name="quota" type="number" data-i18n-placeholder="quotaOptional" placeholder="配额（可选）">
-          <input name="allowed_channels" data-i18n-placeholder="allowedChannels" placeholder="允许的渠道 ID，逗号分隔（留空表示全部）">
-          <button type="submit" data-i18n="generateKey">生成 Key</button>
-        </form>
-        <div id="tokensTable" class="table"></div>
-      </section>
-
-      <section id="usage" class="panel">
-        <div class="panel-head">
-          <h2 data-i18n="usage">用量统计</h2>
-          <button id="refreshUsage" class="secondary" data-i18n="refresh">刷新</button>
-        </div>
-        <div id="usageCards" class="cards"></div>
-      </section>
-
-      <section id="logs" class="panel">
-        <div class="panel-head">
-          <h2 data-i18n="logs">请求日志</h2>
-          <button id="refreshLogs" class="secondary" data-i18n="refresh">刷新</button>
-        </div>
-        <div id="logsTable" class="table"></div>
-      </section>
-    </main>
-
-    <div id="channelModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="channelModalTitle">
+    <div class="modal hidden" id="channelModal" role="dialog" aria-modal="true" aria-labelledby="channelModalTitle">
+      <div class="modal-backdrop" data-close-modal></div>
       <div class="modal-panel">
-        <div class="modal-head">
+        <header class="modal-head">
           <div>
             <h2 id="channelModalTitle" data-i18n="addChannelTitle">新增模型渠道</h2>
             <p data-i18n="addChannelDescription">配置一个上游 API Key 及其可用模型。</p>
           </div>
-          <button id="closeChannelModal" class="secondary" type="button" data-i18n="close">关闭</button>
-        </div>
+          <button class="icon-btn" id="closeChannelModal" aria-label="Close">
+            <i data-lucide="x"></i>
+          </button>
+        </header>
         <form id="channelForm" class="modal-form">
-          <label>
-            <span data-i18n="name">名称</span>
-            <input name="name" placeholder="deepseek-main" required>
-          </label>
-          <label>
-            <span data-i18n="provider">服务商</span>
-            <select name="type">
-              <option value="openai">OpenAI-compatible</option>
-              <option value="anthropic">Anthropic</option>
-              <option value="moonshot">Moonshot</option>
-              <option value="minimax">MiniMax</option>
-              <option value="zhipu">Zhipu</option>
-              <option value="kimi">Kimi</option>
-            </select>
-          </label>
-          <label>
-            <span data-i18n="upstreamBaseUrl">上游 Base URL</span>
-            <input name="base_url" placeholder="https://api.deepseek.com" required>
-          </label>
-          <label>
-            <span data-i18n="upstreamApiKey">上游 API Key</span>
-            <input name="key" type="password" placeholder="provider api key" required>
-          </label>
-          <div class="form-row">
+          <div class="form-grid">
+            <label>
+              <span data-i18n="name">名称</span>
+              <input name="name" placeholder="deepseek-main" required>
+            </label>
+            <label>
+              <span data-i18n="provider">服务商</span>
+              <select name="type">
+                <option value="openai">OpenAI-compatible</option>
+                <option value="deepseek">DeepSeek</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="moonshot">Moonshot</option>
+                <option value="minimax">MiniMax</option>
+                <option value="zhipu">Zhipu</option>
+                <option value="kimi">Kimi</option>
+              </select>
+            </label>
+            <label class="span-2">
+              <span data-i18n="upstreamBaseUrl">上游 Base URL</span>
+              <input name="base_url" placeholder="https://api.deepseek.com" required>
+            </label>
+            <label class="span-2">
+              <span data-i18n="upstreamApiKey">上游 API Key</span>
+              <input name="key" type="password" placeholder="provider api key" required>
+            </label>
             <label>
               <span data-i18n="protocol">协议</span>
               <select name="protocol">
                 <option value="openai">openai</option>
                 <option value="anthropic">anthropic</option>
               </select>
+            </label>
+            <label>
+              <span data-i18n="authType">鉴权方式</span>
+              <select name="auth_type">
+                <option value="bearer">Bearer Token</option>
+                <option value="x-api-key">x-api-key</option>
+                <option value="api-key">api-key</option>
+              </select>
+            </label>
+            <label>
+              <span data-i18n="modelsPath">模型列表路径</span>
+              <input name="models_path" value="/models" required>
+            </label>
+            <label>
+              <span data-i18n="requestPath">模型调用路径</span>
+              <input name="request_path" value="/chat/completions" required>
             </label>
             <label>
               <span data-i18n="priority">优先级</span>
@@ -140,26 +170,94 @@
               <span data-i18n="weight">权重</span>
               <input name="weight" type="number" value="1">
             </label>
+            <label class="span-2">
+              <span data-i18n="models">模型列表</span>
+              <textarea name="models" placeholder="deepseek-chat, deepseek-reasoner" required></textarea>
+            </label>
+            <label class="span-2">
+              <span data-i18n="modelMapping">模型映射 JSON</span>
+              <textarea name="model_mapping" placeholder='{"public-model": "provider-model"}'></textarea>
+            </label>
+            <label class="span-2">
+              <span data-i18n="extra">附加配置 JSON</span>
+              <textarea name="extra" placeholder='{"capabilities": ["stream"]}'></textarea>
+            </label>
+            <label class="check">
+              <input name="enabled" type="checkbox" checked>
+              <span data-i18n="enabled">启用</span>
+            </label>
           </div>
-          <label>
-            <span data-i18n="models">模型列表</span>
-            <textarea name="models" placeholder="deepseek-chat, deepseek-reasoner" required></textarea>
-          </label>
-          <label>
-            <span data-i18n="modelMapping">模型映射 JSON</span>
-            <textarea name="model_mapping" placeholder='{"public-model": "provider-model"}'></textarea>
-          </label>
-          <label class="check"><input name="enabled" type="checkbox" checked> <span data-i18n="enabled">启用</span></label>
           <div id="probeResult" class="inline-result hidden"></div>
-          <div class="modal-actions">
-            <button id="probeModels" type="button" class="secondary" data-i18n="probeModels">探测模型</button>
-            <button type="submit" data-i18n="saveChannel">保存渠道</button>
-          </div>
+          <footer class="modal-actions">
+            <button type="button" class="btn-secondary" id="probeModels">
+              <i data-lucide="radar"></i><span data-i18n="probeModels">探测模型</span>
+            </button>
+            <button type="submit" class="btn-primary" id="saveChannelBtn">
+              <i data-lucide="check"></i><span data-i18n="saveChannel">保存渠道</span>
+            </button>
+          </footer>
         </form>
       </div>
     </div>
 
-    <script src="/config.js?v=3"></script>
-    <script src="/app.js?v=3"></script>
+    <div class="modal hidden" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
+      <div class="modal-backdrop" data-close-modal></div>
+      <div class="modal-panel settings-modal-panel">
+        <header class="modal-head">
+          <div>
+            <h2 id="settingsModalTitle" data-i18n="settings">设置</h2>
+            <p data-i18n="settingsDescription">配置 Rotor 的运行参数。</p>
+          </div>
+          <button class="icon-btn" data-close-modal aria-label="Close">
+            <i data-lucide="x"></i>
+          </button>
+        </header>
+        <form id="settingsForm">
+          <div class="settings-layout">
+            <nav class="settings-nav" aria-label="Settings sections">
+              <button type="button" class="settings-nav-item active">
+                <i data-lucide="route"></i><span data-i18n="routingSettings">路由设置</span>
+              </button>
+            </nav>
+            <div class="settings-content">
+              <h3 data-i18n="routingSettings">路由设置</h3>
+              <p class="settings-section-description" data-i18n="routingSettingsDescription">
+                控制多个渠道之间的选择方式和会话粘性。
+              </p>
+              <div class="settings-fields">
+                <label>
+                  <span data-i18n="routingStrategy">路由策略</span>
+                  <select name="strategy">
+                    <option value="priority_weighted" data-i18n="strategyPriorityWeighted">优先级 + 权重分摊</option>
+                    <option value="fallback_order" data-i18n="strategyFallbackOrder">固定主备顺序</option>
+                    <option value="weighted" data-i18n="strategyWeighted">全局权重分摊</option>
+                  </select>
+                </label>
+                <label class="setting-toggle">
+                  <span>
+                    <strong data-i18n="affinityEnabled">启用会话亲和</strong>
+                    <small data-i18n="affinityDescription">分摊流量时让相同会话稳定使用同一渠道；固定主备策略不受此项影响。</small>
+                  </span>
+                  <input name="affinity_enabled" type="checkbox">
+                </label>
+                <div class="settings-file">
+                  <span data-i18n="settingsFile">配置文件</span>
+                  <code id="settingsPath">~/.rotor/settings.json</code>
+                </div>
+              </div>
+            </div>
+          </div>
+          <footer class="modal-actions">
+            <button type="button" class="btn-secondary" data-close-modal data-i18n="cancel">取消</button>
+            <button type="submit" class="btn-primary">
+              <i data-lucide="save"></i><span data-i18n="saveSettings">保存设置</span>
+            </button>
+          </footer>
+        </form>
+      </div>
+    </div>
+
+    <script src="/config.js?v=8"></script>
+    <script type="module" src="/app.js?v=8"></script>
   </body>
 </html>

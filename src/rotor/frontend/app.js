@@ -1,169 +1,248 @@
-const $ = (id) => document.getElementById(id);
-let noticeTimer;
-const uiConfig = window.ROTOR_UI_CONFIG;
-let locale = localStorage.getItem("rotor.locale") || uiConfig.defaultLocale;
+// App entry — router, sidebar/topbar wiring, modal, theme/locale listeners.
 
-function t(key) {
-  return key.split(".").reduce((value, part) => value?.[part], uiConfig.locales[locale]) ?? key;
+import { t, applyLocale, toggleLocale } from "./i18n.js";
+import { toggleTheme } from "./theme.js";
+import { api, copyText } from "./api.js";
+import { parseCsv, parseJson, refreshIcons, toast } from "./ui.js";
+import { refreshTheme } from "./charts.js?v=8";
+
+import * as overview from "./pages/overview.js";
+import * as channels from "./pages/channels.js";
+import { editState as channelEditState } from "./pages/channels.js";
+import * as tokens from "./pages/tokens.js?v=8";
+import * as usage from "./pages/usage.js?v=8";
+import * as logs from "./pages/logs.js";
+
+const PAGES = { overview, channels, tokens, usage, logs };
+const TITLES = {
+  overview: () => t("overview"),
+  channels: () => t("channels"),
+  tokens: () => t("apiKeys"),
+  usage: () => t("usage"),
+  logs: () => t("logs"),
+};
+
+let current = "overview";
+let initialized = false;
+let channelPresets = [];
+
+async function loadChannelPresets() {
+  channelPresets = await api("/api/admin/channels/presets");
+  const select = document.getElementById("channelForm")?.elements.type;
+  if (!select) return;
+  const selected = select.value;
+  select.innerHTML = channelPresets.map((preset) =>
+    `<option value="${preset.id}">${preset.label}</option>`
+  ).join("");
+  select.value = channelPresets.some((preset) => preset.id === selected)
+    ? selected
+    : channelPresets[0]?.id || "openai";
+  applyChannelPreset(select.value);
 }
 
-function applyLocale() {
-  document.documentElement.lang = locale;
-  document.title = t("pageTitle");
-  document.querySelectorAll("[data-i18n]").forEach((element) => {
-    element.textContent = t(element.dataset.i18n);
+function applyChannelPreset(provider) {
+  const preset = channelPresets.find((item) => item.id === provider);
+  const form = document.getElementById("channelForm");
+  if (!preset || !form) return;
+  form.elements.base_url.value = preset.base_url;
+  form.elements.protocol.value = preset.protocol;
+  form.elements.models_path.value = preset.models_path;
+  form.elements.request_path.value = preset.request_path;
+  form.elements.auth_type.value = preset.auth_type;
+}
+
+export async function refreshActive() {
+  const page = PAGES[current];
+  if (page) {
+    try { await page.load(); }
+    catch (e) { toast(e.message, "error"); }
+  }
+}
+
+function switchTab(tab) {
+  if (current === tab) return;
+  current = tab;
+  document.querySelectorAll(".nav-item").forEach((el) => {
+    el.classList.toggle("active", el.dataset.tab === tab);
   });
-  document.querySelectorAll("[data-i18n-placeholder]").forEach((element) => {
-    element.placeholder = t(element.dataset.i18nPlaceholder);
+  document.querySelectorAll(".panel").forEach((el) => {
+    el.classList.toggle("active", el.id === tab);
   });
-  renderGatewayEndpoints();
+  const titleEl = document.getElementById("pageTitle");
+  if (titleEl) titleEl.textContent = TITLES[tab]?.() || tab;
+  document.title = `${TITLES[tab]?.()} · Rotor`;
+  refreshActive();
 }
 
-function renderGatewayEndpoints() {
-  const origin = window.location.origin;
-  $("gatewayBaseUrl").textContent = origin;
-  const endpoints = [
-    ["OpenAI Chat Completions", `${origin}/v1/chat/completions`],
-    ["OpenAI Responses", `${origin}/v1/responses`],
-    ["Anthropic Messages", `${origin}/anthropic/v1/messages`],
-    ["Models", `${origin}/v1/models`],
-  ];
-  $("gatewayEndpoints").innerHTML = endpoints.map(([protocol, endpoint]) => `
-    <div class="endpoint-row">
-      <strong>${protocol}</strong>
-      <code>${endpoint}</code>
-      <button class="secondary copy-button" data-copy-value="${endpoint}">${t("copy")}</button>
-    </div>
-  `).join("");
+/* ---------- navigation ---------- */
+document.querySelectorAll(".nav-item").forEach((el) => {
+  el.addEventListener("click", () => switchTab(el.dataset.tab));
+});
+
+document.getElementById("themeToggle")?.addEventListener("click", () => {
+  toggleTheme();
+});
+document.getElementById("localeToggle")?.addEventListener("click", toggleLocale);
+document.getElementById("refreshBtn")?.addEventListener("click", () => refreshActive());
+
+/* ---------- mobile sidebar ---------- */
+const sidebar = document.getElementById("sidebar");
+const menuToggle = document.getElementById("menuToggle");
+let overlay = null;
+function openSidebar() {
+  sidebar?.classList.add("open");
+  overlay = document.createElement("div");
+  overlay.className = "sidebar-overlay";
+  overlay.addEventListener("click", closeSidebar);
+  document.body.appendChild(overlay);
 }
-
-function showNotice(message, isError = false) {
-  const box = $("notice");
-  clearTimeout(noticeTimer);
-  box.textContent = message;
-  box.className = `notice${isError ? " error" : ""}`;
-  noticeTimer = setTimeout(() => box.classList.add("hidden"), 4000);
+function closeSidebar() {
+  sidebar?.classList.remove("open");
+  overlay?.remove();
+  overlay = null;
 }
+menuToggle?.addEventListener("click", () => {
+  sidebar?.classList.contains("open") ? closeSidebar() : openSidebar();
+});
 
-function headers(json = false) {
-  const value = {};
-  if (json) value["Content-Type"] = "application/json";
-  return value;
-}
+/* ---------- global click delegation ---------- */
+document.addEventListener("click", async (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
 
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: {
-      ...headers(Boolean(options.body)),
-      ...(options.headers || {}),
-    },
-  });
+  // copy buttons (overview/tokens share this)
+  const copyBtn = target.closest("[data-copy-value]");
+  if (copyBtn) {
+    const value = copyBtn.dataset.copyValue || "";
+    const ok = await copyText(value);
+    toast(ok ? t("copied") : value, ok ? "success" : "warning");
+    return;
+  }
 
-  if (!response.ok) {
-    const contentType = response.headers.get("content-type") || "";
-    if (contentType.includes("application/json")) {
-      const body = await response.json();
-      const detail = Array.isArray(body.detail)
-        ? body.detail.map((item) => item.msg || JSON.stringify(item)).join("; ")
-        : body.detail;
-      throw new Error(detail || body.message || `${response.status} ${response.statusText}`);
+  // copy by target id
+  const idCopy = target.closest("[data-copy-target]");
+  if (idCopy) {
+    const el = document.getElementById(idCopy.dataset.copyTarget);
+    if (el) {
+      const ok = await copyText(el.textContent || "");
+      toast(ok ? t("copied") : "", ok ? "success" : "warning");
     }
-    const text = await response.text();
-    throw new Error(text || `${response.status} ${response.statusText}`);
+    return;
   }
 
-  if (response.status === 204) return null;
-  return response.json();
-}
+  // modal close
+  const modalClose = target.closest("[data-close-modal]");
+  if (modalClose) {
+    modalClose.closest(".modal")?.classList.add("hidden");
+    return;
+  }
 
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
+  // page-specific handlers
+  for (const page of Object.values(PAGES)) {
+    if (page.onClick && await page.onClick(target)) return;
+  }
+});
 
-function parseCsv(value) {
-  return String(value || "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
+/* ---------- channel modal ---------- */
+const channelModal = document.getElementById("channelModal");
+document.getElementById("channelForm")?.elements.type.addEventListener("change", (event) => {
+  applyChannelPreset(event.target.value);
+});
+document.getElementById("closeChannelModal")?.addEventListener("click", () => {
+  channelModal.classList.add("hidden");
+});
 
-function parseJson(value, fallback) {
-  if (!value || !value.trim()) return fallback;
-  return JSON.parse(value);
-}
+/* ---------- settings modal ---------- */
+const settingsModal = document.getElementById("settingsModal");
+const settingsForm = document.getElementById("settingsForm");
 
-async function copyText(value) {
+async function openSettings() {
+  settingsModal.classList.remove("hidden");
+  closeSidebar();
   try {
-    await navigator.clipboard.writeText(value);
-    return true;
-  } catch {
-    return false;
+    const currentSettings = await api("/api/admin/settings");
+    settingsForm.elements.strategy.value = currentSettings.routing.strategy;
+    settingsForm.elements.affinity_enabled.checked =
+      currentSettings.routing.affinity_enabled;
+    document.getElementById("settingsPath").textContent =
+      currentSettings.settings_path;
+  } catch (error) {
+    settingsModal.classList.add("hidden");
+    toast(error.message, "error");
   }
 }
 
-async function loadChannels() {
-  const channels = await api("/api/admin/channels");
-  const columns = t("columns");
-  $("channelsTable").innerHTML = `
-    <table>
-      <thead>
-        <tr>
-          <th>${columns.name}</th><th>${columns.provider}</th><th>${columns.baseUrl}</th><th>${columns.models}</th>
-          <th>${columns.route}</th><th>${columns.status}</th><th>${columns.requests}</th><th>${columns.actions}</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${channels.map((ch) => `
-          <tr>
-            <td><strong>${escapeHtml(ch.name)}</strong><br><span class="muted">#${ch.id}</span></td>
-            <td>${escapeHtml(ch.type)} / ${escapeHtml(ch.protocol)}</td>
-            <td><code>${escapeHtml(ch.base_url || "")}</code></td>
-            <td><code>${escapeHtml((ch.models || []).join(", "))}</code></td>
-            <td>${t("priority")} ${ch.priority}<br><span class="muted">${t("weight")} ${ch.weight}</span></td>
-            <td>${ch.enabled ? t("enable") : t("disable")}</td>
-            <td>${ch.success_requests || 0}/${ch.total_requests || 0}<br><span class="muted">${ch.failed_requests || 0} ${t("failed")}</span></td>
-            <td>
-              <button class="secondary" data-channel-test="${ch.id}">${t("test")}</button>
-              <button class="secondary" data-channel-toggle="${ch.id}" data-enabled="${ch.enabled}">
-                ${ch.enabled ? t("disable") : t("enable")}
-              </button>
-              <button class="danger" data-channel-delete="${ch.id}">${t("delete")}</button>
-            </td>
-          </tr>
-        `).join("")}
-      </tbody>
-    </table>
-  `;
-}
+document.getElementById("openSettings")?.addEventListener("click", openSettings);
+settingsForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const submitBtn = event.currentTarget.querySelector('button[type="submit"]');
+  if (submitBtn.disabled) return;
+  submitBtn.disabled = true;
+  try {
+    await api("/api/admin/settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        routing: {
+          strategy: settingsForm.elements.strategy.value,
+          affinity_enabled: settingsForm.elements.affinity_enabled.checked,
+        },
+      }),
+    });
+    settingsModal.classList.add("hidden");
+    toast(t("settingsSaved"), "success");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
 
-function openChannelModal() {
-  $("channelModal").classList.remove("hidden");
-}
+document.getElementById("probeModels")?.addEventListener("click", async () => {
+  const form = new FormData(document.getElementById("channelForm"));
+  const payload = {
+    base_url: form.get("base_url"),
+    key: form.get("key"),
+    type: form.get("type"),
+    protocol: form.get("protocol"),
+    models_path: form.get("models_path"),
+    auth_type: form.get("auth_type"),
+  };
+  if (!payload.base_url || !payload.key) {
+    toast(t("requireProbeFields"), "warning");
+    return;
+  }
+  try {
+    const result = await api("/api/admin/channels/probe-models", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    document.getElementById("channelForm").elements.models.value = result.models.join(", ");
+    const probeResult = document.getElementById("probeResult");
+    probeResult.textContent = `${result.models.length} ${t("foundModels")} ${result.latency_ms} ms`;
+    probeResult.className = "inline-result success";
+  } catch (e) {
+    const probeResult = document.getElementById("probeResult");
+    probeResult.textContent = e.message;
+    probeResult.className = "inline-result error";
+  }
+});
 
-function closeChannelModal() {
-  $("channelModal").classList.add("hidden");
-  $("probeResult").classList.add("hidden");
-}
-
-async function createChannel(event) {
+document.getElementById("channelForm")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const formElement = event.currentTarget;
-  const submitButton = formElement.querySelector('button[type="submit"]');
-  if (submitButton.disabled) return;
-
-  submitButton.disabled = true;
-  submitButton.textContent = t("saving");
+  const submitBtn = formElement.querySelector('button[type="submit"]');
+  if (submitBtn.disabled) return;
+  submitBtn.disabled = true;
+  const original = submitBtn.innerHTML;
+  submitBtn.innerHTML = `<i data-lucide="loader-2" class="spin"></i>${t("saving")}`;
+  refreshIcons(submitBtn);
   try {
     const form = new FormData(formElement);
+    const extra = parseJson(form.get("extra"), {});
     const payload = {
       name: form.get("name"),
       type: form.get("type"),
-      key: form.get("key"),
+      key: form.get("key") || undefined,
       base_url: form.get("base_url"),
       models: parseCsv(form.get("models")),
       model_mapping: parseJson(form.get("model_mapping"), {}),
@@ -172,240 +251,68 @@ async function createChannel(event) {
       enabled: Boolean(form.get("enabled")),
       test_only: false,
       protocol: form.get("protocol"),
-      extra: {},
+      extra: {
+        ...extra,
+        models_path: form.get("models_path"),
+        request_path: form.get("request_path"),
+        auth_type: form.get("auth_type"),
+      },
     };
-    await api("/api/admin/channels", { method: "POST", body: JSON.stringify(payload) });
+    const editingId = channelEditState.id;
+    const method = editingId ? "PUT" : "POST";
+    const url = editingId ? `/api/admin/channels/${editingId}` : "/api/admin/channels";
+    await api(url, { method, body: JSON.stringify(payload) });
     formElement.reset();
-    closeChannelModal();
-    showNotice(`${t("channels")} "${payload.name}" ${t("created")}`);
-    try {
-      await loadChannels();
-    } catch (error) {
-      showNotice(`Channel created, but the list could not be refreshed: ${error.message}`, true);
-    }
+    applyChannelPreset(formElement.elements.type.value);
+    channelModal.classList.add("hidden");
+    toast(`${t("channels")} "${payload.name}" ${editingId ? t("updated") : t("created")}`, "success");
+    channelEditState.id = null;
+    if (current === "channels") await channels.load();
+  } catch (e) {
+    toast(e.message, "error");
   } finally {
-    submitButton.disabled = false;
-    submitButton.textContent = t("saveChannel");
-  }
-}
-
-async function probeModels() {
-  const form = new FormData($("channelForm"));
-  const payload = {
-    base_url: form.get("base_url"),
-    key: form.get("key"),
-    type: form.get("type"),
-    protocol: form.get("protocol"),
-  };
-  if (!payload.base_url || !payload.key) {
-    showNotice(t("requireProbeFields"), true);
-    return;
-  }
-  const result = await api("/api/admin/channels/probe-models", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  $("channelForm").elements.models.value = result.models.join(", ");
-  $("probeResult").textContent = `${result.models.length} ${t("foundModels")} ${result.latency_ms} ms`;
-  $("probeResult").className = "inline-result";
-}
-
-async function loadTokens() {
-  const tokens = await api("/api/admin/tokens");
-  const columns = t("columns");
-  $("tokensTable").innerHTML = `
-    <table>
-      <thead>
-        <tr>
-          <th>${columns.id}</th><th>${columns.name}</th><th>${columns.key}</th><th>${columns.user}</th>
-          <th>${columns.quota}</th><th>${columns.used}</th><th>${columns.status}</th><th>${columns.actions}</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${tokens.map((token) => `
-          <tr>
-            <td>${token.id}</td>
-            <td>${escapeHtml(token.name)}</td>
-            <td><div class="key-cell"><code>${escapeHtml(token.key)}</code><button class="secondary copy-button" data-copy-value="${escapeHtml(token.key)}">${t("copy")}</button></div></td>
-            <td>${escapeHtml(token.user_id || "")}</td>
-            <td>${token.quota ?? t("unlimited")}</td>
-            <td>${token.used_quota}</td>
-            <td>${token.enabled ? t("enable") : t("disable")}</td>
-            <td>
-              <button class="secondary" data-token-toggle="${token.id}" data-enabled="${token.enabled}">
-                ${token.enabled ? t("disable") : t("enable")}
-              </button>
-              <button class="secondary" data-token-reset="${token.id}">${t("resetUsage")}</button>
-              <button class="danger" data-token-delete="${token.id}">${t("delete")}</button>
-            </td>
-          </tr>
-        `).join("")}
-      </tbody>
-    </table>
-  `;
-}
-
-async function generateToken(event) {
-  event.preventDefault();
-  const form = new FormData(event.currentTarget);
-  const params = new URLSearchParams();
-  params.set("name", form.get("name"));
-  if (form.get("user_id")) params.set("user_id", form.get("user_id"));
-  if (form.get("quota")) params.set("quota", form.get("quota"));
-  const allowed = parseCsv(form.get("allowed_channels"));
-  for (const id of allowed) params.append("allowed_channels", id);
-
-  const token = await api(`/api/admin/tokens/generate?${params}`, { method: "POST" });
-  const copied = await copyText(token.key);
-  showNotice(copied ? t("generated") : `${t("created")}: ${token.key}`);
-  event.currentTarget.reset();
-  await loadTokens();
-}
-
-async function loadUsage() {
-  const stats = await api("/api/admin/logs/stats");
-  const labels = t("metrics");
-  const rows = [
-    [labels[0], stats.total_requests], [labels[1], stats.success_requests],
-    [labels[2], stats.failed_requests], [labels[3], stats.total_tokens],
-    [labels[4], stats.prompt_tokens], [labels[5], stats.completion_tokens],
-    [labels[6], stats.total_cost], [labels[7], `${Number(stats.avg_latency || 0).toFixed(3)}s`],
-  ];
-  $("usageCards").innerHTML = rows.map(([label, value]) => `
-    <div class="card"><span>${label}</span><strong>${value}</strong></div>
-  `).join("");
-}
-
-async function loadLogs() {
-  const logs = await api("/api/admin/logs?limit=100");
-  const columns = t("columns");
-  $("logsTable").innerHTML = `
-    <table>
-      <thead>
-        <tr>
-          <th>${columns.time}</th><th>${columns.models}</th><th>${columns.token}</th><th>${columns.channel}</th>
-          <th>${columns.tokens}</th><th>${columns.status}</th><th>${columns.error}</th><th>${columns.latency}</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${logs.map((log) => `
-          <tr>
-            <td>${escapeHtml(log.created_at)}</td>
-            <td>${escapeHtml(log.model)}</td>
-            <td>${log.token_id ?? ""}</td>
-            <td>${log.channel_id ?? ""}</td>
-            <td>${log.total_tokens}</td>
-            <td>${log.success ? t("reachable") : t("failed")}</td>
-            <td>${escapeHtml(log.error_message || "")}</td>
-            <td>${log.latency ?? ""}</td>
-          </tr>
-        `).join("")}
-      </tbody>
-    </table>
-  `;
-}
-
-async function refreshActive() {
-  const active = document.querySelector(".panel.active")?.id;
-  if (active === "overview") return;
-  if (active === "channels") return loadChannels();
-  if (active === "tokens") return loadTokens();
-  if (active === "usage") return loadUsage();
-  if (active === "logs") return loadLogs();
-}
-
-document.addEventListener("click", async (event) => {
-  const copyButton = event.target.closest("[data-copy-value], [data-copy-target]");
-  if (copyButton) {
-    const value = copyButton.dataset.copyValue
-      || $(copyButton.dataset.copyTarget)?.textContent;
-    if (await copyText(value)) {
-      showNotice(t("copied"));
-    } else {
-      showNotice(value);
-    }
-    return;
-  }
-
-  const tab = event.target.closest(".tab");
-  if (tab) {
-    document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
-    document.querySelectorAll(".panel").forEach((item) => item.classList.remove("active"));
-    tab.classList.add("active");
-    $(tab.dataset.tab).classList.add("active");
-    try {
-      await refreshActive();
-    } catch (error) {
-      showNotice(error.message, true);
-    }
-    return;
-  }
-
-  const channelDelete = event.target.dataset.channelDelete;
-  if (channelDelete && confirm(`${t("confirmDeleteChannel")} ${channelDelete}?`)) {
-    await api(`/api/admin/channels/${channelDelete}`, { method: "DELETE" });
-    await loadChannels();
-  }
-
-  const channelToggle = event.target.dataset.channelToggle;
-  if (channelToggle) {
-    const enabled = event.target.dataset.enabled === "true";
-    await api(`/api/admin/channels/${channelToggle}/${enabled ? "disable" : "enable"}`, { method: "POST" });
-    await loadChannels();
-  }
-
-  const channelTest = event.target.dataset.channelTest;
-  if (channelTest) {
-    const result = await api(`/api/admin/channels/${channelTest}/test`, { method: "POST" });
-    const text = result.ok
-      ? `${t("channels")} ${channelTest} ${t("reachable")}，${result.latency_ms} ms，${result.models.length} models`
-      : `${t("channels")} ${channelTest} ${t("failed")}，${result.latency_ms} ms: ${result.error || result.status_code}`;
-    $("channelTestResult").textContent = text;
-    $("channelTestResult").className = `inline-result${result.ok ? "" : " error"}`;
-  }
-
-  const tokenDelete = event.target.dataset.tokenDelete;
-  if (tokenDelete && confirm(`${t("confirmDeleteKey")} ${tokenDelete}?`)) {
-    await api(`/api/admin/tokens/${tokenDelete}`, { method: "DELETE" });
-    await loadTokens();
-  }
-
-  const tokenToggle = event.target.dataset.tokenToggle;
-  if (tokenToggle) {
-    const enabled = event.target.dataset.enabled === "true";
-    await api(`/api/admin/tokens/${tokenToggle}/${enabled ? "disable" : "enable"}`, { method: "POST" });
-    await loadTokens();
-  }
-
-  const tokenReset = event.target.dataset.tokenReset;
-  if (tokenReset) {
-    await api(`/api/admin/tokens/${tokenReset}/reset-quota`, { method: "POST" });
-    await loadTokens();
+    submitBtn.disabled = false;
+    submitBtn.innerHTML = original;
+    refreshIcons(submitBtn);
   }
 });
 
-$("channelForm").addEventListener("submit", (event) => {
-  createChannel(event).catch((error) => showNotice(error.message, true));
+/* ---------- theme/locale change → re-render ---------- */
+document.addEventListener("themechange", () => {
+  refreshTheme();
+});
+document.addEventListener("localechange", () => {
+  // refresh icons that may have been swapped
+  refreshIcons(document);
+  // re-render current page to apply new labels
+  refreshActive();
+  const titleEl = document.getElementById("pageTitle");
+  if (titleEl) titleEl.textContent = TITLES[current]?.() || current;
 });
 
-$("openChannelModal").addEventListener("click", openChannelModal);
-$("closeChannelModal").addEventListener("click", closeChannelModal);
-$("probeModels").addEventListener("click", () => probeModels().catch((error) => showNotice(error.message, true)));
-
-$("tokenForm").addEventListener("submit", (event) => {
-  generateToken(event).catch((error) => showNotice(error.message, true));
+/* ---------- keyboard ---------- */
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (!channelModal.classList.contains("hidden")) channelModal.classList.add("hidden");
+    if (!settingsModal.classList.contains("hidden")) settingsModal.classList.add("hidden");
+    closeSidebar();
+  }
 });
 
-$("refreshChannels").addEventListener("click", () => loadChannels().catch((error) => showNotice(error.message, true)));
-$("refreshTokens").addEventListener("click", () => loadTokens().catch((error) => showNotice(error.message, true)));
-$("refreshUsage").addEventListener("click", () => loadUsage().catch((error) => showNotice(error.message, true)));
-$("refreshLogs").addEventListener("click", () => loadLogs().catch((error) => showNotice(error.message, true)));
-$("toggleLocale").addEventListener("click", async () => {
-  locale = locale === "zh-CN" ? "en" : "zh-CN";
-  localStorage.setItem("rotor.locale", locale);
-  applyLocale();
-  await refreshActive();
-});
+/* ---------- bootstrap ---------- */
+function initIcons() {
+  // wait for lucide CDN if needed
+  if (window.lucide) {
+    refreshIcons(document);
+  } else {
+    document.addEventListener("DOMContentLoaded", () => {
+      if (window.lucide) refreshIcons(document);
+    });
+  }
+}
 
+initIcons();
 applyLocale();
-refreshActive().catch((error) => showNotice(error.message, true));
+loadChannelPresets().catch((error) => toast(error.message, "error"));
+refreshActive();
+initialized = true;
