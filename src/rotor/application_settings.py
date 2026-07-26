@@ -14,10 +14,21 @@ DEFAULT_SETTINGS_PATH = Path.home() / ".rotor" / "settings.json"
 class RoutingSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    strategy: Literal["priority_weighted", "fallback_order", "weighted"] = (
+    strategy: Literal[
+        "priority_weighted", "fallback_order", "weighted", "adaptive"
+    ] = (
         "priority_weighted"
     )
     affinity_enabled: bool = True
+    adaptive_success_weight: float = Field(default=0.55, ge=0)
+    adaptive_latency_weight: float = Field(default=0.25, ge=0)
+    adaptive_cost_weight: float = Field(default=0.10, ge=0)
+    adaptive_load_weight: float = Field(default=0.10, ge=0)
+    adaptive_ewma_alpha: float = Field(default=0.20, gt=0, le=1)
+    adaptive_prior_successes: float = Field(default=9.0, ge=0)
+    adaptive_prior_failures: float = Field(default=1.0, ge=0)
+    adaptive_latency_target_ms: float = Field(default=2_000.0, gt=0)
+    adaptive_cost_target: float = Field(default=0.01, gt=0)
 
 
 class ApplicationSettings(BaseModel):
