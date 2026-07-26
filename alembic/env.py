@@ -1,5 +1,6 @@
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
+from sqlalchemy.engine import make_url
 from alembic import context
 import sys
 import os
@@ -14,6 +15,8 @@ from rotor.models.token import Token
 from rotor.models.log import RequestLog
 from rotor.models.conversation import ConversationRecord
 from rotor.models.usage import UsageLedger
+from rotor.models.response_route import ResponseRoute
+from rotor.models.routing_decision import RoutingDecisionRecord
 
 # this is the Alembic Config object
 config = context.config
@@ -22,8 +25,20 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Set the SQLAlchemy URL from settings
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+def _sync_database_url(url: str) -> str:
+    """Return a synchronous SQLAlchemy URL for Alembic migrations."""
+    parsed = make_url(url)
+    drivername = parsed.drivername
+    if drivername == "sqlite+aiosqlite":
+        parsed = parsed.set(drivername="sqlite")
+    elif drivername == "postgresql+asyncpg":
+        parsed = parsed.set(drivername="postgresql+psycopg")
+    return parsed.render_as_string(hide_password=False)
+
+
+# Set the SQLAlchemy URL from settings. The app uses async drivers at runtime,
+# while Alembic runs migrations through SQLAlchemy's synchronous engine.
+config.set_main_option("sqlalchemy.url", _sync_database_url(settings.DATABASE_URL))
 
 # add your model's MetaData object here
 target_metadata = Base.metadata
