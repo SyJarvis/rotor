@@ -1,6 +1,111 @@
+import json
+import logging
 from typing import Any, Optional
 from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
+
+_SENSITIVE_KEYS = {
+    "authorization",
+    "api-key",
+    "api_key",
+    "apikey",
+    "cookie",
+    "key",
+    "set-cookie",
+    "token",
+}
+
+
+def _sanitize_provider_value(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 8:
+        return "[truncated]"
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "[redacted]"
+                if str(key).lower() in _SENSITIVE_KEYS
+                else _sanitize_provider_value(item, depth=depth + 1)
+            )
+            for key, item in list(value.items())[:100]
+        }
+    if isinstance(value, list):
+        return [_sanitize_provider_value(item, depth=depth + 1) for item in value[:100]]
+    if isinstance(value, str) and len(value) > 4000:
+        return value[:4000] + "...[truncated]"
+    return value
+
+
+def upstream_error_payload(exc: Exception) -> dict[str, Any] | None:
+    """Extract a bounded, sanitized upstream HTTP error for diagnostics."""
+    import httpx
+
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return None
+    response = exc.response
+    request_ids = {
+        name: response.headers[name]
+        for name in (
+            "x-request-id",
+            "request-id",
+            "cf-ray",
+            "x-amzn-requestid",
+        )
+        if response.headers.get(name)
+    }
+    try:
+        body: Any = response.json()
+    except (httpx.ResponseNotRead, httpx.StreamClosed):
+        body = "[upstream response body was not read]"
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        try:
+            body = response.text
+        except (httpx.ResponseNotRead, httpx.StreamClosed):
+            body = "[upstream response body was not read]"
+    return {
+        "status_code": response.status_code,
+        "request_ids": request_ids,
+        "body": _sanitize_provider_value(body),
+    }
+
+
+def format_error_message(exc: Exception) -> str:
+    """Format an exception into a non-empty, human-readable string.
+
+    httpx timeout exceptions (ReadTimeout, ConnectTimeout, PoolTimeout) return
+    an empty string from ``str(exc)``, which leaves logs and client responses
+    with no useful detail.  Always include the exception type name so the
+    failure is identifiable.
+    """
+    provider_error = upstream_error_payload(exc)
+    msg = str(exc).strip()
+    if provider_error is not None:
+        body = json.dumps(provider_error, ensure_ascii=False, separators=(",", ":"))
+        return f"{type(exc).__name__}: {msg}; upstream={body}"
+    if msg:
+        return f"{type(exc).__name__}: {msg}"
+    return type(exc).__name__
+
+
+def classify_error_status(exc: Exception) -> int:
+    """Derive the correct proxy HTTP status code from an upstream exception.
+
+    - Timeout  -> 504 Gateway Timeout
+    - Upstream 4xx (bad key, bad request, ...) -> pass through
+    - Upstream 5xx or connection error -> 502 Bad Gateway
+    - Anything else -> 500 Internal Server Error
+    """
+    import httpx
+
+    if isinstance(exc, httpx.TimeoutException):
+        return 504
+    if isinstance(exc, httpx.HTTPStatusError):
+        upstream = exc.response.status_code
+        return upstream if 400 <= upstream < 500 else 502
+    if isinstance(exc, httpx.RequestError):
+        return 502
+    return 500
 
 
 class APIRouterException(HTTPException):
@@ -145,6 +250,7 @@ async def api_router_exception_handler(request: Request, exc: APIRouterException
 
 async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Handle general exceptions."""
+    logger.exception("Unhandled error for %s %s", request.method, request.url.path, exc_info=exc)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
