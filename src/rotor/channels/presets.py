@@ -72,12 +72,28 @@ def list_provider_presets() -> list[dict[str, Any]]:
 
 def provider_defaults(provider: str, protocol: str = "openai") -> dict[str, str]:
     preset = PROVIDER_PRESETS.get(provider, {})
+    normalized_protocol = protocol.lower()
     fallback = {
         "models_path": "/models",
-        "request_path": "/messages" if protocol == "anthropic" else "/chat/completions",
-        "auth_type": "x-api-key" if protocol == "anthropic" else "bearer",
+        "request_path": (
+            "/messages"
+            if normalized_protocol in {"anthropic", "anthropic_messages"}
+            else "/responses"
+            if normalized_protocol in {"responses", "openai_responses"}
+            else "/chat/completions"
+        ),
+        "auth_type": (
+            "x-api-key"
+            if normalized_protocol in {"anthropic", "anthropic_messages"}
+            else "bearer"
+        ),
     }
-    return {**fallback, **preset}
+    defaults = {**fallback, **preset}
+    # A provider preset describes its usual protocol. An explicitly selected
+    # protocol must still choose the matching generation endpoint.
+    defaults["request_path"] = fallback["request_path"]
+    defaults["auth_type"] = fallback["auth_type"]
+    return defaults
 
 
 def channel_option(

@@ -32,12 +32,10 @@ def test_settings_store_persists_and_reloads_routing_settings(tmp_path) -> None:
         )
     )
 
-    assert json.loads(path.read_text()) == {
-        "routing": {
-            "strategy": "fallback_order",
-            "affinity_enabled": False,
-        }
-    }
+    payload = json.loads(path.read_text())
+    assert payload["routing"]["strategy"] == "fallback_order"
+    assert payload["routing"]["affinity_enabled"] is False
+    assert payload["routing"]["adaptive_success_weight"] == 0.55
     reloaded = ApplicationSettingsStore(path).get()
     assert reloaded.routing.strategy == "fallback_order"
     assert reloaded.routing.affinity_enabled is False
@@ -48,3 +46,15 @@ def test_settings_reject_unknown_routing_strategy() -> None:
         ApplicationSettings.model_validate(
             {"routing": {"strategy": "last_channel"}}
         )
+
+
+def test_settings_accept_adaptive_routing_strategy() -> None:
+    settings = ApplicationSettings.model_validate({
+        "routing": {
+            "strategy": "adaptive",
+            "adaptive_ewma_alpha": 0.4,
+        }
+    })
+
+    assert settings.routing.strategy == "adaptive"
+    assert settings.routing.adaptive_ewma_alpha == 0.4

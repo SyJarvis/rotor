@@ -148,6 +148,21 @@ const channelModal = document.getElementById("channelModal");
 document.getElementById("channelForm")?.elements.type.addEventListener("change", (event) => {
   applyChannelPreset(event.target.value);
 });
+
+document.getElementById("channelForm")?.elements.protocol.addEventListener("change", (event) => {
+  const form = document.getElementById("channelForm");
+  if (!form) return;
+  if (event.target.value === "openai_responses") {
+    form.elements.request_path.value = "/responses";
+    form.elements.auth_type.value = "bearer";
+  } else if (event.target.value === "anthropic") {
+    form.elements.request_path.value = "/messages";
+    form.elements.auth_type.value = "x-api-key";
+  } else {
+    form.elements.request_path.value = "/chat/completions";
+    form.elements.auth_type.value = "bearer";
+  }
+});
 document.getElementById("closeChannelModal")?.addEventListener("click", () => {
   channelModal.classList.add("hidden");
 });

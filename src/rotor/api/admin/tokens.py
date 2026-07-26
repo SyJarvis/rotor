@@ -15,9 +15,7 @@ router = APIRouter(prefix="/tokens", tags=["tokens"])
 
 def generate_token_key() -> str:
     """Generate a new API token key."""
-    random_bytes = secrets.token_bytes(24)
-    token_key = settings.API_KEY_PREFIX + secrets.token_urlsafe(32)
-    return token_key
+    return settings.API_KEY_PREFIX + secrets.token_urlsafe(32)
 
 
 @router.get("", response_model=List[TokenListItem])
@@ -88,6 +86,7 @@ async def generate_token(
     quota: int = None,
     group: str = "default",
     allowed_channels: List[int] = None,
+    expire_time: datetime = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Generate a new token with a random key."""
@@ -101,7 +100,8 @@ async def generate_token(
         group=group,
         allowed_channels=allowed_channels,
         enabled=True,
-        expired=False
+        expired=False,
+        expire_time=expire_time,
     )
     db.add(new_token)
     await db.commit()
