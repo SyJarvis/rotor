@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "rotor-responses/your-model",
+  "provider": {
+    "rotor-responses": {
+      "npm": "@ai-sdk/openai",
+      "name": "Rotor Responses",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "{env:ROTOR_API_KEY}"
+      },
+      "models": {
+        "your-model": {
+          "name": "your-model"
+        }
+      }
+    }
+  }
+}
