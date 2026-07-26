@@ -3,6 +3,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from httpx import AsyncByteStream, AsyncClient, MockTransport, Request, Response
 from pydantic import ValidationError
 
 from rotor.adapters.protocol.converter import ProtocolConverter
@@ -505,6 +506,118 @@ def test_anthropic_native_fields_survive_anthropic_upstream_conversion() -> None
     assert converted["model"] == "claude-provider"
     assert converted["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert converted["messages"][0]["content"][0]["is_error"] is True
+
+
+def test_anthropic_request_preserves_claude_code_extension_fields() -> None:
+    request = AnthropicMessageRequest.model_validate({
+        "model": "claude-test",
+        "max_tokens": 256,
+        "thinking": {"type": "adaptive"},
+        "context_management": {"edits": []},
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{
+            "name": "Bash",
+            "description": "Run a command",
+            "input_schema": {"type": "object"},
+            "cache_control": {"type": "ephemeral"},
+        }],
+    })
+    adapter = AnthropicAdapter(
+        SimpleNamespace(model_mapping={}, extra={}), None
+    )
+
+    converted = asyncio.run(adapter.convert_request(anthropic_to_openai_request(request)))
+
+    assert converted["thinking"] == {"type": "adaptive"}
+    assert converted["context_management"] == {"edits": []}
+    assert converted["tools"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_native_anthropic_response_and_sse_events_are_not_downgraded() -> None:
+    class NativeStream(AsyncByteStream):
+        async def __aiter__(self):
+            events = [
+                {"type": "message_start", "message": {"id": "msg_1", "type": "message"}},
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "reason"},
+                },
+                {"type": "message_stop"},
+            ]
+            yield "".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                for event in events
+            ).encode()
+
+    request = AnthropicMessageRequest.model_validate({
+        "model": "claude-test",
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    internal = anthropic_to_openai_request(request)
+    adapter = AnthropicAdapter(SimpleNamespace(model_mapping={}, extra={}), None)
+    native = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "thinking", "thinking": "reason", "signature": "sig"}],
+        "model": "claude-test",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 2, "output_tokens": 3},
+    }
+    response = Response(
+        200, json=native, request=Request("POST", "https://example.com/v1/messages")
+    )
+    converted = asyncio.run(adapter.convert_response(response, internal))
+
+    stream_response = Response(
+        200,
+        stream=NativeStream(),
+        request=Request("POST", "https://example.com/v1/messages"),
+    )
+
+    async def collect():
+        return [event async for event in adapter.stream_convert_response(stream_response, internal)]
+
+    events = asyncio.run(collect())
+
+    assert converted == native
+    assert events[1]["delta"]["type"] == "thinking_delta"
+
+
+def test_native_anthropic_count_tokens_and_beta_headers_are_forwarded() -> None:
+    seen: list[Request] = []
+
+    async def handler(request: Request) -> Response:
+        seen.append(request)
+        return Response(200, json={"input_tokens": 42})
+
+    channel = SimpleNamespace(
+        type="anthropic",
+        protocol="anthropic",
+        base_url="https://example.com/v1",
+        key="provider-key",
+        model_mapping={"claude-test": "claude-provider"},
+        extra={},
+    )
+
+    async def exercise() -> None:
+        async with AsyncClient(transport=MockTransport(handler)) as client:
+            adapter = AnthropicAdapter(channel, client)
+            await adapter.count_tokens(
+                {
+                    "model": "claude-test",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+                {"anthropic-beta": "token-counting-2024-11-01"},
+            )
+
+    asyncio.run(exercise())
+
+    assert seen[0].url.path == "/v1/messages/count_tokens"
+    assert seen[0].headers["anthropic-beta"] == "token-counting-2024-11-01"
+    assert json.loads(seen[0].content)["model"] == "claude-provider"
 
 
 def test_provider_adapters_forward_tools() -> None:

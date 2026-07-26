@@ -1,0 +1,12 @@
+# Copy to ~/.codex/rotor.config.toml, then run: codex --profile rotor
+model = "your-model"
+model_provider = "rotor"
+
+[model_providers.rotor]
+name = "Rotor Responses"
+base_url = "http://127.0.0.1:8000/v1"
+env_key = "ROTOR_API_KEY"
+wire_api = "responses"
+request_max_retries = 2
+stream_max_retries = 2
+stream_idle_timeout_ms = 120000

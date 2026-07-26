@@ -1,6 +1,7 @@
 from fastapi import Request, Response
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from typing import Callable
 import time
 import logging
@@ -8,38 +9,50 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class LoggingMiddleware(BaseHTTPMiddleware):
+class LoggingMiddleware:
     """Middleware for logging requests and responses."""
 
     def __init__(self, app: ASGIApp):
-        super().__init__(app)
+        self.app = app
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        """Process request and log details."""
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        """Log HTTP response start without buffering or cancelling streams."""
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
         start_time = time.time()
+        method = scope.get("method", "")
+        path = scope.get("path", "")
+        client = scope.get("client")
+        client_host = client[0] if client else "unknown"
 
-        # Log request
         logger.info(
-            f"Request: {request.method} {request.url.path} "
-            f"from {request.client.host if request.client else 'unknown'}"
+            "Request: %s %s from %s",
+            method,
+            path,
+            client_host,
         )
 
-        # Process request
-        response = await call_next(request)
+        async def send_with_logging(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                duration = time.time() - start_time
+                logger.info(
+                    "Response: %s for %s %s in %.3fs",
+                    message["status"],
+                    method,
+                    path,
+                    duration,
+                )
+                MutableHeaders(scope=message)["X-Process-Time"] = str(duration)
+            await send(message)
 
-        # Calculate duration
-        duration = time.time() - start_time
-
-        # Log response
-        logger.info(
-            f"Response: {response.status_code} for {request.method} {request.url.path} "
-            f"in {duration:.3f}s"
-        )
-
-        # Add timing header
-        response.headers["X-Process-Time"] = str(duration)
-
-        return response
+        await self.app(scope, receive, send_with_logging)
 
 
 class CORSMiddleware(BaseHTTPMiddleware):

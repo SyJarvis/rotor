@@ -16,13 +16,13 @@ security = HTTPBearer(auto_error=False)
 
 async def get_current_token(
     credentials: HTTPAuthorizationCredentials = Depends(security),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
     db: AsyncSession = Depends(get_db)
 ) -> Token:
-    """Get and validate the current token from Authorization header."""
-    if not credentials:
-        raise AuthenticationException("Missing Authorization header")
-
-    token_key = credentials.credentials
+    """Validate a Rotor API key from Bearer auth or Anthropic's x-api-key."""
+    token_key = credentials.credentials if credentials else x_api_key
+    if not token_key:
+        raise AuthenticationException("Missing Authorization or x-api-key header")
 
     if not validate_api_key_format(token_key):
         raise AuthenticationException("Invalid token format")
@@ -58,13 +58,13 @@ async def get_current_token(
 
 async def get_optional_token(
     credentials: HTTPAuthorizationCredentials = Depends(security),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
     db: AsyncSession = Depends(get_db)
 ) -> Optional[Token]:
     """Get optional token (doesn't raise if missing)."""
-    if not credentials:
+    token_key = credentials.credentials if credentials else x_api_key
+    if not token_key:
         return None
-
-    token_key = credentials.credentials
 
     if not validate_api_key_format(token_key):
         return None
@@ -87,10 +87,7 @@ async def get_available_channels(
 ) -> list[Channel]:
     """Get available channels for a given model."""
     # Build query
-    query = select(Channel).where(
-        Channel.enabled == True,
-        Channel.models.contains(model)  # Check if model is in the list
-    )
+    query = select(Channel).where(Channel.enabled.is_(True))
 
     # Filter by allowed channels if token has restrictions
     if token and token.allowed_channels:
@@ -100,7 +97,11 @@ async def get_available_channels(
     query = query.order_by(Channel.priority.desc(), Channel.weight.desc())
 
     result = await db.execute(query)
-    channels = list(result.scalars().all())
+    channels = [
+        channel
+        for channel in result.scalars().all()
+        if model in (channel.models or []) or model in (channel.model_mapping or {})
+    ]
 
     if not channels:
         raise ModelNotFoundException(model)

@@ -19,20 +19,11 @@ class MiniMaxAdapter(OpenAICompatibleAdapter):
 
     async def get_request_url(self, request: ChatCompletionRequest) -> str:
         """Get the target URL for MiniMax OpenAI-compatible API."""
-        return f"{self.channel.base_url.rstrip('/')}/chat/completions"
+        return self.build_request_url("/chat/completions")
 
     def setup_request_headers(self, request: ChatCompletionRequest) -> dict[str, str]:
         """Set up headers for MiniMax API requests."""
-        headers = {
-            "Authorization": f"Bearer {self.channel.key}",
-            "Content-Type": "application/json",
-        }
-
-        # MiniMax may require additional headers
-        if self.channel.extra and "headers" in self.channel.extra:
-            headers.update(self.channel.extra["headers"])
-
-        return headers
+        return self.build_request_headers()
 
     async def convert_request(self, request: ChatCompletionRequest) -> dict:
         """Convert request to MiniMax format."""
@@ -51,6 +42,12 @@ class MiniMaxAdapter(OpenAICompatibleAdapter):
             body["top_p"] = request.top_p
         if request.max_tokens is not None:
             body["max_tokens"] = request.max_tokens
+        if request.stop is not None:
+            body["stop"] = request.stop
+        if request.tools is not None:
+            body["tools"] = [t.model_dump(exclude_none=True) for t in request.tools]
+        if request.tool_choice is not None:
+            body["tool_choice"] = request.tool_choice
 
         # MiniMax-specific parameters
         if self.channel.extra:

@@ -1,7 +1,19 @@
 from typing import Any
 
 
-SENSITIVE_KEYS = {"authorization", "api-key", "x-api-key", "key", "token", "cookie"}
+SENSITIVE_KEYS = {
+    "authorization",
+    "api-key",
+    "api_key",
+    "apikey",
+    "x-api-key",
+    "key",
+    "token",
+    "access_token",
+    "refresh_token",
+    "cookie",
+    "set-cookie",
+}
 
 
 def sanitize(value: Any) -> Any:

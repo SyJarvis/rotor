@@ -1,11 +1,15 @@
+import os
+
 from openai import OpenAI
 
-base_url = "http://127.0.0.1:8000/v1"
-api_key = "sk-jRSJniTrOiCVzuoeotEQ1BVipEGVUSpXFQTkb5Hm5Co"
+base_url = os.getenv("ROTOR_BASE_URL", "http://192.168.0.101:8000").rstrip("/")
+api_key = os.environ["ROTOR_API_KEY"]
+model = os.getenv("ROTOR_MODEL", "glm-5.2")
 
-client = OpenAI(api_key=api_key, base_url=base_url)
+client = OpenAI(api_key=api_key, base_url=f"{base_url}/v1")
 
-def get_llm_response(client, model, prompt, max_tokens=1024):
+
+def get_llm_response(client: OpenAI, model: str, prompt: str, max_tokens: int = 1024) -> str:
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -18,15 +22,15 @@ def get_llm_response(client, model, prompt, max_tokens=1024):
                 "content": prompt
             }
         ],
-        max_completion_tokens=max_tokens,
+        max_tokens=max_tokens,
     )
     return response.choices[0].message.content or ""
 
 
 def main():
-    model = ["glm-5.2", "glm-5.1", "kimi-k2.6", "deepseek-v4-pro", "deepseek-v4-flash", "mimo-v2.5-pro"]
-    content = get_llm_response(client, model[0], "Hello, how are you?")
+    content = get_llm_response(client, model, "Hello, how are you?")
     print(content)
+
 
 if __name__ == "__main__":
     main()

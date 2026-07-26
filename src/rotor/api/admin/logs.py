@@ -1,10 +1,11 @@
 from typing import List, Optional
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, case, func
 
+from rotor.config import settings
 from rotor.database import get_db
 from rotor.models.log import RequestLog
 
@@ -30,6 +31,13 @@ class RequestLogResponse(BaseModel):
     latency: Optional[float]
     created_at: datetime
     ip: Optional[str]
+
+
+class RequestLogDetailResponse(RequestLogResponse):
+    """Detail view including request/response bodies for debugging."""
+
+    request_body: Optional[dict] = None
+    response_body: Optional[dict] = None
 
 
 @router.get("", response_model=List[RequestLogResponse])
@@ -152,6 +160,127 @@ async def get_log_stats(
     }
 
 
+@router.get("/timeseries")
+async def get_log_timeseries(
+    days: int = Query(7, ge=1, le=90),
+    bucket: str = Query("auto", pattern="^(auto|hour|day)$"),
+    token_id: Optional[int] = None,
+    channel_id: Optional[int] = None,
+    model: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get time-bucketed usage statistics for charts.
+
+    Args:
+        days: Number of days to include.
+        bucket: Bucket size. "auto" picks hour for <=3 days, day otherwise.
+        token_id: Filter by token ID.
+        channel_id: Filter by channel ID.
+        model: Filter by model name.
+    """
+    resolved_bucket = "hour" if (bucket == "auto" and days <= 3) or bucket == "hour" else "day"
+    start_time = datetime.utcnow() - timedelta(days=days)
+
+    conditions = [RequestLog.created_at >= start_time]
+    if token_id is not None:
+        conditions.append(RequestLog.token_id == token_id)
+    if channel_id is not None:
+        conditions.append(RequestLog.channel_id == channel_id)
+    if model is not None:
+        conditions.append(RequestLog.model == model)
+
+    is_sqlite = "sqlite" in settings.DATABASE_URL
+    if is_sqlite:
+        fmt = "%Y-%m-%dT%H:00:00" if resolved_bucket == "hour" else "%Y-%m-%d"
+        bucket_expr = func.strftime(fmt, RequestLog.created_at)
+    else:
+        bucket_expr = func.date_trunc(resolved_bucket, RequestLog.created_at)
+
+    result = await db.execute(
+        select(
+            bucket_expr.label("bucket"),
+            func.count(RequestLog.id).label("requests"),
+            func.sum(RequestLog.total_tokens).label("tokens"),
+            func.sum(RequestLog.success).label("success_count"),
+            func.avg(RequestLog.latency).label("avg_latency"),
+        )
+        .where(and_(*conditions))
+        .group_by(bucket_expr)
+        .order_by(bucket_expr)
+    )
+    rows = result.all()
+
+    return [
+        {
+            "bucket": row.bucket,
+            "requests": row.requests or 0,
+            "tokens": int(row.tokens or 0),
+            "success": int(row.success_count or 0),
+            "failed": (row.requests or 0) - int(row.success_count or 0),
+            "avg_latency": float(row.avg_latency or 0),
+        }
+        for row in rows
+    ]
+
+
+@router.get("/timeseries_by_model")
+async def get_log_timeseries_by_model(
+    days: int = Query(7, ge=1, le=90),
+    bucket: str = Query("auto", pattern="^(auto|hour|day)$"),
+    today: bool = Query(False),
+    channel_id: Optional[int] = None,
+    model: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Time-bucketed token usage broken down by model — for stacked area charts.
+
+    When today=True, start is aligned to midnight UTC of the current day
+    (useful for "today 0:00 → now" views). Otherwise the window is `days` days back.
+    """
+    resolved_bucket = "hour" if (bucket == "auto" and days <= 3) or bucket == "hour" else "day"
+    if today:
+        now = datetime.utcnow()
+        start_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start_time = datetime.utcnow() - timedelta(days=days)
+
+    conditions = [RequestLog.created_at >= start_time]
+    if channel_id is not None:
+        conditions.append(RequestLog.channel_id == channel_id)
+    if model is not None:
+        conditions.append(RequestLog.model == model)
+
+    is_sqlite = "sqlite" in settings.DATABASE_URL
+    if is_sqlite:
+        fmt = "%Y-%m-%dT%H:00:00" if resolved_bucket == "hour" else "%Y-%m-%d"
+        bucket_expr = func.strftime(fmt, RequestLog.created_at)
+    else:
+        bucket_expr = func.date_trunc(resolved_bucket, RequestLog.created_at)
+
+    result = await db.execute(
+        select(
+            bucket_expr.label("bucket"),
+            RequestLog.model.label("model"),
+            func.sum(RequestLog.total_tokens).label("tokens"),
+            func.count(RequestLog.id).label("requests"),
+        )
+        .where(and_(*conditions))
+        .group_by(bucket_expr, RequestLog.model)
+        .order_by(bucket_expr, RequestLog.model)
+    )
+    rows = result.all()
+
+    return [
+        {
+            "bucket": row.bucket,
+            "model": row.model,
+            "tokens": int(row.tokens or 0),
+            "requests": row.requests or 0,
+        }
+        for row in rows
+    ]
+
+
 @router.get("/models")
 async def get_model_usage(
     days: int = Query(7, ge=1, le=90),
@@ -184,3 +313,19 @@ async def get_model_usage(
         }
         for row in rows
     ]
+
+
+@router.get("/{log_id}", response_model=RequestLogDetailResponse)
+async def get_log(
+    log_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get full request log detail (including request/response bodies)."""
+    result = await db.execute(select(RequestLog).where(RequestLog.id == log_id))
+    log = result.scalar_one_or_none()
+    if not log:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Log {log_id} not found",
+        )
+    return log

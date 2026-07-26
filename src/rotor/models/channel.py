@@ -40,7 +40,7 @@ class Channel(Base):
     protocol: Mapped[str] = mapped_column(
         String(20),
         default="openai",
-        comment="Protocol: openai or anthropic"
+        comment="Protocol: openai, openai_responses, or anthropic"
     )
 
     # Rate limiting (optional)
@@ -68,11 +68,6 @@ class Channel(Base):
         server_default=func.now(),
         onupdate=func.now()
     )
-
-    # Statistics
-    total_requests: Mapped[int] = mapped_column(Integer, default=0)
-    success_requests: Mapped[int] = mapped_column(Integer, default=0)
-    failed_requests: Mapped[int] = mapped_column(Integer, default=0)
 
     def __repr__(self) -> str:
         return f"<Channel {self.name} ({self.type})>"

@@ -36,7 +36,9 @@ class ProtocolConverter:
 
         for msg in messages:
             if msg.role == Role.SYSTEM:
-                system_prompt = msg.content
+                system_prompt = "\n".join(
+                    part for part in (system_prompt, msg.content) if part
+                )
             elif msg.role in (Role.USER, Role.ASSISTANT):
                 content = msg.content or ""
                 # Anthropic protocol requires content to be an array format
@@ -53,26 +55,46 @@ class ProtocolConverter:
                         content_blocks.append({"type": "text", "text": content})
 
                     for tool_call in msg.tool_calls:
+                        import json
+                        try:
+                            tool_input = json.loads(tool_call.function.arguments)
+                        except (json.JSONDecodeError, TypeError):
+                            tool_input = {}
                         content_blocks.append({
                             "type": "tool_use",
                             "id": tool_call.id,
                             "name": tool_call.function.name,
-                            "input": tool_call.function.arguments
+                            "input": tool_input,
                         })
 
                     anthropic_msg["content"] = content_blocks
 
-                # Handle tool result messages
-                if msg.role == Role.USER and msg.tool_call_id:
-                    anthropic_msg["content"] = [{
-                        "type": "tool_result",
-                        "tool_use_id": msg.tool_call_id,
-                        "content": content
-                    }]
-
-                anthropic_messages.append(anthropic_msg)
+                ProtocolConverter._append_anthropic_message(
+                    anthropic_messages,
+                    anthropic_msg,
+                )
+            elif msg.role == Role.TOOL:
+                ProtocolConverter._append_anthropic_message(
+                    anthropic_messages,
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": msg.tool_call_id or "",
+                            "content": msg.content or "",
+                        }],
+                    },
+                )
 
         return anthropic_messages, system_prompt
+
+    @staticmethod
+    def _append_anthropic_message(messages: List[Dict], message: Dict) -> None:
+        """Merge adjacent equal roles as required by the Anthropic protocol."""
+        if messages and messages[-1]["role"] == message["role"]:
+            messages[-1]["content"].extend(message["content"])
+        else:
+            messages.append(message)
 
     @staticmethod
     def openai_tools_to_anthropic(tools: List[Tool]) -> List[Dict[str, Any]]:
@@ -139,7 +161,17 @@ class ProtocolConverter:
                 # No tool_choice parameter needed for "none" in Anthropic
                 pass
             elif isinstance(request.tool_choice, dict):
-                anthropic_request["tool_choice"] = request.tool_choice
+                function = request.tool_choice.get("function") or {}
+                if (
+                    request.tool_choice.get("type") == "function"
+                    and function.get("name")
+                ):
+                    anthropic_request["tool_choice"] = {
+                        "type": "tool",
+                        "name": function["name"],
+                    }
+                else:
+                    anthropic_request["tool_choice"] = request.tool_choice
 
         return anthropic_request
 
@@ -255,7 +287,7 @@ class ProtocolConverter:
         # Handle message_start (send initial chunk)
         if event_type == "message_start":
             import time
-            return {
+            chunk = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
@@ -266,6 +298,17 @@ class ProtocolConverter:
                     "finish_reason": None,
                 }]
             }
+            usage = (stream_event.get("message") or {}).get("usage") or {}
+            if usage:
+                chunk["usage"] = {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": (
+                        usage.get("input_tokens", 0)
+                        + usage.get("output_tokens", 0)
+                    ),
+                }
+            return chunk
 
         # Handle content_block_start (tool_use start)
         if event_type == "content_block_start":
@@ -297,9 +340,9 @@ class ProtocolConverter:
         # Handle content_block_delta (text delta or tool arguments)
         if event_type == "content_block_delta":
             delta = stream_event.get("delta", {})
-            block_type = stream_event.get("content_block_type", "")
+            delta_type = delta.get("type")
 
-            if block_type == "text" and delta.get("type") == "text_delta":
+            if delta_type == "text_delta":
                 return {
                     "id": chunk_id,
                     "object": "chat.completion.chunk",
@@ -313,7 +356,7 @@ class ProtocolConverter:
                 }
 
             # Handle thinking_delta (GLM-specific thinking process)
-            if block_type == "text" and delta.get("type") == "thinking_delta":
+            if delta_type == "thinking_delta":
                 thinking = delta.get("thinking", "")
                 if thinking:
                     return {
@@ -328,7 +371,7 @@ class ProtocolConverter:
                         }]
                     }
 
-            if block_type == "tool_use" and delta.get("type") == "input_json_delta":
+            if delta_type == "input_json_delta":
                 return {
                     "id": chunk_id,
                     "object": "chat.completion.chunk",
@@ -348,21 +391,25 @@ class ProtocolConverter:
                     }]
                 }
 
-        # Handle message_stop (final chunk with finish_reason)
-        if event_type == "message_stop":
+        # Anthropic sends the stop reason and final usage in message_delta.
+        if event_type == "message_delta":
             stop_reason_map = {
                 "end_turn": "stop",
                 "max_tokens": "length",
                 "stop_sequence": "stop",
                 "tool_use": "tool_calls",
             }
-            message = stream_event.get("message", {})
-            finish_reason = stop_reason_map.get(message.get("stop_reason", "stop"), "stop")
+            delta = stream_event.get("delta", {})
+            finish_reason = stop_reason_map.get(
+                delta.get("stop_reason", "end_turn"),
+                "stop",
+            )
+            usage = stream_event.get("usage") or {}
 
-            return {
+            chunk = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
-                "created": message.get("created_at", 0),
+                "created": 0,
                 "model": request_model,
                 "choices": [{
                     "index": 0,
@@ -370,6 +417,16 @@ class ProtocolConverter:
                     "finish_reason": finish_reason,
                 }]
             }
+            if usage:
+                chunk["usage"] = {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": (
+                        usage.get("input_tokens", 0)
+                        + usage.get("output_tokens", 0)
+                    ),
+                }
+            return chunk
 
         # Ignore other event types
         return None

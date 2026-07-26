@@ -1,3 +1,8 @@
+import asyncio
+from types import SimpleNamespace
+
+from rotor.adapters.factory import AdapterFactory
+from rotor.api.admin.channels import _probe_generation_capability
 from rotor.channels.presets import (
     channel_option,
     join_api_url,
@@ -37,6 +42,57 @@ def test_anthropic_defaults_and_headers() -> None:
     assert "Authorization" not in headers
 
 
+def test_responses_protocol_uses_responses_request_path() -> None:
+    defaults = provider_defaults("openai", "openai_responses")
+
+    assert defaults["request_path"] == "/responses"
+    assert defaults["models_path"] == "/models"
+    assert defaults["auth_type"] == "bearer"
+
+
 def test_bearer_headers() -> None:
     headers = provider_headers(key="secret", auth_type="bearer")
     assert headers["Authorization"] == "Bearer secret"
+
+
+def test_function_call_capability_probe_uses_configured_adapter(monkeypatch) -> None:
+    captured = {}
+
+    class FakeAdapter:
+        async def make_request(self, request, timeout=None):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return object()
+
+        async def convert_response(self, response, request):
+            return {
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "rotor_health_check",
+                                "arguments": "{}",
+                            },
+                        }],
+                    },
+                }],
+            }
+
+    monkeypatch.setattr(
+        AdapterFactory,
+        "create_adapter",
+        lambda channel, client: FakeAdapter(),
+    )
+    channel = SimpleNamespace(protocol="openai_responses")
+
+    asyncio.run(_probe_generation_capability(
+        channel=channel,
+        model="test-model",
+        capability="function_call",
+    ))
+
+    assert captured["request"].tools[0].function.name == "rotor_health_check"
+    assert captured["request"].tool_choice["function"]["name"] == "rotor_health_check"
+    assert captured["timeout"] == 30.0
