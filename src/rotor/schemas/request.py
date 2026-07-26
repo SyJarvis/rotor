@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Optional, List, Dict, Any, Union, Literal
 from enum import Enum
 
@@ -38,6 +38,7 @@ class Function(BaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
 
 
 class Tool(BaseModel):
@@ -64,6 +65,10 @@ class ChatCompletionRequest(BaseModel):
     # Preserve protocol-native fields when an Anthropic request is routed to
     # an Anthropic upstream. Excluded from generic provider serialization.
     anthropic_payload: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
+    anthropic_headers: Optional[Dict[str, str]] = Field(default=None, exclude=True)
+    # Preserve the original Responses request for a native /responses upstream.
+    # Cross-protocol adapters consume the normalized messages/tools instead.
+    responses_payload: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
 
 
 class Usage(BaseModel):
@@ -172,13 +177,17 @@ class AnthropicTextBlock(BaseModel):
 
 class AnthropicToolDefinition(BaseModel):
     """Anthropic tool definition."""
+    model_config = ConfigDict(extra="allow")
+
     name: str
-    description: str
+    description: Optional[str] = None
     input_schema: Dict[str, Any]
 
 
 class AnthropicMessageRequest(BaseModel):
     """Anthropic message request."""
+    model_config = ConfigDict(extra="allow")
+
     model: str
     messages: List[AnthropicMessage]
     max_tokens: int
@@ -235,6 +244,19 @@ class AnthropicMessageRequest(BaseModel):
 
         normalized["system"] = system_blocks or None
         return normalized
+
+
+class AnthropicCountTokensRequest(BaseModel):
+    """Anthropic token-counting request (``max_tokens`` is not required)."""
+    model_config = ConfigDict(extra="allow")
+
+    model: str
+    messages: List[AnthropicMessage]
+    system: Optional[Union[str, List[Dict[str, Any]]]] = None
+    tools: Optional[List[AnthropicToolDefinition]] = None
+
+    def provider_payload(self) -> Dict[str, Any]:
+        return self.model_dump(exclude_none=True)
 
 
 class AnthropicUsage(BaseModel):
