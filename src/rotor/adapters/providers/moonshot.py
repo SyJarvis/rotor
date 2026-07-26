@@ -18,20 +18,11 @@ class MoonshotAdapter(OpenAICompatibleAdapter):
 
     async def get_request_url(self, request: ChatCompletionRequest) -> str:
         """Get the target URL for Moonshot API."""
-        return f"{self.channel.base_url.rstrip('/')}/chat/completions"
+        return self.build_request_url("/chat/completions")
 
     def setup_request_headers(self, request: ChatCompletionRequest) -> dict[str, str]:
         """Set up headers for Moonshot API requests."""
-        headers = {
-            "Authorization": f"Bearer {self.channel.key}",
-            "Content-Type": "application/json",
-        }
-
-        # Moonshot may require additional headers
-        if extra := self.channel.extra.get("headers"):
-            headers.update(extra)
-
-        return headers
+        return self.build_request_headers()
 
     async def convert_request(self, request: ChatCompletionRequest) -> dict:
         """Convert request to Moonshot format."""
@@ -66,7 +57,7 @@ class MoonshotAdapter(OpenAICompatibleAdapter):
             body["user"] = request.user
 
         # Moonshot-specific parameters from extra config
-        if "enable_search" in self.channel.extra:
+        if self.channel.extra and "enable_search" in self.channel.extra:
             body["enable_search"] = self.channel.extra["enable_search"]
 
         return body

@@ -3,6 +3,7 @@ from rotor.adapters.protocol.converter import ProtocolConverter
 from rotor.models.channel import Channel
 from httpx import AsyncClient, Response
 from typing import AsyncIterator, Any
+from copy import deepcopy
 from rotor.schemas.request import ChatCompletionRequest
 import json
 
@@ -10,9 +11,35 @@ import json
 class AnthropicAdapter(AnthropicCompatibleAdapter):
     """Adapter for Anthropic Claude API."""
 
+    native_anthropic = True
+
+    def setup_request_headers(self, request: ChatCompletionRequest) -> dict[str, str]:
+        headers = super().setup_request_headers(request)
+        headers.update(request.anthropic_headers or {})
+        return headers
+
+    async def count_tokens(
+        self,
+        body: dict[str, Any],
+        forwarded_headers: dict[str, str] | None = None,
+    ) -> Response:
+        payload = deepcopy(body)
+        payload["model"] = self.map_model_name(str(payload["model"]))
+        headers = self.build_request_headers()
+        headers.update(forwarded_headers or {})
+        url = f"{self.build_request_url('/messages').rstrip('/')}/count_tokens"
+        response = await self.http_client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        return response
+
     async def convert_request(self, request: ChatCompletionRequest) -> dict[str, Any]:
         """Convert OpenAI request to Anthropic format."""
-        anthropic_request = ProtocolConverter.openai_to_anthropic(request)
+        if request.anthropic_payload is not None:
+            # Keep cache_control, structured system blocks, tool-result error
+            # state, and future Anthropic-native fields intact.
+            anthropic_request = deepcopy(request.anthropic_payload)
+        else:
+            anthropic_request = ProtocolConverter.openai_to_anthropic(request)
         # Map model name if needed
         anthropic_request["model"] = self.map_model_name(request.model)
         return anthropic_request
@@ -20,6 +47,9 @@ class AnthropicAdapter(AnthropicCompatibleAdapter):
     async def convert_response(self, response: Response, request: ChatCompletionRequest) -> dict[str, Any]:
         """Convert Anthropic response to OpenAI format."""
         data = response.json()
+
+        if request.anthropic_payload is not None:
+            return data
 
         # Parse Anthropic response
         from rotor.schemas.request import AnthropicMessageResponse
@@ -55,6 +85,15 @@ class AnthropicAdapter(AnthropicCompatibleAdapter):
                 try:
                     # Parse the JSON data
                     event = json.loads(data_str)
+                    if event.get("type") == "error":
+                        error = event.get("error") or {}
+                        raise RuntimeError(
+                            error.get("message") or "Anthropic upstream stream error"
+                        )
+
+                    if request.anthropic_payload is not None:
+                        yield event
+                        continue
 
                     # Convert to OpenAI format
                     openai_chunk = ProtocolConverter.anthropic_stream_to_openai(
@@ -69,22 +108,3 @@ class AnthropicAdapter(AnthropicCompatibleAdapter):
                 except json.JSONDecodeError:
                     # Skip invalid JSON lines
                     continue
-
-
-class AnthropicBedrockAdapter(AnthropicAdapter):
-    """Adapter for Anthropic via AWS Bedrock."""
-
-    async def get_request_url(self, request: ChatCompletionRequest) -> str:
-        """Get the target URL for Bedrock Anthropic."""
-        # Bedrock uses a different URL structure
-        # Format: https://bedrock-runtime.{region}.amazonaws.com/model/{model_id}/invoke
-        model = self.map_model_name(request.model)
-        return f"{self.channel.base_url.rstrip('/')}/model/{model}/invoke"
-
-    def setup_request_headers(self, request: ChatCompletionRequest) -> dict[str, str]:
-        """Set up headers for Bedrock requests."""
-        # For Bedrock, we need AWS signature which would be handled differently
-        # This is a simplified version
-        return {
-            "Content-Type": "application/json",
-        }

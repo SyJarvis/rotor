@@ -3,6 +3,7 @@ from httpx import AsyncClient
 
 from rotor.adapters.base import BaseAdapter
 from rotor.adapters.protocol.openai import OpenAIAdapter, AzureOpenAIAdapter
+from rotor.adapters.protocol.responses import OpenAIResponsesAdapter
 from rotor.adapters.protocol.anthropic import AnthropicAdapter
 from rotor.adapters.providers.moonshot import MoonshotAdapter
 from rotor.adapters.providers.minimax import MiniMaxAdapter
@@ -17,6 +18,7 @@ class AdapterFactory:
     # Registry of adapter classes
     _adapters: dict[str, Type[BaseAdapter]] = {
         "openai": OpenAIAdapter,
+        "deepseek": OpenAIAdapter,
         "azure": AzureOpenAIAdapter,
         "anthropic": AnthropicAdapter,
         "moonshot": MoonshotAdapter,
@@ -56,6 +58,10 @@ class AdapterFactory:
             ValueError: If the provider type is not supported
         """
         provider_type = channel.type.lower()
+
+        provider_protocol = str(getattr(channel, "protocol", "") or "").lower()
+        if provider_protocol in {"responses", "openai_responses"}:
+            return OpenAIResponsesAdapter(channel, http_client)
 
         if provider_type not in cls._adapters:
             raise ValueError(

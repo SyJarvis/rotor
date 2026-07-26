@@ -1,8 +1,9 @@
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator, Optional
-from httpx import AsyncClient, Response
+from httpx import AsyncClient, Response, Timeout
 from rotor.models.channel import Channel
 from rotor.schemas.request import ChatCompletionRequest
+from rotor.channels.presets import channel_option, join_api_url, provider_headers
 
 
 class BaseAdapter(ABC):
@@ -108,18 +109,56 @@ class BaseAdapter(ABC):
         url = await self.get_request_url(request)
         headers = self.setup_request_headers(request)
         body = await self.convert_request(request)
+        body = self.prepare_request_body(request, body)
 
         from rotor.config import settings
-        timeout = timeout or settings.REQUEST_TIMEOUT
+        read_timeout = timeout or settings.REQUEST_TIMEOUT
+        timeout = Timeout(
+            connect=settings.CONNECT_TIMEOUT,
+            read=read_timeout,
+            write=settings.WRITE_TIMEOUT,
+            pool=settings.POOL_TIMEOUT,
+        )
+
+        if request.stream:
+            http_request = self.http_client.build_request(
+                "POST",
+                url,
+                headers=headers,
+                json=body,
+                timeout=timeout,
+            )
+            response = await self.http_client.send(http_request, stream=True)
+            try:
+                response.raise_for_status()
+            except Exception:
+                # Preserve an upstream error body for diagnostics before the
+                # streaming response is closed. Accessing response.json/text
+                # later would otherwise raise httpx.ResponseNotRead.
+                try:
+                    await response.aread()
+                except Exception:
+                    pass
+                await response.aclose()
+                raise
+            return response
 
         response = await self.http_client.post(
             url,
             headers=headers,
             json=body,
-            timeout=timeout
+            timeout=timeout,
         )
         response.raise_for_status()
         return response
+
+    def prepare_request_body(
+        self,
+        request: ChatCompletionRequest,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply protocol-wide options after provider-specific conversion."""
+        return body
 
     def map_model_name(self, model: str) -> str:
         """
@@ -134,40 +173,49 @@ class BaseAdapter(ABC):
         mapping = self.channel.model_mapping or {}
         return mapping.get(model, model)
 
-    async def increment_usage_stats(
-        self,
-        db_session: Any,
-        success: bool = True
-    ) -> None:
-        """
-        Increment channel usage statistics.
+    def build_request_url(self, default_path: str) -> str:
+        path = channel_option(
+            provider=self.channel.type,
+            protocol=self.channel.protocol,
+            extra=self.channel.extra,
+            name="request_path",
+        ) or default_path
+        return join_api_url(self.channel.base_url, path)
 
-        Args:
-            db_session: Database session
-            success: Whether the request was successful
-        """
-        self.channel.total_requests += 1
-        if success:
-            self.channel.success_requests += 1
-        else:
-            self.channel.failed_requests += 1
-
-        # Note: The caller should commit the session
-
+    def build_request_headers(self) -> dict[str, str]:
+        auth_type = channel_option(
+            provider=self.channel.type,
+            protocol=self.channel.protocol,
+            extra=self.channel.extra,
+            name="auth_type",
+        )
+        return provider_headers(
+            key=self.channel.key,
+            auth_type=auth_type,
+            extra_headers=(self.channel.extra or {}).get("headers"),
+        )
 
 class OpenAICompatibleAdapter(BaseAdapter):
     """Base adapter for OpenAI-compatible providers."""
 
+    def prepare_request_body(
+        self,
+        request: ChatCompletionRequest,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        if request.stream:
+            # Apply this after convert_request so provider adapters that
+            # override conversion still request the final usage chunk.
+            body.setdefault("stream_options", {"include_usage": True})
+        return body
+
     async def get_request_url(self, request: ChatCompletionRequest) -> str:
         """Get the target URL for OpenAI-compatible endpoints."""
-        return f"{self.channel.base_url.rstrip('/')}/chat/completions"
+        return self.build_request_url("/chat/completions")
 
     def setup_request_headers(self, request: ChatCompletionRequest) -> dict[str, str]:
         """Set up headers for OpenAI-compatible requests."""
-        return {
-            "Authorization": f"Bearer {self.channel.key}",
-            "Content-Type": "application/json",
-        }
+        return self.build_request_headers()
 
     async def convert_request(self, request: ChatCompletionRequest) -> dict[str, Any]:
         """Convert request to OpenAI format."""
@@ -178,7 +226,6 @@ class OpenAICompatibleAdapter(BaseAdapter):
             "messages": [m.model_dump(exclude_none=True) for m in request.messages],
             "stream": request.stream,
         }
-
         # Add optional parameters
         if request.temperature is not None:
             body["temperature"] = request.temperature
@@ -230,15 +277,11 @@ class AnthropicCompatibleAdapter(BaseAdapter):
 
     async def get_request_url(self, request: ChatCompletionRequest) -> str:
         """Get the target URL for Anthropic-compatible endpoints."""
-        return f"{self.channel.base_url.rstrip('/')}/messages"
+        return self.build_request_url("/messages")
 
     def setup_request_headers(self, request: ChatCompletionRequest) -> dict[str, str]:
         """Set up headers for Anthropic-compatible requests."""
-        headers = {
-            "x-api-key": self.channel.key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        }
+        headers = self.build_request_headers()
         # Add accept header for streaming requests
         if request.stream:
             headers["accept"] = "text/event-stream"
