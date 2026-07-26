@@ -95,6 +95,9 @@ venv.bak/
 # mkdocs documentation
 /site
 
+# Private notes (scratch / debug logs, not for publishing)
+/private/
+
 # mypy
 .mypy_cache/
 
