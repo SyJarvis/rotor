@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -7,6 +8,7 @@ from rotor.models.channel import Channel
 from rotor.models.log import RequestLog
 from rotor.models.token import Token
 from rotor.models.usage import UsageLedger
+from rotor.models.routing_decision import RoutingDecisionRecord
 
 
 @dataclass(slots=True)
@@ -22,7 +24,40 @@ class UsageData:
 
 
 class AccountingService:
-    """Write request logs, usage ledger rows, and cached counters."""
+    """Write request logs and usage ledgers, and update token quota counters."""
+
+    def record_routing_decision(
+        self,
+        db: AsyncSession,
+        *,
+        request_id: str,
+        token: Token | None,
+        model: str,
+        request_protocol: str,
+        decision,
+        required_capabilities: set[str] | None = None,
+        affinity_used: bool = False,
+        features: dict[str, Any] | None = None,
+    ) -> None:
+        candidates = list(decision.candidates)
+        db.add(RoutingDecisionRecord(
+            request_id=request_id,
+            token_id=token.id if token else None,
+            model=model,
+            request_protocol=request_protocol,
+            strategy=decision.strategy,
+            policy_version=f"{decision.strategy}-v1",
+            candidate_channel_ids=[channel.id for channel in candidates],
+            selected_channel_id=candidates[0].id if candidates else None,
+            required_capabilities=sorted(required_capabilities or set()),
+            affinity_used=affinity_used,
+            score_snapshot=(
+                {str(key): value for key, value in decision.scores.items()}
+                if decision.scores
+                else None
+            ),
+            feature_snapshot=features or {},
+        ))
 
     async def record_success(
         self,
@@ -39,7 +74,7 @@ class AccountingService:
         latency_ms: int,
         client_ip: str,
     ) -> None:
-        self._update_cached_counters(token, channel, usage, success=True)
+        self._update_token_counters(token, usage)
         self._add_request_log(
             db,
             token_id=token.id,
@@ -74,6 +109,19 @@ class AccountingService:
                 latency_ms=latency_ms,
             )
         )
+        # Keep online policy updates on the accounting boundary so every
+        # supported protocol feeds the same learning signal.
+        from rotor.gateway.routing import routing_engine
+
+        routing_engine.observe_result(
+            model,
+            channel,
+            success=True,
+            latency_ms=latency_ms,
+            # Pricing is not implemented yet. Unknown cost must remain
+            # neutral instead of teaching the policy that every request is free.
+            cost=None,
+        )
 
     async def record_failure(
         self,
@@ -89,11 +137,8 @@ class AccountingService:
         error_message: str,
         latency_ms: Optional[int],
         client_ip: str,
+        provider_response: dict[str, Any] | None = None,
     ) -> None:
-        if channel:
-            channel.total_requests += 1
-            channel.failed_requests += 1
-
         self._add_request_log(
             db,
             token_id=token.id if token else None,
@@ -105,6 +150,7 @@ class AccountingService:
             client_ip=client_ip,
             error_code=error_code,
             error_message=error_message,
+            response_body=provider_response,
         )
         db.add(
             UsageLedger(
@@ -124,6 +170,15 @@ class AccountingService:
                 latency_ms=latency_ms,
             )
         )
+        if channel is not None:
+            from rotor.gateway.routing import routing_engine
+
+            routing_engine.observe_result(
+                model,
+                channel,
+                success=False,
+                latency_ms=latency_ms,
+            )
 
     def extract_usage(self, response_data: dict) -> UsageData:
         usage = response_data.get("usage") or {}
@@ -131,8 +186,16 @@ class AccountingService:
         completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
         total_tokens = int(usage.get("total_tokens") or prompt_tokens + completion_tokens)
 
-        details = usage.get("completion_tokens_details") or {}
-        prompt_details = usage.get("prompt_tokens_details") or {}
+        details = (
+            usage.get("completion_tokens_details")
+            or usage.get("output_tokens_details")
+            or {}
+        )
+        prompt_details = (
+            usage.get("prompt_tokens_details")
+            or usage.get("input_tokens_details")
+            or {}
+        )
 
         return UsageData(
             prompt_tokens=prompt_tokens,
@@ -140,29 +203,40 @@ class AccountingService:
             total_tokens=total_tokens,
             cached_tokens=int(prompt_details.get("cached_tokens") or 0),
             reasoning_tokens=int(details.get("reasoning_tokens") or 0),
+            input_audio_tokens=int(prompt_details.get("audio_tokens") or 0),
+            output_audio_tokens=int(details.get("audio_tokens") or 0),
             usage_source="provider" if usage else "missing",
         )
 
-    def _update_cached_counters(
+    def streaming_usage(
+        self,
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        has_provider_usage: bool,
+    ) -> UsageData:
+        if not has_provider_usage:
+            return UsageData(usage_source="missing")
+        return self.extract_usage({
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+        })
+
+    def _update_token_counters(
         self,
         token: Token,
-        channel: Channel,
         usage: UsageData,
-        *,
-        success: bool,
     ) -> None:
         token.request_count += 1
         token.token_count += usage.total_tokens
         token.used_quota += usage.total_tokens
+        token.last_used_at = datetime.now(timezone.utc)
 
         if token.quota is not None and token.used_quota >= token.quota:
             token.enabled = False
-
-        channel.total_requests += 1
-        if success:
-            channel.success_requests += 1
-        else:
-            channel.failed_requests += 1
 
     def _add_request_log(
         self,
@@ -177,6 +251,7 @@ class AccountingService:
         client_ip: str,
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
+        response_body: dict[str, Any] | None = None,
     ) -> None:
         db.add(
             RequestLog(
@@ -190,6 +265,7 @@ class AccountingService:
                 success=success,
                 error_code=error_code,
                 error_message=error_message[:500] if error_message else None,
+                response_body=response_body,
                 latency=(latency_ms / 1000) if latency_ms is not None else None,
                 ip=client_ip,
             )
