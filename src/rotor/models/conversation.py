@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Integer, String, func
+from sqlalchemy import DateTime, Integer, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from rotor.database import Base
@@ -11,6 +11,11 @@ class ConversationRecord(Base):
     """Database index for filesystem conversation archives."""
 
     __tablename__ = "conversation_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id", "request_id", name="uq_conv_req"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     conversation_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)

@@ -1,9 +1,9 @@
 import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from rotor.config import settings
@@ -14,10 +14,12 @@ from rotor.core.exceptions import (
     general_exception_handler,
 )
 from rotor.core.middleware import LoggingMiddleware
-from rotor.api.v1 import chat, models, anthropic, responses
-from rotor.api.admin import channels, tokens, logs
+from rotor.api.v1 import chat, images, models, anthropic, responses
+from rotor.api.admin import channels, tokens, logs, settings as admin_settings
 from rotor.models.conversation import ConversationRecord
 from rotor.models.usage import UsageLedger
+from rotor.models.response_route import ResponseRoute
+from rotor.models.routing_decision import RoutingDecisionRecord
 
 # Configure logging
 logging.basicConfig(
@@ -25,11 +27,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-FRONTEND_DIRS = [
-    Path(__file__).resolve().parents[2] / "frontend",
-    Path(__file__).resolve().parent / "frontend",
-]
-FRONTEND_DIR = next((path for path in FRONTEND_DIRS if path.exists()), FRONTEND_DIRS[0])
+FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 
 
 @asynccontextmanager
@@ -40,10 +38,16 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database initialized")
 
+    # Start conversation store background worker
+    from rotor.api.v1.chat import conversation_store
+
+    conversation_store.attach()
+
     yield
 
     # Shutdown
     logger.info("Shutting down Rotor...")
+    await conversation_store.shutdown()
 
 
 # Create FastAPI application
@@ -83,6 +87,8 @@ async def api_root():
         "status": "running",
         "endpoints": {
             "openai": "/v1/chat/completions",
+            "responses": "/v1/responses",
+            "images": "/v1/images/generations",
             "anthropic": "/anthropic/v1/messages",
             "models": "/v1/models",
             "admin": "/api/admin",
@@ -94,7 +100,15 @@ async def api_root():
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "protocols": [
+            "openai_chat",
+            "openai_responses",
+            "anthropic_messages",
+            "openai_images",
+        ],
+    }
 
 
 @app.get("/")
@@ -106,6 +120,7 @@ async def frontend_index():
 # Include routers
 app.include_router(chat.router, prefix=settings.API_V1_STR, tags=["chat"])
 app.include_router(responses.router, prefix=settings.API_V1_STR, tags=["responses"])
+app.include_router(images.router, prefix=settings.API_V1_STR, tags=["images"])
 app.include_router(models.router, prefix=settings.API_V1_STR, tags=["models"])
 # Anthropic-compatible endpoint
 app.include_router(anthropic.router, prefix="/anthropic/v1", tags=["anthropic"])
@@ -114,16 +129,10 @@ app.include_router(anthropic.router, prefix="/anthropic/v1", tags=["anthropic"])
 app.include_router(channels.router, prefix="/api/admin")
 app.include_router(tokens.router, prefix="/api/admin")
 app.include_router(logs.router, prefix="/api/admin")
+app.include_router(admin_settings.router, prefix="/api/admin")
 
 if FRONTEND_DIR.exists():
     app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
-
-
-# Startup event for backward compatibility
-@app.on_event("startup")
-async def startup_event():
-    """Startup event handler (deprecated, use lifespan instead)."""
-    await init_db()
 
 
 if __name__ == "__main__":

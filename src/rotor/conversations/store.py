@@ -1,34 +1,150 @@
 import asyncio
 import json
-from dataclasses import dataclass
+import logging
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from sqlalchemy import update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.config import settings
 from rotor.conversations.sanitizer import sanitize
-from rotor.conversations.schema import event
+from rotor.conversations.schema import utc_now_iso
+from rotor.database import async_session_maker
 from rotor.models.conversation import ConversationRecord
 from rotor.models.channel import Channel
 from rotor.models.token import Token
 from rotor.schemas.request import ChatCompletionRequest
 
+logger = logging.getLogger(__name__)
+
+_MAX_ATTEMPTS = 3  # 1 initial + 2 retries
+
 
 @dataclass(slots=True)
 class ConversationHandle:
+    """Mutable container accumulating one request's full record.
+
+    The request path fills these fields via ``start`` / ``append_*``; only
+    ``finish`` enqueues a write. File-destined data lives here so the worker
+    can emit one complete JSONL line per request (no partial/ragged events).
+    """
+
     conversation_id: str
     request_id: str
     file_path: Path
-    record: Optional[ConversationRecord]
+    model: str = ""
+    protocol: str = ""
+    provider: str = ""
+    channel_id: Optional[int] = None
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    response: Optional[dict[str, Any]] = None
+    usage: Optional[dict[str, Any]] = None
+    error: Optional[dict[str, Any]] = None
+    status: str = "started"
+    latency_ms: Optional[int] = None
+    started_at: str = ""
+    committed: bool = False  # guards against double finish()
+
+
+@dataclass(slots=True)
+class _Event:
+    kind: str  # "db_only" (DB upsert/update) | "commit" (JSONL line + DB update)
+    file_path: Optional[Path] = None
+    payload: Optional[dict[str, Any]] = None  # full record line (commit only)
+    record_op: Optional[dict[str, Any]] = None  # {"action":"upsert"|"update","fields":{...}}
+    record_key: Optional[tuple[str, str]] = None  # (conversation_id, request_id)
+    attempt: int = 0
 
 
 class ConversationStore:
-    """Filesystem JSONL conversation archive with a DB index."""
+    """Async filesystem JSONL conversation archive with a DB index.
 
+    The request path only mutates an in-memory ``ConversationHandle`` (plus a
+    couple of lightweight DB ops for observability); a single background worker
+    drains the queue and performs file I/O + DB writes. One JSONL line is
+    written per request, at ``finish`` time, so each line is a complete,
+    training-ready sample. Failures are retried up to ``_MAX_ATTEMPTS`` times;
+    events still failing are dropped and logged.
+    """
+
+    _SENTINEL: object = object()
+
+    def __init__(self) -> None:
+        self._queue: Optional[asyncio.Queue[_Event]] = None
+        self._worker_task: Optional[asyncio.Task[None]] = None
+
+    # ------------------------------------------------------------------ #
+    # Lifecycle
+    # ------------------------------------------------------------------ #
+    def attach(self) -> None:
+        """Start the background worker. Call once at app startup."""
+        if not settings.CONVERSATION_STORE_ENABLED:
+            logger.info("Conversation store disabled, worker not started")
+            return
+        if self._worker_task is not None and not self._worker_task.done():
+            return
+        self._queue = asyncio.Queue(maxsize=settings.CONVERSATION_QUEUE_MAXSIZE)
+        self._worker_task = asyncio.create_task(
+            self._worker(), name="conversation-store-worker"
+        )
+        logger.info("Conversation store worker started")
+
+    async def shutdown(self, timeout: float = 10.0) -> None:
+        """Signal the worker to stop and wait for it to drain.
+
+        If the queue is momentarily full, retry delivering the sentinel while
+        the worker drains pending events. Cancel the worker if it does not
+        exit within ``timeout`` seconds (e.g. stuck on a failing event).
+        """
+        if self._worker_task is None:
+            return
+
+        if self._queue is not None:
+            sentinel_deadline = asyncio.get_event_loop().time() + timeout
+
+            async def _deliver_sentinel() -> None:
+                assert self._queue is not None
+                while True:
+                    try:
+                        self._queue.put_nowait(self._SENTINEL)  # type: ignore[arg-type]
+                        return
+                    except asyncio.QueueFull:
+                        remaining = sentinel_deadline - asyncio.get_event_loop().time()
+                        if remaining <= 0:
+                            return
+                        await asyncio.sleep(min(0.05, remaining))
+
+            try:
+                await asyncio.wait_for(_deliver_sentinel(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+
+        try:
+            await asyncio.wait_for(self._worker_task, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Conversation worker did not shut down within %.1fs, cancelling",
+                timeout,
+            )
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        finally:
+            self._worker_task = None
+            self._queue = None
+
+    # ------------------------------------------------------------------ #
+    # Public API (request-path side; only mutates handle + light DB ops)
+    # ------------------------------------------------------------------ #
     async def start(
         self,
-        db: AsyncSession,
+        db: AsyncSession,  # kept for signature compatibility; unused
         *,
         conversation_id: str,
         request_id: str,
@@ -36,116 +152,244 @@ class ConversationStore:
         request: ChatCompletionRequest,
         protocol: str,
     ) -> ConversationHandle:
-        file_path = self._file_path(conversation_id, token)
-        record = None
-
-        if settings.CONVERSATION_STORE_ENABLED:
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            record = ConversationRecord(
-                conversation_id=conversation_id,
-                request_id=request_id,
-                user_id=token.user_id,
-                token_id=token.id,
-                model=request.model,
-                protocol=protocol,
-                file_path=str(file_path),
-                status="started",
-            )
-            db.add(record)
-            await self.append_raw(
-                file_path,
-                event(
-                    "conversation_start",
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    user_id=token.user_id,
-                    token_id=token.id,
-                    protocol=protocol,
-                    model=request.model,
-                ),
-            )
-            if settings.SAVE_CONVERSATION_BODY:
-                for message in request.messages:
-                    await self.append_raw(
-                        file_path,
-                        event(
-                            "message",
-                            role=message.role.value,
-                            content=self._message_content(message),
-                        ),
-                    )
-
-        return ConversationHandle(
+        file_path = self._file_path()
+        handle = ConversationHandle(
             conversation_id=conversation_id,
             request_id=request_id,
             file_path=file_path,
-            record=record,
+            model=request.model,
+            protocol=protocol,
+            started_at=utc_now_iso(),
         )
+
+        if not settings.CONVERSATION_STORE_ENABLED:
+            return handle
+
+        if settings.SAVE_CONVERSATION_BODY:
+            handle.messages = [m.model_dump() for m in request.messages]
+
+        # Record start in the DB index (idempotent upsert — survives any
+        # accidental double start() on the same request id).
+        self._enqueue(
+            _Event(
+                kind="db_only",
+                record_op={
+                    "action": "upsert",
+                    "fields": {
+                        "conversation_id": conversation_id,
+                        "request_id": request_id,
+                        "user_id": token.user_id,
+                        "token_id": token.id,
+                        "model": request.model,
+                        "protocol": protocol,
+                        "file_path": str(file_path),
+                        "status": "started",
+                    },
+                },
+                record_key=(conversation_id, request_id),
+            )
+        )
+
+        return handle
 
     async def append_routing(self, handle: ConversationHandle, channel: Channel) -> None:
         if not settings.CONVERSATION_STORE_ENABLED:
             return
-        await self.append_raw(
-            handle.file_path,
-            event(
-                "routing",
-                channel_id=channel.id,
-                provider=channel.type,
-                provider_protocol=channel.protocol,
-            ),
+        handle.provider = channel.type
+        handle.channel_id = channel.id
+        self._enqueue(
+            _Event(
+                kind="db_only",
+                record_op={
+                    "action": "update",
+                    "fields": {
+                        "channel_id": channel.id,
+                        "provider": channel.type,
+                    },
+                },
+                record_key=(handle.conversation_id, handle.request_id),
+            )
         )
-        if handle.record:
-            handle.record.channel_id = channel.id
-            handle.record.provider = channel.type
 
     async def append_response(self, handle: ConversationHandle, response_data: dict[str, Any]) -> None:
         if not settings.CONVERSATION_STORE_ENABLED or not settings.SAVE_PROVIDER_RESPONSE:
             return
-        await self.append_raw(
-            handle.file_path,
-            event("provider_response", response=sanitize(response_data)),
-        )
+        sanitized = sanitize(response_data)
+        try:
+            if sanitized.get("object") == "response":
+                message = {
+                    "id": sanitized.get("id"),
+                    "status": sanitized.get("status"),
+                    "output": sanitized.get("output") or [],
+                }
+            elif sanitized.get("type") == "message":
+                message = {
+                    "id": sanitized.get("id"),
+                    "role": sanitized.get("role"),
+                    "content": sanitized.get("content") or [],
+                    "stop_reason": sanitized.get("stop_reason"),
+                }
+            else:
+                message = sanitized["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError):
+            message = None
+        handle.response = message
 
     async def append_usage(self, handle: ConversationHandle, usage: dict[str, Any]) -> None:
         if not settings.CONVERSATION_STORE_ENABLED:
             return
-        await self.append_raw(handle.file_path, event("usage", usage=usage))
+        handle.usage = usage or None
 
     async def append_error(self, handle: ConversationHandle, error_code: str, error_message: str) -> None:
         if not settings.CONVERSATION_STORE_ENABLED:
             return
-        await self.append_raw(
-            handle.file_path,
-            event("error", error_code=error_code, error_message=error_message),
-        )
+        handle.error = {"code": error_code, "message": error_message}
 
-    async def finish(self, handle: ConversationHandle, status: str, latency_ms: int | None) -> None:
+    async def finish(self, handle: ConversationHandle, status: str, latency_ms: Optional[int]) -> None:
         if not settings.CONVERSATION_STORE_ENABLED:
             return
-        await self.append_raw(
-            handle.file_path,
-            event("conversation_end", status=status, latency_ms=latency_ms),
+        if handle.committed:
+            return
+        handle.committed = True
+        handle.status = status
+        handle.latency_ms = latency_ms
+
+        record_key = (handle.conversation_id, handle.request_id)
+        line = {
+            "conversation_id": handle.conversation_id,
+            "request_id": handle.request_id,
+            "model": handle.model,
+            "provider": handle.provider or None,
+            "protocol": handle.protocol,
+            "created_at": handle.started_at,
+            "status": handle.status,
+            "latency_ms": handle.latency_ms,
+            "messages": handle.messages,
+            "response": handle.response,
+            "usage": handle.usage,
+            "error": handle.error,
+        }
+        self._enqueue(
+            _Event(
+                kind="commit",
+                file_path=handle.file_path,
+                payload=line,
+                record_op={
+                    "action": "update",
+                    "fields": {
+                        "status": handle.status,
+                        "provider": handle.provider or None,
+                        "channel_id": handle.channel_id,
+                    },
+                },
+                record_key=record_key,
+            )
         )
-        if handle.record:
-            handle.record.status = status
 
+    # ------------------------------------------------------------------ #
+    # Worker
+    # ------------------------------------------------------------------ #
+    def _enqueue(self, ev: _Event) -> None:
+        assert self._queue is not None, "ConversationStore.attach() not called"
+        try:
+            self._queue.put_nowait(ev)
+        except asyncio.QueueFull:
+            logger.warning(
+                "Conversation queue full (maxsize=%d), dropping kind=%s",
+                settings.CONVERSATION_QUEUE_MAXSIZE,
+                ev.kind,
+            )
+
+    async def _worker(self) -> None:
+        assert self._queue is not None
+        async with async_session_maker() as db:
+            while True:
+                item = await self._queue.get()
+                if item is self._SENTINEL:
+                    break
+                await self._handle_event(db, item)  # type: ignore[arg-type]
+
+    async def _handle_event(self, db: AsyncSession, ev: _Event) -> None:
+        try:
+            await self._process(db, ev)
+            await db.commit()
+        except Exception:
+            logger.exception("Conversation event failed kind=%s attempt=%d", ev.kind, ev.attempt)
+            await self._safe_rollback(db)
+            if ev.attempt + 1 < _MAX_ATTEMPTS:
+                ev.attempt += 1
+                self._enqueue(ev)
+            else:
+                logger.error("Dropping event kind=%s after %d attempts", ev.kind, _MAX_ATTEMPTS)
+
+    async def _process(self, db: AsyncSession, ev: _Event) -> None:
+        # File write — only on commit, one complete line per request.
+        if ev.kind == "commit" and ev.payload is not None and ev.file_path is not None:
+            line = json.dumps(ev.payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+            await self._append_raw(ev.file_path, line)
+
+        # DB op.
+        if ev.record_op is not None:
+            action = ev.record_op.get("action")
+            fields = ev.record_op.get("fields") or {}
+            if action == "upsert":
+                await self._upsert_record(db, fields)
+            elif action == "update" and ev.record_key is not None:
+                conv_id, req_id = ev.record_key
+                await db.execute(
+                    update(ConversationRecord)
+                    .where(
+                        ConversationRecord.conversation_id == conv_id,
+                        ConversationRecord.request_id == req_id,
+                    )
+                    .values(**fields)
+                )
+
+    async def _upsert_record(self, db: AsyncSession, fields: dict[str, Any]) -> None:
+        stmt = sqlite_insert(ConversationRecord).values(**fields)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["conversation_id", "request_id"],
+            set_={
+                # Refresh mutable metadata on conflict, but never clobber a
+                # terminal status (success/failed) back to "started".
+                "model": stmt.excluded.model,
+                "protocol": stmt.excluded.protocol,
+                "file_path": stmt.excluded.file_path,
+            },
+        )
+        await db.execute(stmt)
+
+    async def _safe_rollback(self, db: AsyncSession) -> None:
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("Rollback failed")
+
+    # ------------------------------------------------------------------ #
+    # File path helpers
+    # ------------------------------------------------------------------ #
     async def append_raw(self, file_path: Path, payload: dict[str, Any]) -> None:
+        """Direct append bypassing the worker — retained for ad-hoc use."""
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
-        await asyncio.to_thread(self._append_line, file_path, line)
+        await self._append_raw(file_path, line)
 
-    def _append_line(self, file_path: Path, line: str) -> None:
-        with file_path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
+    async def _append_raw(self, file_path: Path, line: str) -> None:
+        def _write() -> None:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            with file_path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
 
-    def _file_path(self, conversation_id: str, token: Token) -> Path:
-        from datetime import datetime
+        await asyncio.to_thread(_write)
 
-        day = datetime.utcnow().strftime("%Y-%m-%d")
-        owner = f"user_{token.user_id}" if token.user_id else f"token_{token.id}"
-        filename = f"{conversation_id}.jsonl"
-        return Path(settings.CONVERSATION_STORE_DIR) / day / owner / filename
+    def _file_path(self) -> Path:
+        from datetime import datetime, timezone
 
-    def _message_content(self, message) -> list[dict[str, Any]]:
-        if message.content is None:
-            return []
-        return [{"type": "text", "text": message.content}]
+        now = datetime.now(timezone.utc)
+        month = now.strftime("%Y-%m")
+        day = now.strftime("%Y-%m-%d")
+        return Path(settings.CONVERSATION_STORE_DIR) / month / f"{day}.jsonl"
+
+    @staticmethod
+    def _safe_component(value: object) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+        return cleaned[:128] or "unknown"
