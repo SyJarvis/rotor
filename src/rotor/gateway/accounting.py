@@ -197,11 +197,18 @@ class AccountingService:
             or {}
         )
 
+        # Anthropic exposes cache metrics as top-level fields rather than
+        # nested under details. Prefer the OpenAI nested format and fall
+        # back to Anthropic's top-level cache_read_input_tokens.
+        cached_tokens = int(prompt_details.get("cached_tokens") or 0)
+        if not cached_tokens:
+            cached_tokens = int(usage.get("cache_read_input_tokens") or 0)
+
         return UsageData(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
-            cached_tokens=int(prompt_details.get("cached_tokens") or 0),
+            cached_tokens=cached_tokens,
             reasoning_tokens=int(details.get("reasoning_tokens") or 0),
             input_audio_tokens=int(prompt_details.get("audio_tokens") or 0),
             output_audio_tokens=int(details.get("audio_tokens") or 0),
@@ -214,6 +221,7 @@ class AccountingService:
         prompt_tokens: int,
         completion_tokens: int,
         has_provider_usage: bool,
+        cached_tokens: int = 0,
     ) -> UsageData:
         if not has_provider_usage:
             return UsageData(usage_source="missing")
@@ -222,6 +230,9 @@ class AccountingService:
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
+                "prompt_tokens_details": {
+                    "cached_tokens": cached_tokens,
+                },
             }
         })
 
@@ -262,6 +273,7 @@ class AccountingService:
                 prompt_tokens=usage.prompt_tokens,
                 completion_tokens=usage.completion_tokens,
                 total_tokens=usage.total_tokens,
+                cached_tokens=usage.cached_tokens,
                 success=success,
                 error_code=error_code,
                 error_message=error_message[:500] if error_message else None,

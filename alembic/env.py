@@ -17,6 +17,7 @@ from rotor.models.conversation import ConversationRecord
 from rotor.models.usage import UsageLedger
 from rotor.models.response_route import ResponseRoute
 from rotor.models.routing_decision import RoutingDecisionRecord
+from rotor.models.request_attempt import RequestAttempt
 
 # this is the Alembic Config object
 config = context.config

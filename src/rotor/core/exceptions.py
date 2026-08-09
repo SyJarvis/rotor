@@ -3,6 +3,7 @@ import logging
 from typing import Any, Optional
 from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from rotor.schemas.error import ErrorCategory, ErrorPhase, UpstreamErrorFact
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,117 @@ def upstream_error_payload(exc: Exception) -> dict[str, Any] | None:
         "request_ids": request_ids,
         "body": _sanitize_provider_value(body),
     }
+
+
+def _indicates_missing_model(body: Any) -> bool:
+    """Only infer model-not-found when the sanitized provider body says so."""
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error", body)
+    if not isinstance(error, dict):
+        return False
+    evidence = " ".join(
+        str(error.get(name, ""))
+        for name in ("code", "type", "message")
+    ).lower()
+    return "model" in evidence and any(
+        marker in evidence
+        for marker in ("not found", "not_found", "does not exist", "unknown")
+    )
+
+
+def normalize_upstream_error(
+    exc: Exception,
+    *,
+    phase: ErrorPhase = ErrorPhase.PROVIDER_REQUEST,
+) -> UpstreamErrorFact:
+    """Return a stable, sanitized diagnostic fact for an upstream failure."""
+    import httpx
+
+    provider_error = upstream_error_payload(exc)
+    upstream_status = None
+    sanitized_body = None
+    provider_request_ids: dict[str, str] = {}
+
+    if provider_error is not None:
+        upstream_status = provider_error["status_code"]
+        sanitized_body = provider_error["body"]
+        provider_request_ids = provider_error["request_ids"]
+
+    retry_after = None
+    if isinstance(exc, httpx.TimeoutException):
+        code = "upstream_timeout"
+        category = ErrorCategory.TIMEOUT
+        retry_same_channel = True
+        fallback_allowed = True
+        message = "Upstream request timed out"
+    elif isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        if status_code in {401, 403}:
+            code = "upstream_authentication_failed"
+            category = ErrorCategory.AUTHENTICATION_OR_PERMISSION
+        elif status_code == 402:
+            code = "upstream_quota_exhausted"
+            category = ErrorCategory.QUOTA_OR_RATE_LIMIT
+        elif status_code == 429:
+            code = "upstream_rate_limited"
+            category = ErrorCategory.QUOTA_OR_RATE_LIMIT
+        elif status_code == 404 and _indicates_missing_model(sanitized_body):
+            code = "upstream_model_not_found"
+            category = ErrorCategory.MODEL_NOT_FOUND
+        elif status_code == 404:
+            code = "upstream_resource_not_found"
+            category = ErrorCategory.PROTOCOL_OR_PARAMETER_ERROR
+        elif status_code in {408, 425}:
+            code = "upstream_temporarily_unavailable"
+            category = ErrorCategory.UPSTREAM_AVAILABILITY
+        elif status_code >= 500:
+            code = "upstream_unavailable"
+            category = ErrorCategory.UPSTREAM_AVAILABILITY
+        else:
+            code = "upstream_protocol_or_parameter_error"
+            category = ErrorCategory.PROTOCOL_OR_PARAMETER_ERROR
+        fallback_allowed = (
+            status_code in {401, 402, 403, 404, 408, 409, 425, 429}
+            or status_code >= 500
+        )
+        retry_same_channel = (
+            status_code in {408, 409, 425, 429}
+            or status_code >= 500
+        )
+        if status_code == 429:
+            value = exc.response.headers.get("retry-after")
+            try:
+                retry_after = float(value) if value is not None else None
+            except ValueError:
+                retry_after = None
+        message = f"Upstream returned HTTP {status_code}"
+    elif isinstance(exc, httpx.RequestError):
+        code = "upstream_connection_failed"
+        category = ErrorCategory.NETWORK_CONNECTIVITY
+        retry_same_channel = True
+        fallback_allowed = True
+        message = "Upstream connection failed"
+    else:
+        code = "upstream_unknown_error"
+        category = ErrorCategory.UNKNOWN
+        retry_same_channel = False
+        fallback_allowed = False
+        message = type(exc).__name__
+
+    return UpstreamErrorFact(
+        code=code,
+        category=category,
+        phase=phase,
+        upstream_status=upstream_status,
+        retryable=retry_same_channel or fallback_allowed,
+        retry_same_channel=retry_same_channel,
+        fallback_allowed=fallback_allowed,
+        retry_after_seconds=retry_after,
+        message=message,
+        sanitized_body=sanitized_body,
+        provider_request_ids=provider_request_ids,
+    )
 
 
 def format_error_message(exc: Exception) -> str:

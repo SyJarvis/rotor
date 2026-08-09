@@ -24,6 +24,56 @@ class ProtocolConverter:
     """Converter between OpenAI and Anthropic protocols."""
 
     @staticmethod
+    def _content_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+        return "\n".join(
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+
+    @staticmethod
+    def _openai_content_to_anthropic(content: Any) -> list[dict[str, Any]]:
+        if isinstance(content, str):
+            return [{"type": "text", "text": content}] if content else []
+        if not isinstance(content, list):
+            return []
+
+        blocks: list[dict[str, Any]] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
+                blocks.append({"type": "text", "text": str(item.get("text", ""))})
+                continue
+            if item.get("type") != "image_url":
+                continue
+            image = item.get("image_url")
+            url = image.get("url") if isinstance(image, dict) else image
+            if not isinstance(url, str) or not url:
+                continue
+            if url.startswith("data:image/") and ";base64," in url:
+                header, data = url.split(",", 1)
+                media_type = header[5:].split(";", 1)[0]
+                blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data,
+                    },
+                })
+            else:
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "url", "url": url},
+                })
+        return blocks
+
+    @staticmethod
     def openai_to_anthropic_messages(messages: List[ChatMessage]) -> tuple[List[Dict], Optional[str]]:
         """
         Convert OpenAI messages to Anthropic format.
@@ -37,22 +87,28 @@ class ProtocolConverter:
         for msg in messages:
             if msg.role == Role.SYSTEM:
                 system_prompt = "\n".join(
-                    part for part in (system_prompt, msg.content) if part
+                    part
+                    for part in (
+                        system_prompt,
+                        ProtocolConverter._content_text(msg.content),
+                    )
+                    if part
                 )
             elif msg.role in (Role.USER, Role.ASSISTANT):
                 content = msg.content or ""
-                # Anthropic protocol requires content to be an array format
-                # Format: [{"type": "text", "text": "..."}]
                 anthropic_msg: Dict[str, Any] = {
                     "role": msg.role.value,
-                    "content": [{"type": "text", "text": content}]
+                    "content": ProtocolConverter._openai_content_to_anthropic(content),
                 }
+                if not anthropic_msg["content"] and not msg.tool_calls:
+                    anthropic_msg["content"] = [{"type": "text", "text": ""}]
 
                 # Handle tool calls in assistant messages
                 if msg.tool_calls:
                     content_blocks = []
-                    if content:
-                        content_blocks.append({"type": "text", "text": content})
+                    content_blocks.extend(
+                        ProtocolConverter._openai_content_to_anthropic(content)
+                    )
 
                     for tool_call in msg.tool_calls:
                         import json
@@ -81,7 +137,7 @@ class ProtocolConverter:
                         "content": [{
                             "type": "tool_result",
                             "tool_use_id": msg.tool_call_id or "",
-                            "content": msg.content or "",
+                            "content": ProtocolConverter._content_text(msg.content),
                         }],
                     },
                 )
@@ -181,7 +237,8 @@ class ProtocolConverter:
         return Usage(
             prompt_tokens=usage.input_tokens,
             completion_tokens=usage.output_tokens,
-            total_tokens=usage.input_tokens + usage.output_tokens
+            total_tokens=usage.input_tokens + usage.output_tokens,
+            prompt_tokens_details={"cached_tokens": usage.cache_read_input_tokens},
         )
 
     @staticmethod
@@ -307,6 +364,9 @@ class ProtocolConverter:
                         usage.get("input_tokens", 0)
                         + usage.get("output_tokens", 0)
                     ),
+                    "prompt_tokens_details": {
+                        "cached_tokens": usage.get("cache_read_input_tokens", 0),
+                    },
                 }
             return chunk
 
@@ -425,6 +485,9 @@ class ProtocolConverter:
                         usage.get("input_tokens", 0)
                         + usage.get("output_tokens", 0)
                     ),
+                    "prompt_tokens_details": {
+                        "cached_tokens": usage.get("cache_read_input_tokens", 0),
+                    },
                 }
             return chunk
 
