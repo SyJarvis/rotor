@@ -3,13 +3,14 @@
 import { api } from "../api.js";
 import { t } from "../i18n.js";
 import {
-  escapeHtml, formatNumber, formatLatency, skeletonKpis, refreshIcons,
+  escapeHtml, formatNumber, formatLatency, skeletonKpis, refreshIcons, badge,
 } from "../ui.js";
 import { renderStackedBar, renderDonut, renderHBar, isAvailable } from "../charts.js?v=8";
 
 const RANGES = [
   { key: "24h", label: "24小时", days: 1, bucket: "hour", bucketCount: 24 },
   { key: "7d",  label: "7天",   days: 7, bucket: "day",  bucketCount: 7 },
+  { key: "30d", label: "30天",  days: 30, bucket: "day", bucketCount: 30 },
 ];
 
 let state = {
@@ -18,6 +19,7 @@ let state = {
   channelFilter: "",
   stats: null,
   timeline: [],       // raw long-format rows from timeseries_by_model
+  timelineLoaded: false,
   modelsAgg: [],      // /logs/models
   channels: [],
 };
@@ -49,11 +51,12 @@ async function fetchAll() {
   const q = filterQuery();
   const [stats, timeline, modelsAgg] = await Promise.all([
     api(`/api/admin/logs/stats?days=${range.days}${q}`).catch(() => null),
-    api(`/api/admin/logs/timeseries_by_model?days=${range.days}&bucket=${range.bucket}${q}`).catch(() => []),
+    api(`/api/admin/logs/timeseries_by_model?days=${range.days}&bucket=${range.bucket}${q}`).catch(() => null),
     api(`/api/admin/logs/models?days=${range.days}&limit=8${q}`).catch(() => []),
   ]);
   state.stats = stats;
-  state.timeline = timeline;
+  state.timelineLoaded = Array.isArray(timeline);
+  state.timeline = timeline || [];
   state.modelsAgg = modelsAgg;
 }
 
@@ -62,7 +65,20 @@ export async function setFilter(key, value) { state[key] = value; await load(); 
 
 export function render() {
   const container = document.getElementById("usage");
-  const s = state.stats || {};
+  // The chart rows are already constrained to the selected range and filters.
+  // Derive the headline token total from those same rows so the KPI can never
+  // accidentally show an all-time aggregate while the request KPI/chart show
+  // only 7 or 30 days.
+  const rangedTokenTotal = state.timeline.reduce(
+    (total, row) => total + Number(row.tokens || 0),
+    0,
+  );
+  const s = {
+    ...(state.stats || {}),
+    total_tokens: state.timelineLoaded
+      ? rangedTokenTotal
+      : (state.stats?.total_tokens || 0),
+  };
   const range = RANGES.find((r) => r.key === state.range) || RANGES[1];
   const successRate = s.total_requests ? ((s.success_requests / s.total_requests) * 100) : 0;
   const chartAvailable = isAvailable();
@@ -119,6 +135,15 @@ export function render() {
         <div class="kpi-value">${formatLatency(s.avg_latency)}</div>
         <div class="kpi-delta">${state.timeline.length} ${t("buckets")}</div>
       </div>
+      <div class="kpi">
+        <div class="kpi-label"><i data-lucide="zap"></i>${t("cacheHitRate") || "Cache hit"}</div>
+        <div class="kpi-value">${
+          (s.prompt_tokens || 0) > 0
+            ? Number(s.cache_hit_rate || 0).toFixed(1) + "%"
+            : "—"
+        }</div>
+        <div class="kpi-delta">${formatNumber(s.cached_tokens || 0)} ${t("cacheHitTokens") || "hits"}</div>
+      </div>
     </div>
 
     <div class="chart-card">
@@ -149,6 +174,48 @@ export function render() {
         <div class="chart-canvas-wrap" style="height:240px">
           ${chartAvailable ? `<canvas id="hbarChart"></canvas>` : renderChannelsFallback()}
         </div>
+      </div>
+    </div>
+
+    <div class="chart-card" style="margin-top:14px">
+      <div class="card-head">
+        <div class="card-title">${t("modelTableTitle") || "按模型明细"}</div>
+        <div class="card-sub">${t("modelTableHint") || "输入/输出/缓存命中按模型拆分"}</div>
+      </div>
+      <div class="table-wrap">
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>${t("columns").models}</th>
+              <th>${t("metrics")[0]}</th>
+              <th>${t("metrics")[4] || "输入"}</th>
+              <th>${t("metrics")[5] || "输出"}</th>
+              <th>${t("cacheHitTokens") || "缓存命中"}</th>
+              <th>${t("cacheHitRate") || "命中率"}</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${(state.modelsAgg || []).map((m) => {
+              const prompt = Number(m.prompt_tokens || 0);
+              const completion = Number(m.completion_tokens || 0);
+              const cached = Number(m.cached_tokens || 0);
+              const rate = Number(m.cache_hit_rate || 0);
+              const rateBadge = cached > 0
+                ? badge(rate.toFixed(1) + "%", rate >= 50 ? "success" : rate >= 10 ? "info" : "")
+                : '<span class="muted">—</span>';
+              return `<tr>
+                <td><code>${escapeHtml(m.model)}</code></td>
+                <td class="mono">${formatNumber(m.request_count)}</td>
+                <td class="mono">${formatNumber(prompt)}</td>
+                <td class="mono">${formatNumber(completion)}</td>
+                <td class="mono">${formatNumber(cached)}</td>
+                <td>${rateBadge}</td>
+              </tr>`;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
       </div>
     </div>
   `;

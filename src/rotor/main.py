@@ -15,11 +15,19 @@ from rotor.core.exceptions import (
 )
 from rotor.core.middleware import LoggingMiddleware
 from rotor.api.v1 import chat, images, models, anthropic, responses
-from rotor.api.admin import channels, tokens, logs, settings as admin_settings
-from rotor.models.conversation import ConversationRecord
-from rotor.models.usage import UsageLedger
-from rotor.models.response_route import ResponseRoute
-from rotor.models.routing_decision import RoutingDecisionRecord
+from rotor.api.admin import channels, tokens, logs, mindagent, settings as admin_settings
+from rotor.api.control import channels as control_channels
+from rotor.api.control import requests as control_requests
+from rotor.core.control_auth import (
+    ControlAPIException,
+    control_api_exception_handler,
+)
+# Model imports register tables in Base.metadata during application startup.
+from rotor.models.conversation import ConversationRecord  # noqa: F401
+from rotor.models.usage import UsageLedger  # noqa: F401
+from rotor.models.response_route import ResponseRoute  # noqa: F401
+from rotor.models.routing_decision import RoutingDecisionRecord  # noqa: F401
+from rotor.models.request_attempt import RequestAttempt  # noqa: F401
 
 # Configure logging
 logging.basicConfig(
@@ -75,6 +83,10 @@ app.add_middleware(LoggingMiddleware)
 
 # Exception handlers
 app.add_exception_handler(APIRouterException, api_router_exception_handler)
+app.add_exception_handler(
+    ControlAPIException,
+    control_api_exception_handler,
+)
 app.add_exception_handler(Exception, general_exception_handler)
 
 
@@ -92,6 +104,7 @@ async def api_root():
             "anthropic": "/anthropic/v1/messages",
             "models": "/v1/models",
             "admin": "/api/admin",
+            "control": "/api/control/v1",
             "admin_ui": "/",
         }
     }
@@ -130,6 +143,11 @@ app.include_router(channels.router, prefix="/api/admin")
 app.include_router(tokens.router, prefix="/api/admin")
 app.include_router(logs.router, prefix="/api/admin")
 app.include_router(admin_settings.router, prefix="/api/admin")
+app.include_router(mindagent.router, prefix="/api/admin")
+
+# Independently authenticated Control API.
+app.include_router(control_channels.router, prefix="/api/control/v1")
+app.include_router(control_requests.router, prefix="/api/control/v1")
 
 if FRONTEND_DIR.exists():
     app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
