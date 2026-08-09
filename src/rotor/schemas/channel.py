@@ -7,7 +7,6 @@ class ChannelBase(BaseModel):
     """Base channel schema."""
     name: str = Field(..., min_length=1, max_length=100, description="Channel name")
     type: str = Field(..., min_length=1, max_length=50, description="Provider type")
-    key: str = Field(..., min_length=1, max_length=500, description="API Key")
     base_url: str = Field(..., min_length=1, max_length=500, description="Base URL")
     models: List[str] = Field(default_factory=list, description="Available models")
     model_mapping: Dict[str, str] = Field(default_factory=dict, description="Model name mapping")
@@ -23,7 +22,7 @@ class ChannelBase(BaseModel):
 
 class ChannelCreate(ChannelBase):
     """Schema for creating a channel."""
-    pass
+    key: str = Field(..., min_length=1, max_length=500, description="API Key")
 
 
 class ChannelUpdate(BaseModel):
