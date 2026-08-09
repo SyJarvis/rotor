@@ -3,9 +3,6 @@
 Rotor MCP Server 是 MindAgent 与 Rotor Backend 之间的 MCP 协议适配层。它只通过
 Rotor Control API 读取数据，不导入 Rotor 后端模块，也不直接连接数据库。
 
-完整的启动、客户端配置、Tool 参数、示例和故障排查见
-[Rotor MCP 使用手册](docs/usage.md)。
-
 ## 当前实现
 
 Server 使用官方 Python MCP SDK `2.0.0` 和 stdio transport，提供五个只读 Tool：

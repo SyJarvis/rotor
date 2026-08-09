@@ -115,6 +115,8 @@ nav:
       - Codex / Claude Code / OpenCode: client-integrations.md
   - 架构设计:
       - 流式请求与异步记账: 流式请求与异步记账设计.md
+      - 模型卡与模型能力知识库: model-cards-design.md
+      - 实现路线图: roadmap.md
   - 性能:
       - 基准测试: 基准测试.md
   - 故障排查:

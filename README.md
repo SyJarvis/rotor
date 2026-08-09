@@ -10,7 +10,7 @@ done directly through HTTP admin APIs.
 ## Run
 
 ```bash
-cd /Users/whoami/research/apirouter/rotor
+cd /path/to/rotor
 pip install -e .
 rotor serve --host 0.0.0.0 --port 8000
 ```
@@ -37,7 +37,33 @@ By default, Rotor stores runtime files in `~/.cache/rotor`:
 DATABASE_URL=
 # Optional. Defaults to ~/.cache/rotor/conversations
 CONVERSATION_STORE_DIR=
+# Required before using the authenticated Control API or Rotor MCP Server.
+ROTOR_CONTROL_API_TOKEN=
 ```
+
+Generate one Control API token and provide the same value to Rotor and the
+Rotor MCP Server or MindAgent:
+
+```bash
+export ROTOR_CONTROL_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+```
+
+Control API requests use a standard Bearer header. This token is deliberately
+separate from ordinary `sk-` Rotor client keys:
+
+```bash
+curl http://localhost:8000/api/control/v1/requests/req_xxx/trace \
+  -H "Authorization: Bearer $ROTOR_CONTROL_API_TOKEN" \
+  -H "X-Agent-Id: mindagent" \
+  -H "X-Agent-Run-Id: run_xxx"
+```
+
+The initial token has the `channel:read`, `request_trace:read`, and
+`usage:read` scopes by default. Override `ROTOR_CONTROL_API_SCOPES` to reduce
+the granted scopes.
+
+For Rotor MCP startup, client configuration, and tool usage, see the
+[Rotor MCP Server README](mcp/README.md).
 
 ## Configure Channels
 
