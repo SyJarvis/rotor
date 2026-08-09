@@ -1,8 +1,9 @@
 import asyncio
 from types import SimpleNamespace
 
+import rotor.api.admin.channels as channels_api
 from rotor.adapters.factory import AdapterFactory
-from rotor.api.admin.channels import _probe_generation_capability
+from rotor.api.admin.channels import _fetch_model_list, _probe_generation_capability
 from rotor.channels.presets import (
     channel_option,
     join_api_url,
@@ -40,6 +41,54 @@ def test_anthropic_defaults_and_headers() -> None:
     headers = provider_headers(key="secret", auth_type=defaults["auth_type"])
     assert headers["x-api-key"] == "secret"
     assert "Authorization" not in headers
+
+
+def test_anthropic_protocol_keeps_non_anthropic_provider_auth() -> None:
+    defaults = provider_defaults("zhipu", "anthropic")
+
+    assert defaults["request_path"] == "/messages"
+    assert defaults["models_path"] == "/models"
+    assert defaults["auth_type"] == "bearer"
+
+
+def test_anthropic_model_probe_keeps_provider_bearer_auth(monkeypatch) -> None:
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"id": "glm-test"}]}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, headers):
+            captured["url"] = url
+            captured["headers"] = headers
+            return FakeResponse()
+
+    monkeypatch.setattr(channels_api.httpx, "AsyncClient", FakeClient)
+
+    models = asyncio.run(_fetch_model_list(
+        base_url="https://example.test/v1",
+        key="secret",
+        provider_type="zhipu",
+        protocol="anthropic",
+    ))
+
+    assert models == ["glm-test"]
+    assert captured["url"] == "https://example.test/v1/models"
+    assert captured["headers"]["Authorization"] == "Bearer secret"
+    assert "x-api-key" not in captured["headers"]
 
 
 def test_responses_protocol_uses_responses_request_path() -> None:
