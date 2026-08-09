@@ -8,6 +8,8 @@ import asyncio
 import httpx
 import json
 
+__test__ = False  # Manual live smoke script; excluded from the offline test suite.
+
 GATEWAY_URL = "http://localhost:8000"
 
 

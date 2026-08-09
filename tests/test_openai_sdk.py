@@ -6,6 +6,8 @@ import os
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
+__test__ = False  # Manual live smoke script; excluded from the offline test suite.
+
 load_dotenv()
 
 async def test_openai_sdk():
