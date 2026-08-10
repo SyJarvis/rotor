@@ -8,10 +8,11 @@ services:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql+asyncpg://rotor:rotor@db:5432/rotor
+      - CONVERSATION_STORE_DIR=/data/conversations
       - LOG_LEVEL=INFO
     volumes:
       - ./src:/app/src
-      - ./data:/app/data
+      - ./data:/data
     depends_on:
       - db
     restart: unless-stopped

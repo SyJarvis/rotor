@@ -24,11 +24,15 @@ python -m rotor.cli serve --host 0.0.0.0 --port 8000
 
 ```bash
 docker build -t rotor .
+mkdir -p "$HOME/.cache/rotor"
+
 docker run --rm -p 8000:8000 \
-  -e DATABASE_URL=sqlite+aiosqlite:////app/data/rotor.db \
-  -v "$PWD/data:/app/data" \
+  -v "$HOME/.cache/rotor:/data" \
   rotor
 ```
+
+镜像默认使用 `/data/rotor.db` 和 `/data/conversations/`。把宿主机目录挂载到
+`/data` 后，SQLite 数据库和 Conversation store 会一起持久化。
 
 ## Docker Compose
 
@@ -40,7 +44,8 @@ curl http://127.0.0.1:8000/health
 ```
 
 示例 Compose 中的数据库用户名和密码是开发默认值，公开部署前必须替换，并避免
-把 PostgreSQL 的 `5432` 端口暴露到不受信任网络。
+把 PostgreSQL 的 `5432` 端口暴露到不受信任网络。Compose 使用 PostgreSQL volume
+保存主数据库，并将 Conversation store 保存到宿主机的 `./data/conversations/`。
 
 ## 数据库初始化
 
