@@ -98,6 +98,19 @@ venv.bak/
 # Private notes (scratch / debug logs, not for publishing)
 /private/
 
+# Local handoff, investigation, and client-integration notes
+/.mcp.json
+/docs/codex-handoff-*.md
+/docs/debug/
+/docs/mindagent-rotor-agent-design.md
+/docs/rotor-control-api-design.md
+/docs/rotor-control-plane-design.md
+/docs/rotor-mcp-mindagent-design.md
+/docs/提交拆分指南.md
+/mcp/docs/
+/rotor接入claudecode指南.md
+/rotor接入codex指南.md
+
 # mypy
 .mypy_cache/
 
@@ -110,8 +123,18 @@ venv.bak/
 
 # Database
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.db.bak-*
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
 *.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3-journal
 data/
 
 # OS

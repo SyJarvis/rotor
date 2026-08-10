@@ -119,5 +119,3 @@ nav:
       - 实现路线图: roadmap.md
   - 性能:
       - 基准测试: 基准测试.md
-  - 故障排查:
-      - Bug 分析 (2026-07-10): debug/bug-analysis-2026-07-10.md
