@@ -12,6 +12,13 @@ from rotor.models.log import RequestLog
 router = APIRouter(prefix="/logs", tags=["logs"])
 
 
+def _cache_hit_rate(prompt_tokens: int | None, cached_tokens: int | None) -> float:
+    prompt = int(prompt_tokens or 0)
+    if prompt <= 0:
+        return 0.0
+    return int(cached_tokens or 0) / prompt * 100
+
+
 class RequestLogResponse(BaseModel):
     """Schema for request log response."""
     model_config = ConfigDict(from_attributes=True)
@@ -24,6 +31,7 @@ class RequestLogResponse(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    cached_tokens: int
     cost: Optional[float]
     success: bool
     error_code: Optional[str]
@@ -103,6 +111,7 @@ async def list_logs(
 async def get_log_stats(
     token_id: Optional[int] = None,
     channel_id: Optional[int] = None,
+    model: Optional[str] = None,
     days: int = Query(7, ge=1, le=90),
     db: AsyncSession = Depends(get_db),
 ):
@@ -112,6 +121,7 @@ async def get_log_stats(
     Args:
         token_id: Filter by token ID
         channel_id: Filter by channel ID
+        model: Filter by model name
         days: Number of days to include in stats
     """
     start_time = datetime.utcnow() - timedelta(days=days)
@@ -125,6 +135,9 @@ async def get_log_stats(
     if channel_id is not None:
         conditions.append(RequestLog.channel_id == channel_id)
 
+    if model is not None:
+        conditions.append(RequestLog.model == model)
+
     # Query stats
     result = await db.execute(
         select(
@@ -132,6 +145,7 @@ async def get_log_stats(
             func.sum(RequestLog.total_tokens).label('total_tokens'),
             func.sum(RequestLog.prompt_tokens).label('prompt_tokens'),
             func.sum(RequestLog.completion_tokens).label('completion_tokens'),
+            func.sum(RequestLog.cached_tokens).label('cached_tokens'),
             func.sum(RequestLog.cost).label('total_cost'),
             func.avg(RequestLog.latency).label('avg_latency'),
         )
@@ -155,6 +169,11 @@ async def get_log_stats(
         "total_tokens": row.total_tokens or 0,
         "prompt_tokens": row.prompt_tokens or 0,
         "completion_tokens": row.completion_tokens or 0,
+        "cached_tokens": row.cached_tokens or 0,
+        "cache_hit_rate": _cache_hit_rate(
+            row.prompt_tokens,
+            row.cached_tokens,
+        ),
         "total_cost": float(row.total_cost or 0),
         "avg_latency": float(row.avg_latency or 0),
     }
@@ -285,10 +304,17 @@ async def get_log_timeseries_by_model(
 async def get_model_usage(
     days: int = Query(7, ge=1, le=90),
     limit: int = Query(20, ge=1, le=100),
+    channel_id: Optional[int] = None,
+    model: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Get model usage statistics."""
     start_time = datetime.utcnow() - timedelta(days=days)
+    conditions = [RequestLog.created_at >= start_time]
+    if channel_id is not None:
+        conditions.append(RequestLog.channel_id == channel_id)
+    if model is not None:
+        conditions.append(RequestLog.model == model)
 
     # Query model usage
     result = await db.execute(
@@ -296,8 +322,11 @@ async def get_model_usage(
             RequestLog.model,
             func.count(RequestLog.id).label('request_count'),
             func.sum(RequestLog.total_tokens).label('total_tokens'),
+            func.sum(RequestLog.prompt_tokens).label('prompt_tokens'),
+            func.sum(RequestLog.completion_tokens).label('completion_tokens'),
+            func.sum(RequestLog.cached_tokens).label('cached_tokens'),
         )
-        .where(RequestLog.created_at >= start_time)
+        .where(and_(*conditions))
         .group_by(RequestLog.model)
         .order_by(func.count(RequestLog.id).desc())
         .limit(limit)
@@ -310,6 +339,13 @@ async def get_model_usage(
             "model": row.model,
             "request_count": row.request_count,
             "total_tokens": row.total_tokens or 0,
+            "prompt_tokens": row.prompt_tokens or 0,
+            "completion_tokens": row.completion_tokens or 0,
+            "cached_tokens": row.cached_tokens or 0,
+            "cache_hit_rate": _cache_hit_rate(
+                row.prompt_tokens,
+                row.cached_tokens,
+            ),
         }
         for row in rows
     ]

@@ -13,8 +13,10 @@ from rotor.schemas.request import (
     ChatCompletionRequest,
     Role,
 )
+from rotor.schemas.error import ErrorPhase
 from rotor.adapters.factory import AdapterFactory
 from rotor.gateway.accounting import AccountingService
+from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.conversations.store import ConversationHandle, ConversationStore
 from rotor.gateway.routing import routing_engine
 from rotor.gateway.fallback import (
@@ -27,6 +29,7 @@ from rotor.core.exceptions import (
     ChannelException,
     classify_error_status,
     format_error_message,
+    normalize_upstream_error,
     upstream_error_payload,
 )
 from httpx import AsyncClient, HTTPStatusError, RequestError
@@ -65,6 +68,8 @@ async def chat_completions(
         or f"conv_{uuid.uuid4().hex[:24]}"
     )
     client_ip = http_request.client.host if http_request.client else "unknown"
+    request_origin = getattr(http_request.state, "request_origin", "client")
+    agent_run_id = getattr(http_request.state, "agent_run_id", None)
 
     # Create routing decision
     affinity_used = application_settings.get().routing.affinity_enabled
@@ -112,6 +117,11 @@ async def chat_completions(
     )
     try:
         for attempt, channel in enumerate(candidates):
+            attempt_context = AttemptContext.start(
+                attempt,
+                request_origin=request_origin,
+                agent_run_id=agent_run_id,
+            )
             try:
                 routing_engine.begin_attempt(request.model, channel)
                 # Create adapter
@@ -125,6 +135,7 @@ async def chat_completions(
                         request, adapter, channel, token, db, start_time,
                         http_request, http_client, request_id, conversation_handle,
                         response=response,
+                        attempt_context=attempt_context,
                     )
                     set_routing_headers(result, channel, request.model, attempt > 0)
                     return result
@@ -134,13 +145,27 @@ async def chat_completions(
                     )
                     return await _handle_non_streaming_request(
                         request, adapter, channel, token, db, start_time, http_request,
-                        request_id, conversation_handle
+                        request_id, conversation_handle,
+                        attempt_context=attempt_context,
                     )
 
             except (HTTPStatusError, RequestError) as e:
                 last_error = e
                 logger.warning(f"Channel {channel.name} failed: {format_error_message(e)}")
                 latency_ms = int((time.time() - start_time) * 1000)
+                error_fact = normalize_upstream_error(e)
+                await attempt_recorder.record(
+                    context=attempt_context,
+                    request_id=request_id,
+                    channel=channel,
+                    requested_model=request.model,
+                    provider_model=(channel.model_mapping or {}).get(
+                        request.model, request.model
+                    ),
+                    request_protocol="openai_chat",
+                    outcome="failed",
+                    error=error_fact,
+                )
                 await accounting_service.record_failure(
                     db,
                     request_id=request_id,
@@ -227,6 +252,7 @@ async def _handle_non_streaming_request(
     request_id: str,
     conversation_handle: ConversationHandle,
     request_protocol: str = "openai_chat",
+    attempt_context: AttemptContext | None = None,
 ) -> dict:
     """Handle non-streaming chat completion request."""
     # Make the request
@@ -246,6 +272,16 @@ async def _handle_non_streaming_request(
         and response_data.get("status") in {"queued", "in_progress"}
         and response_data.get("usage") is None
     )
+    if attempt_context is not None:
+        await attempt_recorder.record(
+            context=attempt_context,
+            request_id=request_id,
+            channel=channel,
+            requested_model=request.model,
+            provider_model=provider_model,
+            request_protocol=request_protocol,
+            outcome="success",
+        )
     if not deferred_background_usage:
         await accounting_service.record_success(
             db,
@@ -285,6 +321,7 @@ async def _handle_streaming_request(
     response=None,
     native_responses_stream: bool = False,
     native_response_callback=None,
+    attempt_context: AttemptContext | None = None,
 ) -> StreamingResponse:
     """Handle streaming chat completion request."""
 
@@ -300,6 +337,7 @@ async def _handle_streaming_request(
             # Track token usage for streaming
             prompt_tokens = 0
             completion_tokens = 0
+            cached_tokens = 0
             has_provider_usage = False
             collected_text: list[str] = []
             collected_tool_calls: dict[int, dict] = {}
@@ -394,6 +432,8 @@ async def _handle_streaming_request(
                     usage.get("completion_tokens", 0),
                     usage.get("output_tokens", 0),
                 )
+                prompt_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+                cached_tokens = max(cached_tokens, int(prompt_details.get("cached_tokens") or 0))
 
             terminal_events: list[str] = []
             if native_responses_stream:
@@ -417,6 +457,7 @@ async def _handle_streaming_request(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 has_provider_usage=has_provider_usage,
+                cached_tokens=cached_tokens,
             )
             latency_ms = int((time.time() - start_time) * 1000)
             client_ip = http_request.client.host if http_request.client else "unknown"
@@ -427,6 +468,16 @@ async def _handle_streaming_request(
                     stream_token = await stream_db.get(type(token), token.id)
                     if stream_token is None:
                         raise RuntimeError(f"Token {token.id} no longer exists")
+                    if attempt_context is not None:
+                        await attempt_recorder.record(
+                            context=attempt_context,
+                            request_id=request_id,
+                            channel=channel,
+                            requested_model=request.model,
+                            provider_model=adapter.map_model_name(request.model),
+                            request_protocol=request_protocol,
+                            outcome="success",
+                        )
                     await accounting_service.record_success(
                         stream_db,
                         request_id=request_id,
@@ -501,6 +552,23 @@ async def _handle_streaming_request(
             # error chunk we send to the client below.
             try:
                 async with async_session_maker() as stream_db:
+                    if (
+                        attempt_context is not None
+                        and isinstance(e, (HTTPStatusError, RequestError))
+                    ):
+                        await attempt_recorder.record(
+                            context=attempt_context,
+                            request_id=request_id,
+                            channel=channel,
+                            requested_model=request.model,
+                            provider_model=adapter.map_model_name(request.model),
+                            request_protocol=request_protocol,
+                            outcome="failed",
+                            error=normalize_upstream_error(
+                                e,
+                                phase=ErrorPhase.PROVIDER_STREAM,
+                            ),
+                        )
                     await accounting_service.record_failure(
                         stream_db,
                         request_id=request_id,

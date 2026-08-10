@@ -228,6 +228,26 @@ def chat_tool_choice_to_responses(choice: Any) -> Any:
     return {"type": "function", "name": function.get("name")}
 
 
+def chat_content_to_responses(content: Any) -> Any:
+    if not isinstance(content, list):
+        return content or ""
+    blocks: list[dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text":
+            blocks.append({"type": "input_text", "text": item.get("text", "")})
+        elif item.get("type") == "image_url":
+            image = item.get("image_url")
+            url = image.get("url") if isinstance(image, dict) else image
+            if url:
+                block = {"type": "input_image", "image_url": url}
+                if isinstance(image, dict) and image.get("detail"):
+                    block["detail"] = image["detail"]
+                blocks.append(block)
+    return blocks
+
+
 def chat_request_to_responses_payload(request: ChatCompletionRequest) -> dict[str, Any]:
     input_items: list[dict[str, Any]] = []
     for message in request.messages:
@@ -236,7 +256,7 @@ def chat_request_to_responses_payload(request: ChatCompletionRequest) -> dict[st
                 input_items.append({
                     "type": "message",
                     "role": "assistant",
-                    "content": message.content,
+                    "content": chat_content_to_responses(message.content),
                 })
             for tool_call in message.tool_calls:
                 input_items.append({
@@ -257,7 +277,7 @@ def chat_request_to_responses_payload(request: ChatCompletionRequest) -> dict[st
         input_items.append({
             "type": "message",
             "role": role,
-            "content": message.content or "",
+            "content": chat_content_to_responses(message.content),
         })
 
     payload: dict[str, Any] = {

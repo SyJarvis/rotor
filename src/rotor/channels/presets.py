@@ -89,10 +89,11 @@ def provider_defaults(provider: str, protocol: str = "openai") -> dict[str, str]
         ),
     }
     defaults = {**fallback, **preset}
-    # A provider preset describes its usual protocol. An explicitly selected
-    # protocol must still choose the matching generation endpoint.
+    # The wire protocol selects the generation endpoint, while authentication
+    # remains provider-specific. Anthropic-compatible providers such as Zhipu
+    # still use their normal Bearer credentials rather than Anthropic's
+    # x-api-key scheme.
     defaults["request_path"] = fallback["request_path"]
-    defaults["auth_type"] = fallback["auth_type"]
     return defaults
 
 

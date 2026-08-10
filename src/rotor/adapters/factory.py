@@ -62,6 +62,8 @@ class AdapterFactory:
         provider_protocol = str(getattr(channel, "protocol", "") or "").lower()
         if provider_protocol in {"responses", "openai_responses"}:
             return OpenAIResponsesAdapter(channel, http_client)
+        if provider_protocol in {"anthropic", "anthropic_messages"}:
+            return AnthropicAdapter(channel, http_client)
 
         if provider_type not in cls._adapters:
             raise ValueError(

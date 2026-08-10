@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import SettingsConfigDict
 from pydantic_settings import BaseSettings
 
@@ -17,6 +18,25 @@ class Settings(BaseSettings):
     VERSION: str = "1.0.0"
 
     API_KEY_PREFIX: str = "sk-"
+    # A single Bearer token keeps the first Control API/MCP integration
+    # intentionally simple. It remains separate from ordinary Rotor API keys.
+    ROTOR_CONTROL_API_TOKEN: str | None = None
+    ROTOR_CONTROL_API_SCOPES: list[str] = Field(
+        default_factory=lambda: [
+            "channel:read",
+            "request_trace:read",
+            "usage:read",
+        ]
+    )
+    ROTOR_CONTROL_ACTOR_ID: str = "rotor-agent"
+    ROTOR_CONTROL_CLIENT_ID: str = "rotor-mcp"
+    ROTOR_CONTROL_API_URL: str = "http://127.0.0.1:8000/api/control/v1"
+    # MindAgent starts the independent Rotor MCP Server only when an explicit
+    # command is configured. The Control token is passed through the child
+    # process environment, never exposed as a tool argument.
+    ROTOR_MINDAGENT_MCP_COMMAND: str | None = None
+    ROTOR_MINDAGENT_MCP_ARGS: list[str] = Field(default_factory=list)
+    ROTOR_MINDAGENT_MCP_CWD: str | None = None
     # Database
     DATABASE_URL: str = f"sqlite+aiosqlite:///{DEFAULT_CACHE_DIR / 'rotor.db'}"
     # For PostgreSQL use:

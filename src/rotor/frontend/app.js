@@ -10,16 +10,18 @@ import * as overview from "./pages/overview.js";
 import * as channels from "./pages/channels.js";
 import { editState as channelEditState } from "./pages/channels.js";
 import * as tokens from "./pages/tokens.js?v=8";
-import * as usage from "./pages/usage.js?v=8";
+import * as usage from "./pages/usage.js?v=10";
 import * as logs from "./pages/logs.js";
+import * as mindagent from "./pages/mindagent.js?v=12";
 
-const PAGES = { overview, channels, tokens, usage, logs };
+const PAGES = { overview, channels, tokens, usage, logs, mindagent };
 const TITLES = {
   overview: () => t("overview"),
   channels: () => t("channels"),
   tokens: () => t("apiKeys"),
   usage: () => t("usage"),
   logs: () => t("logs"),
+  mindagent: () => t("mindagentChat"),
 };
 
 let current = "overview";
@@ -62,6 +64,7 @@ export async function refreshActive() {
 function switchTab(tab) {
   if (current === tab) return;
   current = tab;
+  document.getElementById("content")?.classList.toggle("mindagent-content", tab === "mindagent");
   document.querySelectorAll(".nav-item").forEach((el) => {
     el.classList.toggle("active", el.dataset.tab === tab);
   });
@@ -154,14 +157,13 @@ document.getElementById("channelForm")?.elements.protocol.addEventListener("chan
   if (!form) return;
   if (event.target.value === "openai_responses") {
     form.elements.request_path.value = "/responses";
-    form.elements.auth_type.value = "bearer";
   } else if (event.target.value === "anthropic") {
     form.elements.request_path.value = "/messages";
-    form.elements.auth_type.value = "x-api-key";
   } else {
     form.elements.request_path.value = "/chat/completions";
-    form.elements.auth_type.value = "bearer";
   }
+  const preset = channelPresets.find((item) => item.id === form.elements.type.value);
+  form.elements.auth_type.value = preset?.auth_type || "bearer";
 });
 document.getElementById("closeChannelModal")?.addEventListener("click", () => {
   channelModal.classList.add("hidden");

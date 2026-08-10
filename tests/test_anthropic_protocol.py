@@ -57,6 +57,116 @@ def test_anthropic_request_moves_system_messages_to_top_level() -> None:
     )
 
 
+def test_dynamic_billing_header_does_not_change_cross_protocol_system() -> None:
+    def convert(cch: str):
+        request = AnthropicMessageRequest.model_validate({
+            "model": "glm-5.2",
+            "max_tokens": 256,
+            "system": [
+                {
+                    "type": "text",
+                    "text": (
+                        "x-anthropic-billing-header: "
+                        "cc_version=2.1.98.3ea; cc_entrypoint=cli; "
+                        f"cch={cch};"
+                    ),
+                },
+                {
+                    "type": "text",
+                    "text": "Stable system instructions.",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        return anthropic_to_openai_request(request)
+
+    first = convert("11111")
+    second = convert("22222")
+
+    assert first.messages[0].content == "Stable system instructions."
+    assert first.messages == second.messages
+    assert first.anthropic_payload["system"][0]["text"].endswith("cch=11111;")
+    assert second.anthropic_payload["system"][0]["text"].endswith("cch=22222;")
+
+
+def test_dynamic_billing_header_line_is_removed_from_string_system() -> None:
+    request = AnthropicMessageRequest.model_validate({
+        "model": "glm-5.2",
+        "max_tokens": 256,
+        "system": (
+            "x-anthropic-billing-header: "
+            "cc_version=2.1.98.3ea; cc_entrypoint=cli; cch=abc12;\n"
+            "Stable system instructions."
+        ),
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    converted = anthropic_to_openai_request(request)
+
+    assert converted.messages[0].content == "Stable system instructions."
+
+
+def test_nonleading_billing_header_system_block_is_preserved() -> None:
+    billing_header = (
+        "x-anthropic-billing-header: "
+        "cc_version=2.1.98.3ea; cc_entrypoint=cli; cch=abc12;"
+    )
+    request = AnthropicMessageRequest.model_validate({
+        "model": "glm-5.2",
+        "max_tokens": 256,
+        "system": [
+            {"type": "text", "text": "Meaningful first block."},
+            {"type": "text", "text": billing_header},
+        ],
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    converted = anthropic_to_openai_request(request)
+
+    assert converted.messages[0].content == (
+        f"Meaningful first block.\n{billing_header}"
+    )
+
+
+@pytest.mark.parametrize(
+    "first_block",
+    [
+        {
+            "type": "text",
+            "text": (
+                "x-anthropic-billing-header: "
+                "cc_version=2.1.98.3ea; cc_entrypoint=cli; cch=not-hex;"
+            ),
+        },
+        {
+            "type": "text",
+            "text": (
+                "x-anthropic-billing-header: "
+                "cc_version=2.1.98.3ea; cc_entrypoint=cli; cch=abc12;"
+            ),
+            "cache_control": {"type": "ephemeral"},
+        },
+    ],
+)
+def test_ambiguous_billing_header_system_block_is_preserved(first_block) -> None:
+    request = AnthropicMessageRequest.model_validate({
+        "model": "glm-5.2",
+        "max_tokens": 256,
+        "system": [
+            first_block,
+            {"type": "text", "text": "Stable system instructions."},
+        ],
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+
+    converted = anthropic_to_openai_request(request)
+
+    assert converted.messages[0].content.startswith(
+        "x-anthropic-billing-header:"
+    )
+
+
 def test_anthropic_request_still_rejects_unknown_message_roles() -> None:
     with pytest.raises(ValidationError):
         AnthropicMessageRequest.model_validate({
@@ -86,7 +196,11 @@ def test_openai_text_response_converts_to_anthropic_message() -> None:
     assert response["id"] == "chatcmpl-test"
     assert response["content"] == [{"type": "text", "text": "hello"}]
     assert response["stop_reason"] == "end_turn"
-    assert response["usage"] == {"input_tokens": 8, "output_tokens": 4}
+    assert response["usage"] == {
+        "input_tokens": 8,
+        "output_tokens": 4,
+        "cache_read_input_tokens": 0,
+    }
 
 
 def test_openai_tool_calls_convert_to_anthropic_tool_use_blocks() -> None:
@@ -229,6 +343,63 @@ def test_streaming_usage_provider_when_usage_chunk_is_seen() -> None:
     assert usage.prompt_tokens == 8
     assert usage.completion_tokens == 4
     assert usage.total_tokens == 12
+
+
+def test_anthropic_to_openai_usage_preserves_cache_read_tokens() -> None:
+    """Non-streaming usage conversion maps cache_read_input_tokens into OpenAI details."""
+    from rotor.schemas.request import AnthropicUsage
+
+    usage = AnthropicUsage(
+        input_tokens=100,
+        output_tokens=50,
+        cache_creation_input_tokens=200,
+        cache_read_input_tokens=300,
+    )
+    result = ProtocolConverter.anthropic_to_openai_usage(usage)
+
+    assert result.prompt_tokens == 100
+    assert result.completion_tokens == 50
+    assert result.prompt_tokens_details == {"cached_tokens": 300}
+
+
+def test_anthropic_stream_message_start_preserves_cache_tokens() -> None:
+    """message_start stream event carries cache_read_input_tokens into OpenAI chunk."""
+    event = {
+        "type": "message_start",
+        "message": {
+            "id": "msg_test",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 200,
+                "cache_read_input_tokens": 300,
+            },
+        },
+    }
+    chunk = ProtocolConverter.anthropic_stream_to_openai(event, "claude-test", "chatcmpl-test")
+
+    assert chunk is not None
+    usage = chunk["usage"]
+    assert usage["prompt_tokens"] == 100
+    assert usage["prompt_tokens_details"]["cached_tokens"] == 300
+
+
+def test_anthropic_stream_message_delta_preserves_cache_tokens() -> None:
+    """message_delta stream event carries cache_read_input_tokens into OpenAI chunk."""
+    event = {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn"},
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 300,
+        },
+    }
+    chunk = ProtocolConverter.anthropic_stream_to_openai(event, "claude-test", "chatcmpl-test")
+
+    assert chunk is not None
+    usage = chunk["usage"]
+    assert usage["prompt_tokens_details"]["cached_tokens"] == 300
 
 
 def test_anthropic_request_preserves_tools_and_tool_messages() -> None:
@@ -506,6 +677,36 @@ def test_anthropic_native_fields_survive_anthropic_upstream_conversion() -> None
     assert converted["model"] == "claude-provider"
     assert converted["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert converted["messages"][0]["content"][0]["is_error"] is True
+
+
+def test_anthropic_native_upstream_preserves_billing_header() -> None:
+    billing_header = (
+        "x-anthropic-billing-header: "
+        "cc_version=2.1.98.3ea; cc_entrypoint=cli; cch=abc12;"
+    )
+    request = AnthropicMessageRequest.model_validate({
+        "model": "claude-test",
+        "max_tokens": 256,
+        "system": [
+            {"type": "text", "text": billing_header},
+            {
+                "type": "text",
+                "text": "cached system",
+                "cache_control": {"type": "ephemeral"},
+            },
+        ],
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    adapter = AnthropicAdapter(
+        SimpleNamespace(model_mapping={}, extra={}), None
+    )
+
+    converted = asyncio.run(adapter.convert_request(
+        anthropic_to_openai_request(request)
+    ))
+
+    assert converted["system"][0]["text"] == billing_header
+    assert converted["system"][1]["cache_control"] == {"type": "ephemeral"}
 
 
 def test_anthropic_request_preserves_claude_code_extension_fields() -> None:

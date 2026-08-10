@@ -5,6 +5,8 @@ import httpx
 import os
 from dotenv import load_dotenv
 
+__test__ = False  # Manual live smoke script; excluded from the offline test suite.
+
 load_dotenv()
 
 async def test_glm_direct():

@@ -22,16 +22,19 @@ from rotor.core.exceptions import (
     ChannelException,
     classify_error_status,
     format_error_message,
+    normalize_upstream_error,
     upstream_error_payload,
 )
 from rotor.database import async_session_maker, get_db
 from rotor.gateway.accounting import AccountingService
+from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.fallback import (
     retry_after_seconds,
     set_routing_headers,
     should_fallback,
 )
 from rotor.gateway.routing import routing_engine
+from rotor.schemas.error import ErrorPhase
 
 
 logger = logging.getLogger(__name__)
@@ -97,7 +100,20 @@ async def _record_success(
     conversation_id: str,
     start_time: float,
     client_ip: str,
+    attempt_context: AttemptContext | None = None,
 ) -> None:
+    if attempt_context is not None:
+        await attempt_recorder.record(
+            context=attempt_context,
+            request_id=request_id,
+            channel=channel,
+            requested_model=request.model,
+            provider_model=(channel.model_mapping or {}).get(
+                request.model, request.model
+            ),
+            request_protocol="openai_images",
+            outcome="success",
+        )
     await accounting_service.record_success(
         db,
         request_id=request_id,
@@ -125,7 +141,23 @@ async def _record_failure(
     conversation_id: str,
     start_time: float,
     client_ip: str,
+    attempt_context: AttemptContext | None = None,
+    phase: ErrorPhase = ErrorPhase.PROVIDER_REQUEST,
 ) -> None:
+    if (
+        attempt_context is not None
+        and isinstance(error, (HTTPStatusError, RequestError))
+    ):
+        await attempt_recorder.record(
+            context=attempt_context,
+            request_id=request_id,
+            channel=channel,
+            requested_model=model,
+            provider_model=(channel.model_mapping or {}).get(model, model),
+            request_protocol="openai_images",
+            outcome="failed",
+            error=normalize_upstream_error(error, phase=phase),
+        )
     await accounting_service.record_failure(
         db,
         request_id=request_id,
@@ -169,6 +201,7 @@ async def _stream_image_response(
     conversation_id: str,
     start_time: float,
     client_ip: str,
+    attempt_context: AttemptContext | None = None,
 ) -> AsyncIterator[str]:
     terminal_blocks: list[str] = []
     response_data: dict[str, Any] = {}
@@ -205,6 +238,7 @@ async def _stream_image_response(
                 conversation_id=conversation_id,
                 start_time=start_time,
                 client_ip=client_ip,
+                attempt_context=attempt_context,
             )
         for block in terminal_blocks:
             yield block
@@ -223,6 +257,8 @@ async def _stream_image_response(
                     conversation_id=conversation_id,
                     start_time=start_time,
                     client_ip=client_ip,
+                    attempt_context=attempt_context,
+                    phase=ErrorPhase.PROVIDER_STREAM,
                 )
         except Exception:
             logger.exception("Failed to record image stream failure")
@@ -252,6 +288,8 @@ async def generate_image(
     )
     request_id = http_request.headers.get("X-Request-Id") or f"req_{uuid.uuid4().hex}"
     client_ip = http_request.client.host if http_request.client else "unknown"
+    request_origin = getattr(http_request.state, "request_origin", "client")
+    agent_run_id = getattr(http_request.state, "agent_run_id", None)
     start_time = time.time()
     required = {"image_generation"}
     if image_request.stream:
@@ -292,6 +330,11 @@ async def generate_image(
     http_client = AsyncClient(timeout=_timeout())
     last_error: Exception | None = None
     for attempt, channel in enumerate(candidates):
+        attempt_context = AttemptContext.start(
+            attempt,
+            request_origin=request_origin,
+            agent_run_id=agent_run_id,
+        )
         try:
             routing_engine.begin_attempt(image_request.model, channel)
             provider_model = (channel.model_mapping or {}).get(
@@ -328,6 +371,7 @@ async def generate_image(
                         conversation_id=conversation_id,
                         start_time=start_time,
                         client_ip=client_ip,
+                        attempt_context=attempt_context,
                     ),
                     media_type="text/event-stream",
                 )
@@ -346,6 +390,7 @@ async def generate_image(
                 conversation_id=conversation_id,
                 start_time=start_time,
                 client_ip=client_ip,
+                attempt_context=attempt_context,
             )
             set_routing_headers(api_response, channel, image_request.model, attempt > 0)
             await http_client.aclose()
@@ -362,6 +407,7 @@ async def generate_image(
                 conversation_id=conversation_id,
                 start_time=start_time,
                 client_ip=client_ip,
+                attempt_context=attempt_context,
             )
             if should_fallback(exc):
                 routing_engine.mark_unavailable(

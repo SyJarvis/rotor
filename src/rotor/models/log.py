@@ -22,6 +22,7 @@ class RequestLog(Base):
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cached_tokens: Mapped[int] = mapped_column(Integer, default=0)
 
     # Cost calculation (optional)
     cost: Mapped[Optional[float]] = mapped_column(Float, nullable=True)

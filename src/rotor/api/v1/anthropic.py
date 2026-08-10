@@ -26,6 +26,7 @@ from rotor.schemas.request import (
 )
 from rotor.adapters.factory import AdapterFactory
 from rotor.gateway.accounting import AccountingService
+from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.routing import routing_engine
 from rotor.gateway.fallback import (
     retry_after_seconds,
@@ -39,14 +40,80 @@ from rotor.core.exceptions import (
     ChannelException,
     classify_error_status,
     format_error_message,
+    normalize_upstream_error,
     upstream_error_payload,
 )
+from rotor.schemas.error import ErrorPhase
 from httpx import AsyncClient, HTTPStatusError, RequestError
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 accounting_service = AccountingService()
+
+_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+_BILLING_HEADER_REQUIRED_FIELDS = {"cc_version", "cc_entrypoint", "cch"}
+
+
+def _is_claude_code_billing_header(text: object) -> bool:
+    """Recognize the standalone, transient Claude Code billing system block."""
+    if not isinstance(text, str) or not text.startswith(_BILLING_HEADER_PREFIX):
+        return False
+    if "\n" in text or "\r" in text:
+        return False
+
+    payload = text[len(_BILLING_HEADER_PREFIX):].strip()
+    if not payload.endswith(";"):
+        return False
+
+    fields: dict[str, str] = {}
+    for item in payload[:-1].split(";"):
+        key, separator, value = item.strip().partition("=")
+        if (
+            not separator
+            or not key
+            or not key[0].isalpha()
+            or not all(char.isalnum() or char in "_-" for char in key)
+            or not value
+            or key in fields
+        ):
+            return False
+        fields[key] = value
+
+    cch = fields.get("cch", "")
+    return (
+        _BILLING_HEADER_REQUIRED_FIELDS.issubset(fields)
+        and len(cch) == 5
+        and all(char in "0123456789abcdefABCDEF" for char in cch)
+    )
+
+
+def _anthropic_system_to_chat_text(
+    system: str | list[dict] | None,
+) -> Optional[str]:
+    """Build cross-protocol system text without transient client metadata."""
+    if isinstance(system, str):
+        first_line, separator, remainder = system.partition("\n")
+        if _is_claude_code_billing_header(first_line.rstrip("\r")):
+            system = remainder if separator else ""
+        return system or None
+
+    blocks = system or []
+    if (
+        blocks
+        and isinstance(blocks[0], dict)
+        and set(blocks[0]).issubset({"type", "text"})
+        and blocks[0].get("type") == "text"
+        and _is_claude_code_billing_header(blocks[0].get("text"))
+    ):
+        blocks = blocks[1:]
+
+    parts = [
+        block.get("text", "")
+        for block in blocks
+        if isinstance(block, dict) and block.get("type") == "text"
+    ]
+    return "\n".join(parts) or None
 
 
 def anthropic_to_openai_request(anthropic_request: AnthropicMessageRequest) -> ChatCompletionRequest:
@@ -55,14 +122,7 @@ def anthropic_to_openai_request(anthropic_request: AnthropicMessageRequest) -> C
     # Add system message if present (system may be a string or a list of
     # content blocks, e.g. [{"type": "text", "text": "...", "cache_control": {...}}])
     if anthropic_request.system:
-        system = anthropic_request.system
-        if isinstance(system, list):
-            parts = [
-                block.get("text", "")
-                for block in system
-                if isinstance(block, dict) and block.get("type") == "text"
-            ]
-            system = "\n".join(parts) or None
+        system = _anthropic_system_to_chat_text(anthropic_request.system)
         if system:
             messages.append(ChatMessage(role=Role.SYSTEM, content=system))
 
@@ -236,9 +296,11 @@ def openai_to_anthropic_response(openai_response: dict, model: str) -> dict:
 
     # Convert usage
     usage = openai_response.get("usage") or {}
+    prompt_details = usage.get("prompt_tokens_details") or {}
     anthropic_usage = {
         "input_tokens": usage.get("prompt_tokens", 0),
-        "output_tokens": usage.get("completion_tokens", 0)
+        "output_tokens": usage.get("completion_tokens", 0),
+        "cache_read_input_tokens": int(prompt_details.get("cached_tokens") or 0),
     }
 
     return {
@@ -383,6 +445,7 @@ class OpenAIToAnthropicStreamConverter:
             },
             "usage": {
                 "output_tokens": usage.get("completion_tokens", 0),
+                "cache_read_input_tokens": int(usage.get("cached_tokens") or 0),
             },
         })
         events.append({"type": "message_stop"})
@@ -428,6 +491,8 @@ async def messages(
         or f"conv_{uuid.uuid4().hex[:24]}"
     )
     client_ip = http_request.client.host if http_request.client else "unknown"
+    request_origin = getattr(http_request.state, "request_origin", "client")
+    agent_run_id = getattr(http_request.state, "agent_run_id", None)
     affinity_used = application_settings.get().routing.affinity_enabled
     required_capabilities = {"stream"} if request.stream else set()
     routing_decision = routing_engine.route(
@@ -469,6 +534,11 @@ async def messages(
     )
     try:
         for attempt, channel in enumerate(routing_decision.candidates):
+            attempt_context = AttemptContext.start(
+                attempt,
+                request_origin=request_origin,
+                agent_run_id=agent_run_id,
+            )
             try:
                 routing_engine.begin_attempt(request.model, channel)
                 # Create adapter
@@ -487,6 +557,7 @@ async def messages(
                         start_time, http_request, http_client, request_id,
                         conversation_id, response, conversation_handle,
                         native_anthropic_stream=native_anthropic,
+                        attempt_context=attempt_context,
                     )
                     set_routing_headers(result, channel, request.model, attempt > 0)
                     return result
@@ -497,12 +568,26 @@ async def messages(
                     return await _handle_non_streaming_request(
                         request, internal_request, adapter, channel, token, db, start_time,
                         http_request, request_id, conversation_id, conversation_handle,
+                        attempt_context=attempt_context,
                     )
 
             except (HTTPStatusError, RequestError) as e:
                 last_error = e
                 logger.warning(f"Channel {channel.name} failed: {format_error_message(e)}")
                 latency_ms = int((time.time() - start_time) * 1000)
+                error_fact = normalize_upstream_error(e)
+                await attempt_recorder.record(
+                    context=attempt_context,
+                    request_id=request_id,
+                    channel=channel,
+                    requested_model=request.model,
+                    provider_model=(channel.model_mapping or {}).get(
+                        request.model, request.model
+                    ),
+                    request_protocol="anthropic_messages",
+                    outcome="failed",
+                    error=error_fact,
+                )
                 await accounting_service.record_failure(
                     db,
                     request_id=request_id,
@@ -586,6 +671,7 @@ async def _handle_non_streaming_request(
     request_id: str,
     conversation_id: str,
     conversation_handle: ConversationHandle,
+    attempt_context: AttemptContext | None = None,
 ) -> dict:
     """Handle non-streaming Anthropic message request."""
     # Make the request
@@ -604,6 +690,16 @@ async def _handle_non_streaming_request(
     latency_ms = int((time.time() - start_time) * 1000)
     usage = accounting_service.extract_usage(response_data)
     client_ip = http_request.client.host if http_request.client else "unknown"
+    if attempt_context is not None:
+        await attempt_recorder.record(
+            context=attempt_context,
+            request_id=request_id,
+            channel=channel,
+            requested_model=anthropic_request.model,
+            provider_model=adapter.map_model_name(anthropic_request.model),
+            request_protocol="anthropic_messages",
+            outcome="success",
+        )
     await accounting_service.record_success(
         db,
         request_id=request_id,
@@ -643,6 +739,7 @@ async def _handle_streaming_request(
     response,
     conversation_handle: ConversationHandle,
     native_anthropic_stream: bool = False,
+    attempt_context: AttemptContext | None = None,
 ) -> StreamingResponse:
     """Handle streaming Anthropic message request."""
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -658,6 +755,7 @@ async def _handle_streaming_request(
             # Track token usage for streaming
             input_tokens = 0
             output_tokens = 0
+            cached_tokens = 0
             has_provider_usage = False
             collected_text: list[str] = []
             collected_tool_calls: list[dict] = []
@@ -696,11 +794,13 @@ async def _handle_streaming_request(
                         usage = (openai_chunk.get("message") or {}).get("usage") or {}
                         input_tokens = max(input_tokens, usage.get("input_tokens", 0))
                         output_tokens = max(output_tokens, usage.get("output_tokens", 0))
+                        cached_tokens = max(cached_tokens, usage.get("cache_read_input_tokens", 0))
                         has_provider_usage = has_provider_usage or bool(usage)
                     elif event_type == "message_delta":
                         usage = openai_chunk.get("usage") or {}
                         input_tokens = max(input_tokens, usage.get("input_tokens", 0))
                         output_tokens = max(output_tokens, usage.get("output_tokens", 0))
+                        cached_tokens = max(cached_tokens, usage.get("cache_read_input_tokens", 0))
                         has_provider_usage = has_provider_usage or bool(usage)
                         if openai_chunk.get("delta", {}).get("stop_reason"):
                             last_finish_reason = openai_chunk["delta"]["stop_reason"]
@@ -725,6 +825,8 @@ async def _handle_streaming_request(
                     has_provider_usage = True
                 input_tokens = max(input_tokens, usage.get("prompt_tokens", 0))
                 output_tokens = max(output_tokens, usage.get("completion_tokens", 0))
+                prompt_details = usage.get("prompt_tokens_details") or {}
+                cached_tokens = max(cached_tokens, int(prompt_details.get("cached_tokens") or 0))
 
                 for event in stream_converter.feed(openai_chunk):
                     event_type = event["type"]
@@ -735,6 +837,7 @@ async def _handle_streaming_request(
                     usage={
                         "prompt_tokens": input_tokens,
                         "completion_tokens": output_tokens,
+                        "cached_tokens": cached_tokens,
                     },
                 ):
                     event_type = event["type"]
@@ -745,6 +848,7 @@ async def _handle_streaming_request(
                 prompt_tokens=input_tokens,
                 completion_tokens=output_tokens,
                 has_provider_usage=has_provider_usage,
+                cached_tokens=cached_tokens,
             )
             latency_ms = int((time.time() - start_time) * 1000)
             client_ip = http_request.client.host if http_request.client else "unknown"
@@ -752,6 +856,18 @@ async def _handle_streaming_request(
                 stream_token = await stream_db.get(type(token), token.id)
                 if stream_token is None:
                     raise RuntimeError(f"Token {token.id} no longer exists")
+                if attempt_context is not None:
+                    await attempt_recorder.record(
+                        context=attempt_context,
+                        request_id=request_id,
+                        channel=channel,
+                        requested_model=anthropic_request.model,
+                        provider_model=adapter.map_model_name(
+                            anthropic_request.model
+                        ),
+                        request_protocol="anthropic_messages",
+                        outcome="success",
+                    )
                 await accounting_service.record_success(
                     stream_db,
                     request_id=request_id,
@@ -804,6 +920,25 @@ async def _handle_streaming_request(
             latency_ms = int((time.time() - start_time) * 1000)
             client_ip = http_request.client.host if http_request.client else "unknown"
             async with async_session_maker() as stream_db:
+                if (
+                    attempt_context is not None
+                    and isinstance(e, (HTTPStatusError, RequestError))
+                ):
+                    await attempt_recorder.record(
+                        context=attempt_context,
+                        request_id=request_id,
+                        channel=channel,
+                        requested_model=anthropic_request.model,
+                        provider_model=adapter.map_model_name(
+                            anthropic_request.model
+                        ),
+                        request_protocol="anthropic_messages",
+                        outcome="failed",
+                        error=normalize_upstream_error(
+                            e,
+                            phase=ErrorPhase.PROVIDER_STREAM,
+                        ),
+                    )
                 await accounting_service.record_failure(
                     stream_db,
                     request_id=request_id,

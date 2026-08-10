@@ -28,10 +28,12 @@ from rotor.core.exceptions import (
     ChannelException,
     classify_error_status,
     format_error_message,
+    normalize_upstream_error,
     upstream_error_payload,
 )
 from rotor.database import async_session_maker, get_db
 from rotor.gateway.routing import routing_engine
+from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.fallback import (
     retry_after_seconds,
     set_routing_headers,
@@ -302,6 +304,8 @@ async def create_response(
         or f"conv_{uuid.uuid4().hex[:24]}"
     )
     client_ip = http_request.client.host if http_request.client else "unknown"
+    request_origin = getattr(http_request.state, "request_origin", "client")
+    agent_run_id = getattr(http_request.state, "agent_run_id", None)
     start_time = time.time()
 
     if previous_route is not None:
@@ -377,6 +381,11 @@ async def create_response(
     )
     try:
         for attempt, channel in enumerate(routing_candidates):
+            attempt_context = AttemptContext.start(
+                attempt,
+                request_origin=request_origin,
+                agent_run_id=agent_run_id,
+            )
             try:
                 routing_engine.begin_attempt(chat_request.model, channel)
                 adapter = AdapterFactory.create_adapter(channel, http_client)
@@ -426,6 +435,7 @@ async def create_response(
                         native_response_callback=(
                             persist_stream_response if native_responses else None
                         ),
+                        attempt_context=attempt_context,
                     )
                     set_routing_headers(
                         result, channel, chat_request.model, attempt > 0
@@ -443,6 +453,7 @@ async def create_response(
                     request_id,
                     conversation_handle,
                     request_protocol="openai_responses",
+                    attempt_context=attempt_context,
                 )
                 set_routing_headers(
                     api_response, channel, chat_request.model, attempt > 0
@@ -467,6 +478,19 @@ async def create_response(
             except (HTTPStatusError, RequestError) as exc:
                 last_error = exc
                 latency_ms = int((time.time() - start_time) * 1000)
+                error_fact = normalize_upstream_error(exc)
+                await attempt_recorder.record(
+                    context=attempt_context,
+                    request_id=request_id,
+                    channel=channel,
+                    requested_model=chat_request.model,
+                    provider_model=(channel.model_mapping or {}).get(
+                        chat_request.model, chat_request.model
+                    ),
+                    request_protocol="openai_responses",
+                    outcome="failed",
+                    error=error_fact,
+                )
                 await accounting_service.record_failure(
                     db,
                     request_id=request_id,

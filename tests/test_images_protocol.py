@@ -1,11 +1,17 @@
+import asyncio
 from types import SimpleNamespace
 
+import httpx
+
+import rotor.api.v1.images as images_endpoint
 from rotor.api.v1.images import (
     ImageGenerationRequest,
     _parse_sse_data,
+    _record_failure,
     image_generation_headers,
     image_generation_url,
 )
+from rotor.gateway.attempts import AttemptContext
 from rotor.main import app
 
 
@@ -90,3 +96,55 @@ def test_image_generation_sse_parser_reads_usage() -> None:
 
     assert event["type"] == "image_generation.completed"
     assert event["usage"]["total_tokens"] == 5
+
+
+def test_image_failure_records_normalized_attempt() -> None:
+    class RecordingAccounting:
+        def __init__(self) -> None:
+            self.attempts = []
+
+        async def record(self, **kwargs) -> bool:
+            self.attempts.append(kwargs)
+            kwargs["context"].recorded = True
+            return True
+
+        async def record_failure(self, db, **kwargs) -> None:
+            return None
+
+    class FakeDatabase:
+        async def commit(self) -> None:
+            return None
+
+    request = httpx.Request("POST", "https://example.com/v1/images/generations")
+    response = httpx.Response(503, request=request, json={"error": "unavailable"})
+    error = httpx.HTTPStatusError(
+        "unavailable",
+        request=request,
+        response=response,
+    )
+    original = images_endpoint.accounting_service
+    original_attempt_recorder = images_endpoint.attempt_recorder
+    accounting = RecordingAccounting()
+    images_endpoint.accounting_service = accounting
+    images_endpoint.attempt_recorder = accounting
+    try:
+        asyncio.run(
+            _record_failure(
+                FakeDatabase(),
+                token=SimpleNamespace(id=1),
+                channel=_channel(),
+                model="image-model",
+                error=error,
+                request_id="req-1",
+                conversation_id="conv-1",
+                start_time=0.0,
+                client_ip="127.0.0.1",
+                attempt_context=AttemptContext.start(0),
+            )
+        )
+    finally:
+        images_endpoint.accounting_service = original
+        images_endpoint.attempt_recorder = original_attempt_recorder
+
+    assert accounting.attempts[0]["error"].code == "upstream_unavailable"
+    assert accounting.attempts[0]["error"].fallback_allowed is True

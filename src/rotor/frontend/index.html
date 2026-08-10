@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
-    <link rel="stylesheet" href="/styles.css?v=8">
+    <link rel="stylesheet" href="/styles.css?v=12">
     <script>
       // FOUC guard — must run before body paints.
       (function () {
@@ -57,6 +57,9 @@
           <button class="nav-item" data-tab="logs">
             <i data-lucide="scroll-text"></i><span data-i18n="logs">请求日志</span>
           </button>
+          <button class="nav-item" data-tab="mindagent">
+            <i data-lucide="bot"></i><span data-i18n="mindagentChat">MindAgent 对话</span>
+          </button>
         </nav>
         <div class="sidebar-footer">
           <button class="nav-item" id="openSettings" type="button">
@@ -95,6 +98,7 @@
           <section id="tokens" class="panel"></section>
           <section id="usage" class="panel"></section>
           <section id="logs" class="panel"></section>
+          <section id="mindagent" class="panel"></section>
         </main>
       </div>
     </div>
@@ -258,7 +262,7 @@
       </div>
     </div>
 
-    <script src="/config.js?v=8"></script>
-    <script type="module" src="/app.js?v=8"></script>
+    <script src="/config.js?v=12"></script>
+    <script type="module" src="/app.js?v=13"></script>
   </body>
 </html>

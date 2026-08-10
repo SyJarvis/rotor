@@ -27,7 +27,7 @@ class ToolCall(BaseModel):
 class ChatMessage(BaseModel):
     """Chat message."""
     role: Role
-    content: Optional[str] = None
+    content: Optional[Union[str, List[Dict[str, Any]]]] = None
     name: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
     tool_call_id: Optional[str] = None
@@ -76,6 +76,7 @@ class Usage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    prompt_tokens_details: Optional[Dict[str, Any]] = None
 
 
 class ChatMessageResponse(BaseModel):
@@ -263,6 +264,8 @@ class AnthropicUsage(BaseModel):
     """Anthropic usage."""
     input_tokens: int
     output_tokens: int
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
 
 class AnthropicMessageResponse(BaseModel):
