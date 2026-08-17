@@ -15,7 +15,14 @@ from rotor.core.exceptions import (
 )
 from rotor.core.middleware import LoggingMiddleware
 from rotor.api.v1 import chat, images, models, anthropic, responses
-from rotor.api.admin import channels, tokens, logs, mindagent, settings as admin_settings
+from rotor.api.admin import (
+    channels,
+    mcp_control_keys,
+    tokens,
+    logs,
+    mindagent,
+    settings as admin_settings,
+)
 from rotor.api.control import channels as control_channels
 from rotor.api.control import requests as control_requests
 from rotor.core.control_auth import (
@@ -28,6 +35,7 @@ from rotor.models.usage import UsageLedger  # noqa: F401
 from rotor.models.response_route import ResponseRoute  # noqa: F401
 from rotor.models.routing_decision import RoutingDecisionRecord  # noqa: F401
 from rotor.models.request_attempt import RequestAttempt  # noqa: F401
+from rotor.models.mcp_control_key import MCPControlKey  # noqa: F401
 
 # Configure logging
 logging.basicConfig(
@@ -141,6 +149,7 @@ app.include_router(anthropic.router, prefix="/anthropic/v1", tags=["anthropic"])
 # Admin routes
 app.include_router(channels.router, prefix="/api/admin")
 app.include_router(tokens.router, prefix="/api/admin")
+app.include_router(mcp_control_keys.router, prefix="/api/admin")
 app.include_router(logs.router, prefix="/api/admin")
 app.include_router(admin_settings.router, prefix="/api/admin")
 app.include_router(mindagent.router, prefix="/api/admin")

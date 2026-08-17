@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
 import re
 import secrets
 import uuid
@@ -7,8 +9,12 @@ from typing import Any
 from fastapi import Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.config import settings
+from rotor.database import get_db
+from rotor.models.mcp_control_key import MCPControlKey
 
 
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
@@ -65,6 +71,7 @@ async def get_control_actor(
     config: ControlAuthConfig = Depends(
         get_control_auth_config
     ),
+    db: AsyncSession = Depends(get_db),
 ) -> ActorContext:
     if authorization is None:
         raise ControlAPIException(
@@ -73,31 +80,55 @@ async def get_control_actor(
             message="Control API authentication is required",
         )
 
-    if config.token is None:
-        raise ControlAPIException(
-            status_code=503,
-            code="control_api_not_configured",
-            message="Control API credential is not configured",
-        )
-    if (
-        authorization.credentials.startswith(settings.API_KEY_PREFIX)
-        or not secrets.compare_digest(
-            authorization.credentials,
-            config.token,
-        )
-    ):
+    credential = authorization.credentials
+    if credential.startswith(settings.API_KEY_PREFIX):
         raise ControlAPIException(
             status_code=401,
             code="control_invalid_credential",
             message="Invalid Control API credential",
         )
 
-    return ActorContext(
-        actor_id=config.actor_id,
-        client_id=config.client_id,
-        scopes=config.scopes,
-        agent_id=request.headers.get("X-Agent-Id"),
-        agent_run_id=request.headers.get("X-Agent-Run-Id"),
+    if config.token is not None and secrets.compare_digest(
+        credential, config.token
+    ):
+        return ActorContext(
+            actor_id=config.actor_id,
+            client_id=config.client_id,
+            scopes=config.scopes,
+            agent_id=request.headers.get("X-Agent-Id"),
+            agent_run_id=request.headers.get("X-Agent-Run-Id"),
+        )
+
+    if credential.startswith("rck_"):
+        result = await db.execute(
+            select(MCPControlKey).where(
+                MCPControlKey.secret_hash
+                == hashlib.sha256(credential.encode("utf-8")).hexdigest(),
+                MCPControlKey.enabled.is_(True),
+            )
+        )
+        key = result.scalar_one_or_none()
+        if key is not None:
+            key.last_used_at = datetime.now(timezone.utc)
+            return ActorContext(
+                actor_id=f"mcp-control-key-{key.id}",
+                client_id=f"mcp-control-key-{key.id}",
+                scopes=frozenset(key.scopes),
+                agent_id=request.headers.get("X-Agent-Id"),
+                agent_run_id=request.headers.get("X-Agent-Run-Id"),
+            )
+
+    if config.token is None and not credential.startswith("rck_"):
+        raise ControlAPIException(
+            status_code=503,
+            code="control_api_not_configured",
+            message="Control API credential is not configured",
+        )
+
+    raise ControlAPIException(
+        status_code=401,
+        code="control_invalid_credential",
+        message="Invalid Control API credential",
     )
 
 

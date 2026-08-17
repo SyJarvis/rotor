@@ -18,6 +18,7 @@ from rotor.models.usage import UsageLedger
 from rotor.models.response_route import ResponseRoute
 from rotor.models.routing_decision import RoutingDecisionRecord
 from rotor.models.request_attempt import RequestAttempt
+from rotor.models.mcp_control_key import MCPControlKey
 
 # this is the Alembic Config object
 config = context.config

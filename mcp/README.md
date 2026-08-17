@@ -36,6 +36,16 @@ Codex、Claude Code 和其他 MCP Client 使用现有只读 Tool。
 
 ## 配置
 
+```
+mkdir -p ~/.cache/rotor
+python -c 'import secrets; print("ROTOR_CONTROL_API_TOKEN=" + secrets.token_urlsafe(32))' > ~/.cache/rotor/control.env
+chmod 600 ~/.cache/rotor/control.env
+
+set -a
+source ~/.cache/rotor/control.env
+set +a
+```
+
 ```bash
 export ROTOR_CONTROL_API_URL=http://127.0.0.1:8000/api/control/v1
 export ROTOR_CONTROL_API_TOKEN=replace-with-control-token
@@ -47,6 +57,10 @@ export ROTOR_AGENT_RUN_ID=run_123
 `ROTOR_CONTROL_API_TOKEN` 是专用 Control API Token，不是普通的 `sk-` Rotor API
 Key。Token 只通过 `Authorization: Bearer` 请求头发送，不会出现在 Tool 参数和错误
 消息中。
+
+也可以在 Rotor 管理页面的 **API Key → MCP Control Key** 创建 `rck_` 密钥。新密钥
+创建后会立即被 Control API 识别；完整值只显示一次，请将页面提供的 MCP 环境变量复制到
+启动 Codex、MindCode 或其他 MCP Client 的环境中。
 
 ## 运行
 
