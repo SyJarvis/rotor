@@ -72,10 +72,9 @@ class ContextManager:
             return
 
         state = self._state(context)
-        self._ingest_existing_messages(state.store, context.messages)
         if self.config.system_prompt and not any(
-            record.kind == "system"
-            for record in state.store.records
+            message.get("role") == "system"
+            for message in context.messages
         ):
             state.store.append(
                 ContextRecord(
@@ -91,6 +90,7 @@ class ContextManager:
                     stable_prefix=True,
                 )
             )
+        self._ingest_existing_messages(state.store, context.messages)
 
         task_state_message = self._build_task_state_message(context)
         if task_state_message is not None:

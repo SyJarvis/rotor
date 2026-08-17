@@ -10,6 +10,8 @@ from starlette.responses import StreamingResponse
 import rotor.api.admin.mindagent as endpoint
 from rotor.adapters.protocol.converter import ProtocolConverter
 from rotor.adapters.protocol.responses import chat_request_to_responses_payload
+from mindagent.context import ContextConfig, ContextManager
+from mindagent.core import AgentContext
 from rotor.schemas.request import ChatCompletionRequest
 
 
@@ -76,6 +78,48 @@ def test_image_content_converts_for_anthropic_and_responses():
         "type": "input_image",
         "image_url": "data:image/png;base64,dGVzdA==",
     }
+
+
+def test_chat_request_moves_system_messages_to_stable_leading_prefix():
+    request = ChatCompletionRequest.model_validate({
+        "model": "test-model",
+        "messages": [
+            {"role": "user", "content": "first user message"},
+            {"role": "system", "content": "first instruction"},
+            {"role": "assistant", "content": "first response"},
+            {"role": "system", "content": "second instruction"},
+            {"role": "user", "content": "second user message"},
+        ],
+    })
+
+    assert [message.role.value for message in request.messages] == [
+        "system", "system", "user", "assistant", "user",
+    ]
+    assert [message.content for message in request.messages] == [
+        "first instruction", "second instruction", "first user message",
+        "first response", "second user message",
+    ]
+
+
+def test_context_manager_keeps_default_system_before_history():
+    context = AgentContext(
+        user_input="new user message",
+        run_id="context-order",
+        messages=[
+            {"role": "user", "content": "earlier user message"},
+            {"role": "assistant", "content": "earlier response"},
+        ],
+    )
+    manager = ContextManager(ContextConfig(system_prompt="MindAgent instructions"))
+
+    asyncio.run(manager.build_context(context))
+
+    assert context.messages == [
+        {"role": "system", "content": "MindAgent instructions"},
+        {"role": "user", "content": "earlier user message"},
+        {"role": "assistant", "content": "earlier response"},
+        {"role": "user", "content": "new user message"},
+    ]
 
 
 def test_gateway_provider_forwards_tools_and_decodes_tool_calls(

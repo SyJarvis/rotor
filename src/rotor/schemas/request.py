@@ -70,6 +70,18 @@ class ChatCompletionRequest(BaseModel):
     # Cross-protocol adapters consume the normalized messages/tools instead.
     responses_payload: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
 
+    @model_validator(mode="after")
+    def move_system_messages_to_prefix(self) -> "ChatCompletionRequest":
+        """Keep system instructions in a stable leading prefix for providers and caching."""
+        system_messages = [
+            message for message in self.messages if message.role == Role.SYSTEM
+        ]
+        if system_messages:
+            self.messages = system_messages + [
+                message for message in self.messages if message.role != Role.SYSTEM
+            ]
+        return self
+
 
 class Usage(BaseModel):
     """Token usage."""
