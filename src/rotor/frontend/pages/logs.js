@@ -3,21 +3,31 @@
 import { api } from "../api.js";
 import { t } from "../i18n.js";
 import {
-  escapeHtml, badge, relativeTime, formatTime, formatNumber, skeletonRows,
+  escapeHtml, badge, formatNumber, formatTimeInTimezone, skeletonRows,
   refreshIcons, toast,
-} from "../ui.js";
+} from "../ui.js?v=12";
+import { renderStackedBar, isAvailable } from "../charts.js?v=8";
+import {
+  CALENDAR_PERIODS, bucketKey, localDate, periodDates, periodQuery, todayInTimezone,
+} from "../periods.js";
 
 const PAGE_SIZE = 50;
 let state = {
   logs: [],
   total: 0,
   page: 0,
+  range: "week",
+  selectedDate: localDate(),
+  displayTimezone: "",
+  timeline: [],
   filter: { model: "", channel: "", status: "", q: "" },
   models: [],
   channels: [],
   autoRefresh: false,
   expanded: new Set(),
   detailCache: {},
+  detailLoading: new Set(),
+  detailErrors: {},
   seen: new Set(),
   timer: null,
 };
@@ -34,6 +44,11 @@ export async function load() {
       state.models = models.map((m) => m.model);
       state.channels = channels;
     }
+    if (!state.displayTimezone) {
+      const settings = await api("/api/admin/settings").catch(() => null);
+      state.displayTimezone = settings?.display_timezone || "Asia/Shanghai";
+      state.selectedDate = todayInTimezone(state.displayTimezone);
+    }
     await fetchPage();
     render();
   } catch (e) {
@@ -44,7 +59,15 @@ export async function load() {
 
 async function fetchPage() {
   const skip = state.page * PAGE_SIZE;
-  state.logs = await api(`/api/admin/logs?limit=${PAGE_SIZE}&skip=${skip}${buildFilterQuery()}`);
+  const filters = buildFilterQuery();
+  const [logs, count, timeline] = await Promise.all([
+    api(`/api/admin/logs?limit=${PAGE_SIZE}&skip=${skip}${filters}`),
+    api(`/api/admin/logs/count?${filters.slice(1)}`),
+    api(`/api/admin/logs/timeseries?bucket=hour${filters}`).catch(() => []),
+  ]);
+  state.logs = logs;
+  state.total = count.count;
+  state.timeline = timeline;
   state.seen = new Set(state.logs.map((l) => l.id));
 }
 
@@ -54,6 +77,8 @@ function buildFilterQuery() {
   if (state.filter.channel) params.set("channel_id", state.filter.channel);
   if (state.filter.status === "success") params.set("success", "true");
   if (state.filter.status === "failed") params.set("success", "false");
+  params.set("period", state.range);
+  params.set("period_date", state.selectedDate);
   return params.toString() ? `&${params.toString()}` : "";
 }
 
@@ -61,7 +86,10 @@ export function render() {
   const container = document.getElementById("logs");
   const cols = t("columns");
   const filtered = applyClientFilter(state.logs);
-  const totalPages = Math.max(1, Math.ceil((state.total || filtered.length) / PAGE_SIZE));
+  const totalItems = state.filter.q ? filtered.length : state.total;
+  const totalPages = state.filter.q ? 1 : Math.max(1, Math.ceil(totalItems / PAGE_SIZE));
+  const chartAvailable = isAvailable();
+  const range = CALENDAR_PERIODS.find((item) => item.key === state.range) || CALENDAR_PERIODS[1];
 
   container.innerHTML = `
     <div class="section-head">
@@ -76,6 +104,16 @@ export function render() {
         </label>
         <button class="btn-secondary" id="refreshLogsData"><i data-lucide="refresh-cw"></i>${t("refresh")}</button>
       </div>
+    </div>
+
+    <div class="usage-period-controls logs-period-controls">
+      <div class="range-switch" id="logRangeSwitch">
+        ${CALENDAR_PERIODS.map((item) => `<button data-log-range="${item.key}" class="${item.key === state.range ? "active" : ""}">${item.label}</button>`).join("")}
+      </div>
+      <label class="usage-date-picker">
+        <span>${t("usageDate")}</span>
+        <input class="input" id="logDate" type="date" value="${state.selectedDate}" max="${localDate()}">
+      </label>
     </div>
 
     <div class="filter-bar">
@@ -93,6 +131,16 @@ export function render() {
       <input class="input" id="logSearch" placeholder="${t("searchError")}" value="${escapeHtml(state.filter.q)}">
     </div>
 
+    <div class="chart-card log-chart-card">
+      <div class="card-head">
+        <div class="card-title">${t("requestTrend")}</div>
+        <div class="card-sub">${state.selectedDate} · ${state.displayTimezone}</div>
+      </div>
+      <div class="chart-canvas-wrap" style="height:260px">
+        ${chartAvailable ? `<canvas id="logRequestsChart"></canvas>` : renderChartFallback()}
+      </div>
+    </div>
+
     ${filtered.length === 0
       ? `<div class="empty-state"><i data-lucide="scroll-text"></i><h3>${t("noLogs")}</h3></div>`
       : `<div class="table-wrap"><div class="table-scroll"><table>
@@ -105,13 +153,12 @@ export function render() {
           </tbody>
         </table></div></div>`}
 
-    ${renderPagination(totalPages)}
+    ${renderPagination(totalPages, totalItems)}
   `;
 
   bindControls();
   refreshIcons(container);
-  // lazy-load detail for expanded rows
-  for (const id of state.expanded) loadDetail(id);
+  if (chartAvailable) drawChart(range);
 }
 
 function renderRow(log) {
@@ -120,13 +167,15 @@ function renderRow(log) {
   const isFail = !log.success;
   const expanded = state.expanded.has(log.id);
   const detail = state.detailCache[log.id];
+  const createdAt = formatTimeInTimezone(log.created_at, state.displayTimezone);
 
   return `
-    <tr class="log-row ${isFail ? "failed" : ""}">
-      <td><button class="icon-btn" data-log-expand="${log.id}">
+    <tr class="log-row ${isFail ? "failed" : ""} ${expanded ? "expanded" : ""}">
+      <td><button class="icon-btn log-expand-btn" type="button" data-log-expand="${log.id}"
+        aria-expanded="${expanded}" aria-label="${t("logDetails")}">
         <i data-lucide="${expanded ? "chevron-down" : "chevron-right"}"></i>
       </button></td>
-      <td><span title="${escapeHtml(formatTime(log.created_at))}" class="mono text-sm">${escapeHtml(relativeTime(log.created_at))}</span></td>
+      <td><span class="mono text-sm">${escapeHtml(createdAt)}</span></td>
       <td><code>${escapeHtml(log.model)}</code></td>
       <td class="muted mono">${log.token_id ?? "—"}</td>
       <td>
@@ -142,6 +191,15 @@ function renderRow(log) {
 
 function renderDetail(log, detail) {
   if (!detail) {
+    const error = state.detailErrors[log.id];
+    if (error) {
+      return `<div class="log-detail-error" role="alert">
+        <span>${escapeHtml(t("logDetailFailed"))}: ${escapeHtml(error)}</span>
+        <button class="btn-secondary" type="button" data-log-detail-retry="${log.id}">
+          <i data-lucide="refresh-cw"></i>${t("retry")}
+        </button>
+      </div>`;
+    }
     return `<div class="skeleton block" style="height:120px"></div>`;
   }
   return `
@@ -171,14 +229,16 @@ function renderDetail(log, detail) {
   `;
 }
 
-function renderPagination(totalPages) {
+function renderPagination(totalPages, totalItems) {
   if (totalPages <= 1 && state.page === 0) return "";
+  const first = totalItems ? state.page * PAGE_SIZE + 1 : 0;
+  const last = Math.min((state.page + 1) * PAGE_SIZE, totalItems);
   return `
     <div class="pagination">
       <button class="btn-secondary" id="logPrev" ${state.page === 0 ? "disabled" : ""}>
         <i data-lucide="chevron-left"></i>${t("prev") || "上一页"}
       </button>
-      <span class="muted text-sm">${state.page + 1} / ${totalPages}</span>
+      <span class="muted text-sm">${first}–${last} / ${totalItems}</span>
       <button class="btn-secondary" id="logNext" ${state.page >= totalPages - 1 ? "disabled" : ""}>
         ${t("next") || "下一页"}<i data-lucide="chevron-right"></i>
       </button>
@@ -200,11 +260,58 @@ function bindControls() {
   document.getElementById("logModelFilter")?.addEventListener("change", (e) => { state.filter.model = e.target.value; state.page = 0; load(); });
   document.getElementById("logChannelFilter")?.addEventListener("change", (e) => { state.filter.channel = e.target.value; state.page = 0; load(); });
   document.getElementById("logStatusFilter")?.addEventListener("change", (e) => { state.filter.status = e.target.value; state.page = 0; load(); });
-  document.getElementById("logSearch")?.addEventListener("input", (e) => { state.filter.q = e.target.value; debouncedRender(); });
+  document.getElementById("logSearch")?.addEventListener("input", (e) => { state.filter.q = e.target.value; state.page = 0; debouncedRender(); });
+  document.getElementById("logRangeSwitch")?.addEventListener("click", (e) => {
+    const button = e.target.closest("button[data-log-range]");
+    if (!button) return;
+    state.range = button.dataset.logRange;
+    state.page = 0;
+    load();
+  });
+  document.getElementById("logDate")?.addEventListener("change", (e) => {
+    if (!e.target.value) return;
+    state.selectedDate = e.target.value;
+    state.page = 0;
+    load();
+  });
   document.getElementById("refreshLogsData")?.addEventListener("click", () => load());
   document.getElementById("logAutoRefresh")?.addEventListener("change", (e) => toggleAutoRefresh(e.target.checked));
   document.getElementById("logPrev")?.addEventListener("click", () => { if (state.page > 0) { state.page--; load(); } });
   document.getElementById("logNext")?.addEventListener("click", () => { state.page++; load(); });
+}
+
+function drawChart(range) {
+  const canvas = document.getElementById("logRequestsChart");
+  if (!canvas) return;
+  const buckets = range.key === "day"
+    ? Array.from({ length: 24 }, (_, hour) => `${state.selectedDate}T${String(hour).padStart(2, "0")}:00:00`)
+    : periodDates(range.key, state.selectedDate);
+  const values = new Map();
+  state.timeline.forEach((row) => {
+    const key = bucketKey(row.bucket, range.key, state.displayTimezone);
+    const previous = values.get(key) || { success: 0, failed: 0 };
+    previous.success += Number(row.success || 0);
+    previous.failed += Number(row.failed || 0);
+    values.set(key, previous);
+  });
+  const labels = buckets.map((bucket) => range.key === "day" ? bucket.slice(11, 16) : bucket.slice(5));
+  renderStackedBar("logRequests", canvas, labels, [
+    { label: t("reachable"), data: buckets.map((bucket) => values.get(bucket)?.success || 0) },
+    { label: t("failed"), data: buckets.map((bucket) => values.get(bucket)?.failed || 0) },
+  ], { yTitle: t("requestCount") || "Requests" });
+}
+
+function renderChartFallback() {
+  return `<div class="empty-state"><i data-lucide="bar-chart-3"></i><h3>${formatNumber(state.total)} ${t("requestCount") || "Requests"}</h3></div>`;
+}
+
+export function setDisplayTimezone(value) {
+  state.displayTimezone = value || "Asia/Shanghai";
+}
+
+export function showFailures() {
+  state.filter.status = "failed";
+  state.page = 0;
 }
 
 let renderTimer;
@@ -229,18 +336,27 @@ async function pollNew() {
     state.seen = new Set(fresh.map((l) => l.id));
     if (state.page === 0) {
       state.logs = fresh;
+      state.total += newOnes.length;
       if (newOnes.length) render();
     }
   } catch (e) { /* swallow */ }
 }
 
 async function loadDetail(id) {
-  if (state.detailCache[id]) { render(); return; }
+  if (state.detailCache[id] || state.detailLoading.has(id)) return;
+  state.detailLoading.add(id);
   try {
     const detail = await api(`/api/admin/logs/${id}`);
     state.detailCache[id] = detail;
-    render();
-  } catch (e) { /* keep skeleton */ }
+    delete state.detailErrors[id];
+  } catch (e) {
+    state.detailErrors[id] = e.message || t("logDetailFailed");
+  } finally {
+    state.detailLoading.delete(id);
+    if (state.expanded.has(id) && state.logs.some((log) => log.id === id)) {
+      render();
+    }
+  }
 }
 
 export async function onClick(target) {
@@ -252,9 +368,18 @@ export async function onClick(target) {
       render();
     } else {
       state.expanded.add(id);
-      if (!state.detailCache[id]) loadDetail(id);
-      else render();
+      render();
+      loadDetail(id);
     }
+    return true;
+  }
+
+  const retry = target.closest("[data-log-detail-retry]")?.dataset.logDetailRetry;
+  if (retry) {
+    const id = Number(retry);
+    delete state.detailErrors[id];
+    render();
+    loadDetail(id);
     return true;
   }
 

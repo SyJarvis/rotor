@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
-    <link rel="stylesheet" href="/styles.css?v=12">
+    <link rel="stylesheet" href="/styles.css?v=16">
     <script>
       // FOUC guard — must run before body paints.
       (function () {
@@ -60,6 +60,21 @@
           <button class="nav-item" data-tab="mindagent">
             <i data-lucide="bot"></i><span data-i18n="mindagentChat">MindAgent 对话</span>
           </button>
+          <section class="sidebar-conversations" id="mindagentHistory" aria-label="最近对话">
+            <div class="sidebar-conversations-head">
+              <span data-i18n="recentConversations">最近对话</span>
+              <button
+                class="sidebar-conversations-new"
+                type="button"
+                data-agent-action="new"
+                title="新对话"
+                aria-label="新对话"
+              >
+                <i data-lucide="square-pen"></i>
+              </button>
+            </div>
+            <div class="agent-thread-list" id="agentThreadList"></div>
+          </section>
         </nav>
         <div class="sidebar-footer">
           <button class="nav-item" id="openSettings" type="button">
@@ -245,6 +260,19 @@
                   </span>
                   <input name="affinity_enabled" type="checkbox">
                 </label>
+                <label>
+                  <span data-i18n="displayTimezone">日期与时间</span>
+                  <small data-i18n="displayTimezoneDescription">用于用量和请求日志的自然日、周和月边界。</small>
+                  <input name="display_timezone" list="displayTimezoneOptions" value="Asia/Shanghai" required>
+                  <datalist id="displayTimezoneOptions">
+                    <option value="Asia/Shanghai">Asia/Shanghai (UTC+08:00)</option>
+                    <option value="UTC">UTC (UTC+00:00)</option>
+                    <option value="Asia/Tokyo">Asia/Tokyo (UTC+09:00)</option>
+                    <option value="America/Los_Angeles">America/Los_Angeles</option>
+                    <option value="America/New_York">America/New_York</option>
+                    <option value="Europe/London">Europe/London</option>
+                  </datalist>
+                </label>
                 <div class="settings-file">
                   <span data-i18n="settingsFile">配置文件</span>
                   <code id="settingsPath">~/.rotor/settings.json</code>
@@ -262,7 +290,24 @@
       </div>
     </div>
 
-    <script src="/config.js?v=12"></script>
-    <script type="module" src="/app.js?v=13"></script>
+    <div class="modal hidden" id="mindagentDeleteModal" role="dialog" aria-modal="true" aria-labelledby="mindagentDeleteModalTitle">
+      <div class="modal-backdrop" data-agent-action="cancel-delete"></div>
+      <div class="modal-panel mindagent-delete-modal">
+        <header class="modal-head">
+          <div>
+            <h2 id="mindagentDeleteModalTitle" data-i18n="deleteConversation">删除对话</h2>
+            <p data-i18n="confirmDeleteConversation">确定删除这条本地对话记录吗？</p>
+          </div>
+        </header>
+        <p class="mindagent-delete-name" id="mindagentDeleteConversationName"></p>
+        <footer class="modal-actions">
+          <button type="button" class="btn-secondary" data-agent-action="cancel-delete" data-i18n="cancel">取消</button>
+          <button type="button" class="btn-danger" data-agent-action="confirm-delete" data-i18n="confirmDelete">确认删除</button>
+        </footer>
+      </div>
+    </div>
+
+    <script src="/config.js?v=17"></script>
+    <script type="module" src="/app.js?v=20"></script>
   </body>
 </html>

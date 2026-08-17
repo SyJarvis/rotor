@@ -241,7 +241,7 @@ def _build_gateway_provider(
 
 
 async def _build_rotor_mcp_registry(run_id: str):
-    from mindagent.tools import MCPToolSet, ToolRegistry
+    from mindagent.tools import ToolRegistry
 
     command = settings.ROTOR_MINDAGENT_MCP_COMMAND
     if not command:
@@ -250,6 +250,13 @@ async def _build_rotor_mcp_registry(run_id: str):
         raise RuntimeError(
             "ROTOR_CONTROL_API_TOKEN 未配置，无法启动 Rotor MCP"
         )
+    try:
+        from mindagent.tools import MCPToolSet
+    except ImportError as exc:
+        raise RuntimeError(
+            "当前 MindAgent 版本不支持 Rotor MCP；请升级 MindAgent，"
+            "或清除 ROTOR_MINDAGENT_MCP_COMMAND 以禁用 MCP。"
+        ) from exc
 
     tool_set = MCPToolSet.stdio(
         command=command,

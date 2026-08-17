@@ -3,18 +3,17 @@
 import { api } from "../api.js";
 import { t } from "../i18n.js";
 import {
-  escapeHtml, formatNumber, formatLatency, skeletonKpis, refreshIcons, badge,
-} from "../ui.js";
+  escapeHtml, formatNumber, formatRequestCount, formatLatency, skeletonKpis, refreshIcons, badge,
+} from "../ui.js?v=11";
 import { renderStackedBar, renderDonut, renderHBar, isAvailable } from "../charts.js?v=8";
-
-const RANGES = [
-  { key: "24h", label: "24小时", days: 1, bucket: "hour", bucketCount: 24 },
-  { key: "7d",  label: "7天",   days: 7, bucket: "day",  bucketCount: 7 },
-  { key: "30d", label: "30天",  days: 30, bucket: "day", bucketCount: 30 },
-];
+import {
+  CALENDAR_PERIODS, bucketKey, localDate, periodDates, periodQuery, todayInTimezone,
+} from "../periods.js";
 
 let state = {
-  range: "7d",
+  range: "week",
+  selectedDate: localDate(),
+  displayTimezone: "",
   modelFilter: "",
   channelFilter: "",
   stats: null,
@@ -30,6 +29,11 @@ export async function load() {
   try {
     if (state.channels.length === 0) {
       state.channels = await api("/api/admin/channels").catch(() => []);
+    }
+    if (!state.displayTimezone) {
+      const settings = await api("/api/admin/settings").catch(() => null);
+      state.displayTimezone = settings?.display_timezone || "Asia/Shanghai";
+      state.selectedDate = todayInTimezone(state.displayTimezone);
     }
     await fetchAll();
     render();
@@ -47,12 +51,13 @@ function filterQuery() {
 }
 
 async function fetchAll() {
-  const range = RANGES.find((r) => r.key === state.range) || RANGES[1];
+  const range = CALENDAR_PERIODS.find((r) => r.key === state.range) || CALENDAR_PERIODS[1];
+  const period = periodQuery(range.key, state.selectedDate);
   const q = filterQuery();
   const [stats, timeline, modelsAgg] = await Promise.all([
-    api(`/api/admin/logs/stats?days=${range.days}${q}`).catch(() => null),
-    api(`/api/admin/logs/timeseries_by_model?days=${range.days}&bucket=${range.bucket}${q}`).catch(() => null),
-    api(`/api/admin/logs/models?days=${range.days}&limit=8${q}`).catch(() => []),
+    api(`/api/admin/logs/stats?${period}${q}`).catch(() => null),
+    api(`/api/admin/logs/timeseries_by_model?${period}&bucket=hour${q}`).catch(() => null),
+    api(`/api/admin/logs/models?${period}&limit=8${q}`).catch(() => []),
   ]);
   state.stats = stats;
   state.timelineLoaded = Array.isArray(timeline);
@@ -62,6 +67,7 @@ async function fetchAll() {
 
 export async function setRange(range) { state.range = range; await load(); }
 export async function setFilter(key, value) { state[key] = value; await load(); }
+export function setDisplayTimezone(value) { state.displayTimezone = value || "Asia/Shanghai"; }
 
 export function render() {
   const container = document.getElementById("usage");
@@ -79,7 +85,7 @@ export function render() {
       ? rangedTokenTotal
       : (state.stats?.total_tokens || 0),
   };
-  const range = RANGES.find((r) => r.key === state.range) || RANGES[1];
+  const range = CALENDAR_PERIODS.find((r) => r.key === state.range) || CALENDAR_PERIODS[1];
   const successRate = s.total_requests ? ((s.success_requests / s.total_requests) * 100) : 0;
   const chartAvailable = isAvailable();
   const filtering = state.modelFilter || state.channelFilter;
@@ -91,8 +97,14 @@ export function render() {
   container.innerHTML = `
     <div class="section-head">
       <div><h2>${t("usage")}</h2><p>${t("usageHint")}</p></div>
-      <div class="range-switch" id="rangeSwitch">
-        ${RANGES.map((r) => `<button data-range="${r.key}" class="${r.key === state.range ? "active" : ""}">${r.label}</button>`).join("")}
+      <div class="usage-period-controls">
+        <div class="range-switch" id="rangeSwitch">
+        ${CALENDAR_PERIODS.map((r) => `<button data-range="${r.key}" class="${r.key === state.range ? "active" : ""}">${r.label}</button>`).join("")}
+        </div>
+        <label class="usage-date-picker">
+          <span>${t("usageDate")}</span>
+          <input class="input" id="usageDate" type="date" value="${state.selectedDate}" max="${localDate()}">
+        </label>
       </div>
     </div>
 
@@ -117,8 +129,8 @@ export function render() {
     <div class="kpi-grid">
       <div class="kpi">
         <div class="kpi-label"><i data-lucide="activity"></i>${t("metrics")[0]}</div>
-        <div class="kpi-value">${formatNumber(s.total_requests)}</div>
-        <div class="kpi-delta">${s.failed_requests || 0} ${t("failed")}</div>
+        <div class="kpi-value">${formatRequestCount(s.total_requests)}</div>
+        <div class="kpi-delta">${formatRequestCount(s.failed_requests)} ${t("failed")}</div>
       </div>
       <div class="kpi">
         <div class="kpi-label"><i data-lucide="coins"></i>${t("metrics")[3]}</div>
@@ -128,7 +140,7 @@ export function render() {
       <div class="kpi">
         <div class="kpi-label"><i data-lucide="check-circle"></i>${t("successRate") || "Success"}</div>
         <div class="kpi-value">${successRate.toFixed(1)}%</div>
-        <div class="kpi-delta">${s.success_requests || 0} ok</div>
+        <div class="kpi-delta">${formatRequestCount(s.success_requests)} ok</div>
       </div>
       <div class="kpi">
         <div class="kpi-label"><i data-lucide="gauge"></i>${t("metrics")[7]}</div>
@@ -149,7 +161,7 @@ export function render() {
     <div class="chart-card">
       <div class="card-head">
         <div class="card-title">${t("tokenByModel") || "按模型的 Token 消耗"}</div>
-        <div class="card-sub">${chartAvailable ? `${range.label} · ${distinctModels(state.timeline).length} ${t("models")}` : t("chartUnavailable")}</div>
+        <div class="card-sub">${chartAvailable ? `${state.selectedDate} · ${distinctModels(state.timeline).length} ${t("models")}` : t("chartUnavailable")}</div>
       </div>
       <div class="chart-canvas-wrap" style="height:320px">
         ${chartAvailable ? `<canvas id="stackedChart"></canvas>` : renderStackedFallback()}
@@ -206,7 +218,7 @@ export function render() {
                 : '<span class="muted">—</span>';
               return `<tr>
                 <td><code>${escapeHtml(m.model)}</code></td>
-                <td class="mono">${formatNumber(m.request_count)}</td>
+                <td class="mono">${formatRequestCount(m.request_count)}</td>
                 <td class="mono">${formatNumber(prompt)}</td>
                 <td class="mono">${formatNumber(completion)}</td>
                 <td class="mono">${formatNumber(cached)}</td>
@@ -232,6 +244,11 @@ function bindControls() {
   });
   document.getElementById("usageModelFilter")?.addEventListener("change", (e) => setFilter("modelFilter", e.target.value));
   document.getElementById("usageChannelFilter")?.addEventListener("change", (e) => setFilter("channelFilter", e.target.value));
+  document.getElementById("usageDate")?.addEventListener("change", (e) => {
+    if (!e.target.value) return;
+    state.selectedDate = e.target.value;
+    setRange("day");
+  });
   document.getElementById("clearUsageFilter")?.addEventListener("click", () => {
     state.modelFilter = "";
     state.channelFilter = "";
@@ -242,7 +259,7 @@ function bindControls() {
 function drawCharts(range) {
   // Grouped histogram: every model starts from the same baseline, with one
   // colored bar per model inside each time bucket.
-  const { labels, datasets } = pivotByModel(state.timeline, range.bucket);
+  const { labels, datasets } = pivotByModel(state.timeline, range.key);
   const stackedCanvas = document.getElementById("stackedChart");
   if (stackedCanvas) {
     if (datasets.length) {
@@ -283,17 +300,19 @@ function distinctModels(rows) {
   return [...new Set(rows.map((r) => r.model))];
 }
 
-function pivotByModel(rows, bucketSize) {
-  const range = RANGES.find((r) => r.key === state.range) || RANGES[1];
+function pivotByModel(rows, period) {
+  const range = CALENDAR_PERIODS.find((r) => r.key === state.range) || CALENDAR_PERIODS[1];
   const buckets = expectedBuckets(range);
   const models = distinctModels(rows).sort();
-  const lookup = new Map(
-    rows.map((r) => [`${normalizeBucketKey(r.bucket, bucketSize)}|${r.model}`, r])
-  );
-  const labels = buckets.map((b) => formatBucketLabel(b, bucketSize));
+  const lookup = new Map();
+  rows.forEach((row) => {
+    const key = `${bucketKey(row.bucket, period, state.displayTimezone)}|${row.model}`;
+    lookup.set(key, (lookup.get(key) || 0) + Number(row.tokens || 0));
+  });
+  const labels = buckets.map((bucket) => period === "day" ? bucket.slice(11, 16) : bucket.slice(5));
   const datasets = models
     .map((m) => {
-      const data = buckets.map((b) => lookup.get(`${b}|${m}`)?.tokens || 0);
+      const data = buckets.map((b) => lookup.get(`${b}|${m}`) || 0);
       return {
         label: m,
         data,
@@ -305,78 +324,14 @@ function pivotByModel(rows, bucketSize) {
 }
 
 function expectedBuckets(range) {
-  const now = new Date();
-  if (range.bucket === "hour") {
-    const end = new Date(Date.UTC(
-      now.getUTCFullYear(),
-      now.getUTCMonth(),
-      now.getUTCDate(),
-      now.getUTCHours(),
-      0,
-      0,
-      0,
-    ));
-    return Array.from({ length: range.bucketCount }, (_, index) => {
-      const d = new Date(end.getTime() - (range.bucketCount - 1 - index) * 3600_000);
-      return utcHourKey(d);
-    });
+  if (range.key === "day") {
+    return Array.from({ length: 24 }, (_, hour) => `${state.selectedDate}T${pad(hour)}:00:00`);
   }
-
-  const end = new Date(Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    0,
-    0,
-    0,
-    0,
-  ));
-  return Array.from({ length: range.bucketCount }, (_, index) => {
-    const d = new Date(end.getTime() - (range.bucketCount - 1 - index) * 86400_000);
-    return utcDayKey(d);
-  });
-}
-
-function normalizeBucketKey(bucket, bucketSize) {
-  const value = String(bucket || "");
-  if (bucketSize === "hour") {
-    const match = value.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2})/);
-    if (match) return `${match[1]}T${match[2]}:00:00`;
-    const d = new Date(value);
-    return Number.isNaN(d.getTime()) ? value : utcHourKey(d);
-  }
-  const match = value.match(/^(\d{4}-\d{2}-\d{2})/);
-  if (match) return match[1];
-  const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? value : utcDayKey(d);
-}
-
-function utcHourKey(date) {
-  return `${utcDayKey(date)}T${pad(date.getUTCHours())}:00:00`;
-}
-
-function utcDayKey(date) {
-  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`;
+  return periodDates(range.key, state.selectedDate);
 }
 
 function pad(value) {
   return String(value).padStart(2, "0");
-}
-
-function formatBucketLabel(bucket, bucketSize) {
-  if (!bucket) return "";
-  const s = String(bucket);
-  if (bucketSize === "hour") {
-    const d = new Date(`${normalizeBucketKey(s, "hour")}Z`);
-    if (!Number.isNaN(d.getTime())) {
-      return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" });
-    }
-  }
-  const d = new Date(`${normalizeBucketKey(s, "day")}T00:00:00Z`);
-  if (!Number.isNaN(d.getTime())) {
-    return d.toLocaleDateString([], { month: "short", day: "numeric" });
-  }
-  return s.slice(0, 10);
 }
 
 function renderStackedFallback() {
@@ -395,7 +350,7 @@ function renderModelsFallback() {
     <div class="row" style="gap:10px;margin-bottom:8px">
       <code style="min-width:140px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(m.model)}</code>
       <div class="progress" style="flex:1"><span style="width:${(m.request_count / max) * 100}%"></span></div>
-      <span class="mono text-sm" style="min-width:60px;text-align:right">${m.request_count}</span>
+      <span class="mono text-sm" style="min-width:60px;text-align:right">${formatRequestCount(m.request_count)}</span>
     </div>`).join("");
 }
 

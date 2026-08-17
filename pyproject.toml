@@ -1,6 +1,6 @@
 [project]
 name = "rotor-gateway"
-version = "0.2.4"
+version = "0.2.5"
 description = ""
 authors = [
     {name = "runkezhong",email = "jarvisshangye@gmail.com"}

@@ -34,6 +34,12 @@ export function formatNumber(n) {
   return String(num);
 }
 
+export function formatRequestCount(n) {
+  const num = Number(n || 0);
+  if (Number.isNaN(num)) return "0";
+  return Math.trunc(num).toLocaleString();
+}
+
 export function formatLatency(seconds) {
   const s = Number(seconds || 0);
   if (s < 1) return `${Math.round(s * 1000)} ms`;
@@ -45,6 +51,27 @@ export function formatTime(iso) {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return String(iso);
   return d.toLocaleString();
+}
+
+export function formatTimeInTimezone(iso, timeZone = "Asia/Shanghai") {
+  if (!iso) return "—";
+  const raw = String(iso);
+  const date = new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(raw) ? raw : `${raw}Z`);
+  if (Number.isNaN(date.getTime())) return raw;
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(date)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
 }
 
 export function relativeTime(iso) {

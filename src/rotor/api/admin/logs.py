@@ -1,11 +1,13 @@
-from typing import List, Optional
-from datetime import datetime, timedelta
+from typing import List, Literal, Optional
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, case, func
 
 from rotor.config import settings
+from rotor.application_settings import application_settings
 from rotor.database import get_db
 from rotor.models.log import RequestLog
 
@@ -17,6 +19,74 @@ def _cache_hit_rate(prompt_tokens: int | None, cached_tokens: int | None) -> flo
     if prompt <= 0:
         return 0.0
     return int(cached_tokens or 0) / prompt * 100
+
+
+def _usage_time_window(
+    *,
+    days: int,
+    start_time: datetime | None,
+    end_time: datetime | None,
+    period: Literal["day", "week", "month"] | None = None,
+    period_date: date | None = None,
+) -> tuple[datetime, datetime | None]:
+    if period is not None:
+        if start_time is not None or end_time is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="period cannot be combined with start_time or end_time",
+            )
+        return _calendar_time_window(period, period_date)
+    if start_time is None and end_time is None:
+        return datetime.utcnow() - timedelta(days=days), None
+    if start_time is None or end_time is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="start_time and end_time must be provided together",
+        )
+
+    def utc_naive(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    start = utc_naive(start_time)
+    end = utc_naive(end_time)
+    if start >= end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="end_time must be after start_time",
+        )
+    return start, end
+
+
+def _calendar_time_window(
+    period: Literal["day", "week", "month"],
+    period_date: date | None,
+    display_timezone_name: str | None = None,
+) -> tuple[datetime, datetime]:
+    timezone_name = display_timezone_name or application_settings.get().display_timezone
+    display_timezone = ZoneInfo(timezone_name)
+    anchor = period_date or datetime.now(display_timezone).date()
+    if period == "day":
+        start_date = anchor
+        end_date = anchor + timedelta(days=1)
+    elif period == "week":
+        start_date = anchor - timedelta(days=anchor.weekday())
+        end_date = start_date + timedelta(days=7)
+    else:
+        start_date = anchor.replace(day=1)
+        end_date = (
+            start_date.replace(year=start_date.year + 1, month=1)
+            if start_date.month == 12
+            else start_date.replace(month=start_date.month + 1)
+        )
+
+    def utc_naive(day: date) -> datetime:
+        return datetime.combine(day, time.min, display_timezone).astimezone(
+            timezone.utc
+        ).replace(tzinfo=None)
+
+    return utc_naive(start_date), utc_naive(end_date)
 
 
 class RequestLogResponse(BaseModel):
@@ -48,6 +118,31 @@ class RequestLogDetailResponse(RequestLogResponse):
     response_body: Optional[dict] = None
 
 
+def _log_filter_conditions(
+    *,
+    token_id: int | None = None,
+    channel_id: int | None = None,
+    model: str | None = None,
+    success: bool | None = None,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+) -> list:
+    conditions = []
+    if token_id is not None:
+        conditions.append(RequestLog.token_id == token_id)
+    if channel_id is not None:
+        conditions.append(RequestLog.channel_id == channel_id)
+    if model is not None:
+        conditions.append(RequestLog.model == model)
+    if success is not None:
+        conditions.append(RequestLog.success == success)
+    if start_time is not None:
+        conditions.append(RequestLog.created_at >= start_time)
+    if end_time is not None:
+        conditions.append(RequestLog.created_at < end_time)
+    return conditions
+
+
 @router.get("", response_model=List[RequestLogResponse])
 async def list_logs(
     skip: int = Query(0, ge=0),
@@ -58,6 +153,8 @@ async def list_logs(
     success: Optional[bool] = None,
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
+    period: Literal["day", "week", "month"] | None = None,
+    period_date: date | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -73,26 +170,22 @@ async def list_logs(
         start_time: Filter logs after this time
         end_time: Filter logs before this time
     """
-    # Build query with filters
-    conditions = []
-
-    if token_id is not None:
-        conditions.append(RequestLog.token_id == token_id)
-
-    if channel_id is not None:
-        conditions.append(RequestLog.channel_id == channel_id)
-
-    if model is not None:
-        conditions.append(RequestLog.model == model)
-
-    if success is not None:
-        conditions.append(RequestLog.success == success)
-
-    if start_time is not None:
-        conditions.append(RequestLog.created_at >= start_time)
-
-    if end_time is not None:
-        conditions.append(RequestLog.created_at <= end_time)
+    if period is not None:
+        start_time, end_time = _usage_time_window(
+            days=1,
+            start_time=start_time,
+            end_time=end_time,
+            period=period,
+            period_date=period_date,
+        )
+    conditions = _log_filter_conditions(
+        token_id=token_id,
+        channel_id=channel_id,
+        model=model,
+        success=success,
+        start_time=start_time,
+        end_time=end_time,
+    )
 
     query = select(RequestLog)
 
@@ -107,12 +200,52 @@ async def list_logs(
     return logs
 
 
+@router.get("/count")
+async def count_logs(
+    token_id: Optional[int] = None,
+    channel_id: Optional[int] = None,
+    model: Optional[str] = None,
+    success: Optional[bool] = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    period: Literal["day", "week", "month"] | None = None,
+    period_date: date | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Count request logs matching the list filters."""
+    if period is not None:
+        start_time, end_time = _usage_time_window(
+            days=1,
+            start_time=start_time,
+            end_time=end_time,
+            period=period,
+            period_date=period_date,
+        )
+    conditions = _log_filter_conditions(
+        token_id=token_id,
+        channel_id=channel_id,
+        model=model,
+        success=success,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    query = select(func.count(RequestLog.id))
+    if conditions:
+        query = query.where(and_(*conditions))
+    result = await db.execute(query)
+    return {"count": result.scalar() or 0}
+
+
 @router.get("/stats")
 async def get_log_stats(
     token_id: Optional[int] = None,
     channel_id: Optional[int] = None,
     model: Optional[str] = None,
     days: int = Query(7, ge=1, le=90),
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    period: Literal["day", "week", "month"] | None = None,
+    period_date: date | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -124,10 +257,18 @@ async def get_log_stats(
         model: Filter by model name
         days: Number of days to include in stats
     """
-    start_time = datetime.utcnow() - timedelta(days=days)
+    start_time, end_time = _usage_time_window(
+        days=days,
+        start_time=start_time,
+        end_time=end_time,
+        period=period,
+        period_date=period_date,
+    )
 
     # Build conditions
     conditions = [RequestLog.created_at >= start_time]
+    if end_time is not None:
+        conditions.append(RequestLog.created_at < end_time)
 
     if token_id is not None:
         conditions.append(RequestLog.token_id == token_id)
@@ -137,7 +278,6 @@ async def get_log_stats(
 
     if model is not None:
         conditions.append(RequestLog.model == model)
-
     # Query stats
     result = await db.execute(
         select(
@@ -186,6 +326,11 @@ async def get_log_timeseries(
     token_id: Optional[int] = None,
     channel_id: Optional[int] = None,
     model: Optional[str] = None,
+    success: Optional[bool] = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    period: Literal["day", "week", "month"] | None = None,
+    period_date: date | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Get time-bucketed usage statistics for charts.
@@ -198,15 +343,25 @@ async def get_log_timeseries(
         model: Filter by model name.
     """
     resolved_bucket = "hour" if (bucket == "auto" and days <= 3) or bucket == "hour" else "day"
-    start_time = datetime.utcnow() - timedelta(days=days)
+    start_time, end_time = _usage_time_window(
+        days=days,
+        start_time=start_time,
+        end_time=end_time,
+        period=period,
+        period_date=period_date,
+    )
 
     conditions = [RequestLog.created_at >= start_time]
+    if end_time is not None:
+        conditions.append(RequestLog.created_at < end_time)
     if token_id is not None:
         conditions.append(RequestLog.token_id == token_id)
     if channel_id is not None:
         conditions.append(RequestLog.channel_id == channel_id)
     if model is not None:
         conditions.append(RequestLog.model == model)
+    if success is not None:
+        conditions.append(RequestLog.success == success)
 
     is_sqlite = "sqlite" in settings.DATABASE_URL
     if is_sqlite:
@@ -247,6 +402,10 @@ async def get_log_timeseries_by_model(
     days: int = Query(7, ge=1, le=90),
     bucket: str = Query("auto", pattern="^(auto|hour|day)$"),
     today: bool = Query(False),
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    period: Literal["day", "week", "month"] | None = None,
+    period_date: date | None = None,
     channel_id: Optional[int] = None,
     model: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
@@ -257,13 +416,28 @@ async def get_log_timeseries_by_model(
     (useful for "today 0:00 → now" views). Otherwise the window is `days` days back.
     """
     resolved_bucket = "hour" if (bucket == "auto" and days <= 3) or bucket == "hour" else "day"
-    if today:
+    if period is not None:
+        start_time, end_time = _usage_time_window(
+            days=days,
+            start_time=start_time,
+            end_time=end_time,
+            period=period,
+            period_date=period_date,
+        )
+    elif today and start_time is None and end_time is None:
         now = datetime.utcnow()
         start_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_time = None
     else:
-        start_time = datetime.utcnow() - timedelta(days=days)
+        start_time, end_time = _usage_time_window(
+            days=days,
+            start_time=start_time,
+            end_time=end_time,
+        )
 
     conditions = [RequestLog.created_at >= start_time]
+    if end_time is not None:
+        conditions.append(RequestLog.created_at < end_time)
     if channel_id is not None:
         conditions.append(RequestLog.channel_id == channel_id)
     if model is not None:
@@ -306,11 +480,23 @@ async def get_model_usage(
     limit: int = Query(20, ge=1, le=100),
     channel_id: Optional[int] = None,
     model: Optional[str] = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    period: Literal["day", "week", "month"] | None = None,
+    period_date: date | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Get model usage statistics."""
-    start_time = datetime.utcnow() - timedelta(days=days)
+    start_time, end_time = _usage_time_window(
+        days=days,
+        start_time=start_time,
+        end_time=end_time,
+        period=period,
+        period_date=period_date,
+    )
     conditions = [RequestLog.created_at >= start_time]
+    if end_time is not None:
+        conditions.append(RequestLog.created_at < end_time)
     if channel_id is not None:
         conditions.append(RequestLog.channel_id == channel_id)
     if model is not None:

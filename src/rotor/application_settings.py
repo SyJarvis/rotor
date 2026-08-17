@@ -3,8 +3,9 @@ import logging
 from pathlib import Path
 from threading import RLock
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,16 @@ class ApplicationSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     routing: RoutingSettings = Field(default_factory=RoutingSettings)
+    display_timezone: str = "Asia/Shanghai"
+
+    @field_validator("display_timezone")
+    @classmethod
+    def validate_display_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("display_timezone must be a valid IANA timezone") from exc
+        return value
 
 
 class ApplicationSettingsStore:

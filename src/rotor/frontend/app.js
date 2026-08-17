@@ -3,16 +3,16 @@
 import { t, applyLocale, toggleLocale } from "./i18n.js";
 import { toggleTheme } from "./theme.js";
 import { api, copyText } from "./api.js";
-import { parseCsv, parseJson, refreshIcons, toast } from "./ui.js";
+import { parseCsv, parseJson, refreshIcons, toast } from "./ui.js?v=12";
 import { refreshTheme } from "./charts.js?v=8";
 
-import * as overview from "./pages/overview.js";
+import * as overview from "./pages/overview.js?v=3";
 import * as channels from "./pages/channels.js";
 import { editState as channelEditState } from "./pages/channels.js";
-import * as tokens from "./pages/tokens.js?v=8";
-import * as usage from "./pages/usage.js?v=10";
-import * as logs from "./pages/logs.js";
-import * as mindagent from "./pages/mindagent.js?v=12";
+import * as tokens from "./pages/tokens.js?v=9";
+import * as usage from "./pages/usage.js?v=12";
+import * as logs from "./pages/logs.js?v=3";
+import * as mindagent from "./pages/mindagent.js?v=14";
 
 const PAGES = { overview, channels, tokens, usage, logs, mindagent };
 const TITLES = {
@@ -62,7 +62,7 @@ export async function refreshActive() {
 }
 
 function switchTab(tab) {
-  if (current === tab) return;
+  if (current === tab) return refreshActive();
   current = tab;
   document.getElementById("content")?.classList.toggle("mindagent-content", tab === "mindagent");
   document.querySelectorAll(".nav-item").forEach((el) => {
@@ -74,12 +74,17 @@ function switchTab(tab) {
   const titleEl = document.getElementById("pageTitle");
   if (titleEl) titleEl.textContent = TITLES[tab]?.() || tab;
   document.title = `${TITLES[tab]?.()} · Rotor`;
-  refreshActive();
+  return refreshActive();
 }
 
 /* ---------- navigation ---------- */
 document.querySelectorAll(".nav-item").forEach((el) => {
   el.addEventListener("click", () => switchTab(el.dataset.tab));
+});
+document.addEventListener("mindagentconversationopen", () => switchTab("mindagent"));
+document.addEventListener("logsopen", async (event) => {
+  if (event.detail?.failedOnly) logs.showFailures?.();
+  await switchTab("logs");
 });
 
 document.getElementById("themeToggle")?.addEventListener("click", () => {
@@ -181,6 +186,8 @@ async function openSettings() {
     settingsForm.elements.strategy.value = currentSettings.routing.strategy;
     settingsForm.elements.affinity_enabled.checked =
       currentSettings.routing.affinity_enabled;
+    settingsForm.elements.display_timezone.value =
+      currentSettings.display_timezone;
     document.getElementById("settingsPath").textContent =
       currentSettings.settings_path;
   } catch (error) {
@@ -196,17 +203,22 @@ settingsForm?.addEventListener("submit", async (event) => {
   if (submitBtn.disabled) return;
   submitBtn.disabled = true;
   try {
-    await api("/api/admin/settings", {
+    const savedSettings = await api("/api/admin/settings", {
       method: "PUT",
       body: JSON.stringify({
         routing: {
           strategy: settingsForm.elements.strategy.value,
           affinity_enabled: settingsForm.elements.affinity_enabled.checked,
         },
+        display_timezone: settingsForm.elements.display_timezone.value,
       }),
     });
+    for (const page of Object.values(PAGES)) {
+      page.setDisplayTimezone?.(savedSettings.display_timezone);
+    }
     settingsModal.classList.add("hidden");
     toast(t("settingsSaved"), "success");
+    refreshActive();
   } catch (error) {
     toast(error.message, "error");
   } finally {
@@ -303,6 +315,7 @@ document.addEventListener("localechange", () => {
   refreshIcons(document);
   // re-render current page to apply new labels
   refreshActive();
+  mindagent.renderHistory();
   const titleEl = document.getElementById("pageTitle");
   if (titleEl) titleEl.textContent = TITLES[current]?.() || current;
 });
@@ -312,6 +325,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (!channelModal.classList.contains("hidden")) channelModal.classList.add("hidden");
     if (!settingsModal.classList.contains("hidden")) settingsModal.classList.add("hidden");
+    document.getElementById("mindagentDeleteModal")?.classList.add("hidden");
     closeSidebar();
   }
 });
@@ -330,6 +344,7 @@ function initIcons() {
 
 initIcons();
 applyLocale();
+mindagent.renderHistory();
 loadChannelPresets().catch((error) => toast(error.message, "error"));
 refreshActive();
 initialized = true;

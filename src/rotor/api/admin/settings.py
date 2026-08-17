@@ -14,12 +14,14 @@ router = APIRouter(prefix="/settings", tags=["settings"])
 
 class SettingsResponse(BaseModel):
     routing: RoutingSettings
+    display_timezone: str
     settings_path: str
 
 
 def _response(settings: ApplicationSettings) -> SettingsResponse:
     return SettingsResponse(
         routing=settings.routing,
+        display_timezone=settings.display_timezone,
         settings_path=str(application_settings.path),
     )
 

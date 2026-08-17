@@ -14,6 +14,8 @@ let status = null;
 let abortController = null;
 let initialized = false;
 let pendingAttachments = [];
+let openConversationMenu = null;
+let pendingDeleteConversationId = null;
 
 const TEXT_FILE_EXTENSIONS = new Set([
   "txt", "md", "markdown", "json", "jsonl", "csv", "tsv", "xml", "yaml", "yml",
@@ -74,19 +76,6 @@ function renderShell() {
   container.classList.add("mindagent-panel");
   container.innerHTML = `
     <div class="agent-chat-shell">
-      <aside class="agent-thread-panel">
-        <div class="agent-thread-head">
-          <div>
-            <span class="agent-eyebrow">MindAgent</span>
-            <h2>${t("conversations")}</h2>
-          </div>
-          <button class="icon-btn" type="button" data-agent-action="new" title="${t("newConversation")}" aria-label="${t("newConversation")}">
-            <i data-lucide="square-pen"></i>
-          </button>
-        </div>
-        <div class="agent-thread-list" id="agentThreadList"></div>
-      </aside>
-
       <section class="agent-chat-main">
         <header class="agent-chat-head">
           <div class="agent-identity">
@@ -285,7 +274,19 @@ function renderPendingAttachments() {
 function renderThreads() {
   const list = document.getElementById("agentThreadList");
   if (!list) return;
-  list.innerHTML = conversations.map((conversation) => `
+  const newButton = document.querySelector(".sidebar-conversations-new");
+  if (newButton) {
+    newButton.title = t("newConversation");
+    newButton.setAttribute("aria-label", t("newConversation"));
+  }
+  list.innerHTML = conversations.map((conversation) => {
+    const menu = openConversationMenu?.id === conversation.id
+      ? openConversationMenu
+      : null;
+    const menuStyle = menu
+      ? `style="top: ${menu.top}px; left: ${menu.left}px"`
+      : "";
+    return `
     <div class="agent-thread ${conversation.id === activeId ? "active" : ""}" data-conversation-id="${escapeHtml(conversation.id)}">
       <button type="button" class="agent-thread-open" data-agent-action="open" data-conversation-id="${escapeHtml(conversation.id)}">
         <i data-lucide="message-square"></i>
@@ -294,12 +295,65 @@ function renderThreads() {
           <small>${escapeHtml(conversation.model || t("selectModel"))}</small>
         </span>
       </button>
-      <button type="button" class="agent-thread-delete" data-agent-action="delete" data-conversation-id="${escapeHtml(conversation.id)}" aria-label="${t("deleteConversation")}">
-        <i data-lucide="trash-2"></i>
-      </button>
+      <div class="agent-thread-menu">
+        <button type="button" class="agent-thread-more" data-agent-action="conversation-menu" data-conversation-id="${escapeHtml(conversation.id)}" aria-label="${t("conversations")}" aria-expanded="${Boolean(menu)}">
+          <i data-lucide="ellipsis"></i>
+        </button>
+        <div class="agent-thread-menu-popover ${menu ? "" : "hidden"} ${menu?.opensUp ? "opens-up" : ""}" ${menuStyle} role="menu">
+          <button type="button" data-agent-action="export" data-conversation-id="${escapeHtml(conversation.id)}" role="menuitem">
+            <i data-lucide="download"></i><span>${t("exportConversation")}</span>
+          </button>
+          <button type="button" class="danger" data-agent-action="delete" data-conversation-id="${escapeHtml(conversation.id)}" role="menuitem">
+            <i data-lucide="trash-2"></i><span>${t("deleteConversation")}</span>
+          </button>
+        </div>
+      </div>
     </div>
-  `).join("");
+  `;
+  }).join("");
   refreshIcons(list);
+}
+
+function showDeleteConfirmation(conversation) {
+  const dialog = document.getElementById("mindagentDeleteModal");
+  if (!dialog) return;
+  pendingDeleteConversationId = conversation.id;
+  const name = document.getElementById("mindagentDeleteConversationName");
+  if (name) name.textContent = conversation.title || t("newConversation");
+  dialog.classList.remove("hidden");
+}
+
+function closeDeleteConfirmation() {
+  pendingDeleteConversationId = null;
+  document.getElementById("mindagentDeleteModal")?.classList.add("hidden");
+}
+
+function deleteConversation(conversation) {
+  conversations = conversations.filter((item) => item.id !== conversation.id);
+  if (activeId === conversation.id) activeId = conversations[0]?.id || null;
+  ensureConversation();
+  saveConversations();
+  renderThreads();
+  renderMessages();
+  renderModels();
+}
+
+function exportConversation(conversation) {
+  const payload = {
+    schema_version: 1,
+    exported_at: new Date().toISOString(),
+    conversation,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const link = document.createElement("a");
+  const safeId = conversation.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const url = URL.createObjectURL(blob);
+  link.href = url;
+  link.download = `mindagent-conversation-${safeId}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url));
 }
 
 function inlineMarkdown(value) {
@@ -616,15 +670,27 @@ export async function load() {
   }
 }
 
+export function renderHistory() {
+  renderThreads();
+}
+
 export async function onClick(target) {
   const button = target.closest("[data-agent-action]");
-  if (!button) return false;
+  if (!button) {
+    if (openConversationMenu && !target.closest(".agent-thread-menu")) {
+      openConversationMenu = null;
+      renderThreads();
+    }
+    return false;
+  }
   const action = button.dataset.agentAction;
 
   if (action === "new") {
     if (abortController) stopGenerating();
     pendingAttachments = [];
+    openConversationMenu = null;
     createConversation();
+    document.dispatchEvent(new CustomEvent("mindagentconversationopen"));
     renderThreads();
     renderMessages();
     renderModels();
@@ -633,20 +699,45 @@ export async function onClick(target) {
   } else if (action === "open") {
     if (abortController) return true;
     activeId = button.dataset.conversationId;
+    openConversationMenu = null;
     saveConversations();
+    document.dispatchEvent(new CustomEvent("mindagentconversationopen"));
     renderThreads();
     renderMessages();
     renderModels();
+  } else if (action === "conversation-menu") {
+    if (openConversationMenu?.id === button.dataset.conversationId) {
+      openConversationMenu = null;
+    } else {
+      const bounds = button.getBoundingClientRect();
+      const menuWidth = 176;
+      const opensUp = bounds.bottom + 102 > window.innerHeight && bounds.top > 102;
+      openConversationMenu = {
+        id: button.dataset.conversationId,
+        top: opensUp ? bounds.top - 6 : bounds.bottom + 6,
+        left: Math.max(8, Math.min(bounds.right - menuWidth, window.innerWidth - menuWidth - 8)),
+        opensUp,
+      };
+    }
+    renderThreads();
+  } else if (action === "export") {
+    const conversation = conversations.find((item) => item.id === button.dataset.conversationId);
+    if (conversation) exportConversation(conversation);
+    openConversationMenu = null;
+    renderThreads();
   } else if (action === "delete") {
     const conversation = conversations.find((item) => item.id === button.dataset.conversationId);
-    if (!conversation || !window.confirm(t("confirmDeleteConversation"))) return true;
-    conversations = conversations.filter((item) => item.id !== conversation.id);
-    if (activeId === conversation.id) activeId = conversations[0]?.id || null;
-    ensureConversation();
-    saveConversations();
+    if (conversation) showDeleteConfirmation(conversation);
+    openConversationMenu = null;
     renderThreads();
-    renderMessages();
-    renderModels();
+  } else if (action === "cancel-delete") {
+    closeDeleteConfirmation();
+  } else if (action === "confirm-delete") {
+    const conversation = conversations.find(
+      (item) => item.id === pendingDeleteConversationId
+    );
+    closeDeleteConfirmation();
+    if (conversation) deleteConversation(conversation);
   } else if (action === "suggest") {
     const textarea = document.getElementById("agentPrompt");
     if (textarea) {

@@ -1,4 +1,6 @@
 import asyncio
+import sys
+import types
 
 import pytest
 from pydantic import ValidationError
@@ -27,6 +29,22 @@ def test_decode_gateway_events_ignores_done_marker():
     )
     assert events[0]["choices"][0]["delta"]["content"] == "hello"
     assert len(events) == 1
+
+
+def test_mcp_registry_does_not_require_mcp_tool_set_when_unconfigured(
+    monkeypatch,
+):
+    class FakeToolRegistry:
+        pass
+
+    tools = types.ModuleType("mindagent.tools")
+    tools.ToolRegistry = FakeToolRegistry
+    monkeypatch.setitem(sys.modules, "mindagent.tools", tools)
+    monkeypatch.setattr(endpoint.settings, "ROTOR_MINDAGENT_MCP_COMMAND", None)
+
+    registry = asyncio.run(endpoint._build_rotor_mcp_registry("run-1"))
+
+    assert isinstance(registry, FakeToolRegistry)
 
 
 def test_image_content_converts_for_anthropic_and_responses():
