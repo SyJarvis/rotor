@@ -18,6 +18,14 @@ class Settings(BaseSettings):
     VERSION: str = "1.0.0"
 
     API_KEY_PREFIX: str = "sk-"
+    ROTOR_DEFAULT_ADMIN_USERNAME: str = "admin"
+    ROTOR_DEFAULT_ADMIN_PASSWORD: str = "123456"
+    ROTOR_ADMIN_SESSION_IDLE_SECONDS: int = 1800
+    ROTOR_ADMIN_SESSION_TTL_SECONDS: int = 43200
+    ROTOR_ADMIN_COOKIE_SECURE: bool = False
+    ROTOR_ADMIN_LOGIN_MAX_FAILURES: int = Field(default=5, ge=1)
+    ROTOR_ADMIN_LOGIN_WINDOW_SECONDS: int = Field(default=300, ge=1)
+    ROTOR_ADMIN_LOGIN_LOCK_SECONDS: int = Field(default=900, ge=1)
     # A single Bearer token keeps the first Control API/MCP integration
     # intentionally simple. It remains separate from ordinary Rotor API keys.
     ROTOR_CONTROL_API_TOKEN: str | None = None
@@ -53,6 +61,7 @@ class Settings(BaseSettings):
 
     # Logging
     LOG_LEVEL: str = "INFO"
+    ROTOR_LOG_DIR: str = str(DEFAULT_CACHE_DIR / "logs")
 
     # Conversation storage
     CONVERSATION_STORE_ENABLED: bool = True

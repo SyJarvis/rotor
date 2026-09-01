@@ -23,6 +23,7 @@ from rotor.adapters.protocol.responses import (
     responses_request_to_chat,
 )
 from rotor.core.deps import get_available_channels, get_current_token
+from rotor.core.client_session import resolve_client_session
 from rotor.application_settings import application_settings
 from rotor.core.exceptions import (
     ChannelException,
@@ -32,7 +33,12 @@ from rotor.core.exceptions import (
     upstream_error_payload,
 )
 from rotor.database import async_session_maker, get_db
-from rotor.gateway.routing import routing_engine
+from rotor.gateway.provider_facts import (
+    extract_capacity_snapshot,
+    extract_capacity_snapshot_from_error,
+)
+from rotor.gateway.routing import routing_engine, session_lease_success_reason
+from rotor.services.session_leases import get_preferred_channel_id
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.fallback import (
     retry_after_seconds,
@@ -298,22 +304,49 @@ async def create_response(
     else:
         channels = await get_available_channels(chat_request.model, token, db)
     request_id = http_request.headers.get("X-Request-Id") or f"req_{uuid.uuid4().hex}"
-    conversation_id = (
-        http_request.headers.get("X-Conversation-Id")
-        or (request.metadata or {}).get("conversation_id")
-        or f"conv_{uuid.uuid4().hex[:24]}"
+    client_session = resolve_client_session(
+        http_request.headers,
+        metadata=request.metadata,
+        conversation=request.conversation,
+        prompt_cache_key=getattr(request, "prompt_cache_key", None),
+        legacy_user_id=(
+            previous_route.conversation_id if previous_route is not None else None
+        ),
     )
+    conversation_id = client_session.session_id or f"conv_{uuid.uuid4().hex[:24]}"
     client_ip = http_request.client.host if http_request.client else "unknown"
     request_origin = getattr(http_request.state, "request_origin", "client")
     agent_run_id = getattr(http_request.state, "agent_run_id", None)
     start_time = time.time()
+    routing_settings = application_settings.get().routing
+    lease_session_id = (
+        client_session.session_id
+        if routing_settings.affinity_enabled
+        and routing_settings.session_lease_enabled
+        # The previous route's archive ID is a state lookup fallback, not a
+        # client-provided session identity.
+        and client_session.source != "legacy-user-id"
+        else None
+    )
+    routing_decision = None
 
     if previous_route is not None:
         # Stateful Responses must return to the account that owns the previous
         # response; fallback to another provider would break the state chain.
         routing_candidates = channels
     else:
-        affinity_used = application_settings.get().routing.affinity_enabled
+        preferred_channel_id = await get_preferred_channel_id(
+            db,
+            token_id=token.id,
+            session_id=lease_session_id,
+            logical_model=chat_request.model,
+        )
+        affinity_key = (
+            client_session.affinity_key(token.id)
+            if routing_settings.affinity_enabled
+            else None
+        )
+        affinity_used = affinity_key is not None
         required_capabilities = responses_required_capabilities(request)
         routing_decision = routing_engine.route(
             channels,
@@ -321,16 +354,18 @@ async def create_response(
             token=token,
             request_protocol="openai_responses",
             required_capabilities=required_capabilities,
-            affinity_key=conversation_id if affinity_used else None,
+            affinity_key=affinity_key,
+            preferred_channel_id=preferred_channel_id,
         )
         routing_candidates = routing_decision.candidates
         # Prefer a lossless native Responses upstream, but retain converted
         # Chat/Anthropic candidates for Codex requests containing optional
         # hosted or namespace tools that those protocols cannot represent.
-        routing_candidates.sort(
-            key=lambda candidate: str(candidate.protocol or "").lower()
-            not in {"responses", "openai_responses"}
-        )
+        if not routing_decision.lease_used:
+            routing_candidates.sort(
+                key=lambda candidate: str(candidate.protocol or "").lower()
+                not in {"responses", "openai_responses"}
+            )
         accounting_service.record_routing_decision(
             db,
             request_id=request_id,
@@ -344,6 +379,7 @@ async def create_response(
                 "stream": bool(chat_request.stream),
                 "has_tools": bool(request.tools),
                 "background": bool(request.background),
+                **client_session.routing_features(),
             },
         )
         await db.commit()
@@ -370,6 +406,7 @@ async def create_response(
         )
 
     http_client = AsyncClient(timeout=120.0)
+    streaming_response_returned = False
     last_error = None
     conversation_handle = await conversation_store.start(
         db,
@@ -410,6 +447,7 @@ async def create_response(
                                 model=native_response.get("model") or chat_request.model,
                                 status=native_response.get("status"),
                                 usage_accounted=usage_accounted,
+                                request_started_at=attempt_context.started_at,
                             )
                             await route_db.commit()
 
@@ -436,10 +474,21 @@ async def create_response(
                             persist_stream_response if native_responses else None
                         ),
                         attempt_context=attempt_context,
+                        lease_session_id=lease_session_id,
+                        lease_migration_reason=(
+                            "state_binding"
+                            if previous_route is not None
+                            else session_lease_success_reason(
+                                routing_decision, attempt
+                            )
+                        ),
                     )
                     set_routing_headers(
                         result, channel, chat_request.model, attempt > 0
                     )
+                    # Ownership of http_client transfers to the streaming
+                    # generator, which closes it in its own finally block.
+                    streaming_response_returned = True
                     return result
 
                 response_data = await _handle_non_streaming_request(
@@ -454,6 +503,14 @@ async def create_response(
                     conversation_handle,
                     request_protocol="openai_responses",
                     attempt_context=attempt_context,
+                    lease_session_id=lease_session_id,
+                    lease_migration_reason=(
+                        "state_binding"
+                        if previous_route is not None
+                        else session_lease_success_reason(
+                            routing_decision, attempt
+                        )
+                    ),
                 )
                 set_routing_headers(
                     api_response, channel, chat_request.model, attempt > 0
@@ -470,6 +527,7 @@ async def create_response(
                             model=response_data.get("model") or chat_request.model,
                             status=response_data.get("status"),
                             usage_accounted=response_data.get("usage") is not None,
+                            request_started_at=attempt_context.started_at,
                         )
                         await db.commit()
                     return response_data
@@ -504,6 +562,7 @@ async def create_response(
                     latency_ms=latency_ms,
                     client_ip=client_ip,
                     provider_response=upstream_error_payload(exc),
+                    capacity_snapshot=extract_capacity_snapshot_from_error(exc),
                 )
                 if conversation_handle:
                     await conversation_store.append_error(
@@ -538,6 +597,7 @@ async def create_response(
                     error_message=format_error_message(exc),
                     latency_ms=latency_ms,
                     client_ip=client_ip,
+                    capacity_snapshot=extract_capacity_snapshot_from_error(exc),
                 )
                 if conversation_handle:
                     await conversation_store.append_error(
@@ -550,7 +610,8 @@ async def create_response(
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)
                 raise
     finally:
-        if not chat_request.stream:
+        # Close the client unless a streaming response took ownership of it.
+        if not streaming_response_returned:
             await http_client.aclose()
 
     await conversation_store.finish(
@@ -606,6 +667,7 @@ async def _account_deferred_response_usage(
     payload: dict[str, Any],
     client_ip: str,
     latency_ms: int,
+    capacity_snapshot: dict[str, str] | None = None,
 ) -> None:
     """Account background usage once, even when a response is polled repeatedly."""
     usage = payload.get("usage")
@@ -635,6 +697,8 @@ async def _account_deferred_response_usage(
         usage=accounting_service.extract_usage({"usage": usage}),
         latency_ms=latency_ms,
         client_ip=client_ip,
+        capacity_snapshot=capacity_snapshot,
+        tariff_at=route.created_at,
     )
 
 
@@ -796,6 +860,9 @@ async def retrieve_response(
                                     payload=terminal_response,
                                     client_ip=client_ip,
                                     latency_ms=int((time.time() - started_at) * 1000),
+                                    capacity_snapshot=extract_capacity_snapshot(
+                                        upstream.headers
+                                    ),
                                 )
                                 await stream_db.commit()
                     except Exception:
@@ -818,6 +885,7 @@ async def retrieve_response(
                 payload=payload,
                 client_ip=http_request.client.host if http_request.client else "unknown",
                 latency_ms=int((time.time() - started_at) * 1000),
+                capacity_snapshot=extract_capacity_snapshot(upstream.headers),
             )
             await db.commit()
         return _upstream_response(upstream)
@@ -878,6 +946,7 @@ async def cancel_response(
                     payload=payload,
                     client_ip=http_request.client.host if http_request.client else "unknown",
                     latency_ms=int((time.time() - started_at) * 1000),
+                    capacity_snapshot=extract_capacity_snapshot(upstream.headers),
                 )
                 await db.commit()
             return _upstream_response(upstream)

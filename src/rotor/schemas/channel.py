@@ -1,6 +1,8 @@
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+
+from rotor.core.resource_scopes import normalize_scope_config
 
 
 class ChannelBase(BaseModel):
@@ -24,6 +26,11 @@ class ChannelCreate(ChannelBase):
     """Schema for creating a channel."""
     key: str = Field(..., min_length=1, max_length=500, description="API Key")
 
+    @field_validator("extra")
+    @classmethod
+    def validate_resource_scopes(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        return normalize_scope_config(value)
+
 
 class ChannelUpdate(BaseModel):
     """Schema for updating a channel."""
@@ -41,6 +48,14 @@ class ChannelUpdate(BaseModel):
     rpm_limit: Optional[int] = None
     tpm_limit: Optional[int] = None
     extra: Optional[Dict[str, Any]] = None
+
+    @field_validator("extra")
+    @classmethod
+    def validate_resource_scopes(
+        cls,
+        value: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        return normalize_scope_config(value) if value is not None else None
 
 
 class ChannelResponse(ChannelBase):

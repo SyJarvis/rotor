@@ -381,6 +381,8 @@ def test_queue_full_drops_commit_without_blocking(modules, monkeypatch):
             # finish enqueues a commit; queue is full → dropped, must not block.
             await asyncio.wait_for(store.finish(handle, "success", 1), timeout=1.0)
             assert store._queue.qsize() == 1
+            assert store.dropped_queue_full == 1
+            assert store.dropped_retry_exhausted == 0
         finally:
             await store.shutdown(timeout=2)
 
@@ -474,7 +476,32 @@ def test_persistently_failing_commit_is_dropped(modules, monkeypatch, caplog):
         assert any(
             "Dropping event" in r.message for r in caplog.records
         ), [r.message for r in caplog.records]
+        assert store.dropped_retry_exhausted >= 1
+        assert store.drop_stats()["dropped_retry_exhausted"] >= 1
 
         await store.shutdown(timeout=2)
+
+    asyncio.run(scenario())
+
+
+def test_status_reports_worker_and_drop_counters(modules):
+    store_mod = modules["store_mod"]
+
+    async def scenario():
+        store = store_mod.ConversationStore()
+        status = store.status()
+        assert status["worker_running"] is False
+        assert status["queue_size"] == 0
+        assert status["dropped_queue_full"] == 0
+        assert status["dropped_retry_exhausted"] == 0
+
+        store.attach()
+        try:
+            status = store.status()
+            assert status["worker_running"] is True
+        finally:
+            await store.shutdown(timeout=2)
+
+        assert store.status()["worker_running"] is False
 
     asyncio.run(scenario())

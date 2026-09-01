@@ -67,7 +67,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
 
-rotor serve --host 0.0.0.0 --port 8000
+rotor serve --host 127.0.0.1 --port 8000
 ```
 
 Check the service:
@@ -82,12 +82,20 @@ Open the browser admin interface:
 http://127.0.0.1:8000/
 ```
 
+On first startup Rotor creates the administrator `admin` with password
+`123456`. The first login must change that password before any management API
+can be used. Complete this step locally before binding Rotor to a non-local
+network interface.
+
 Runtime data is stored under the following directory by default:
 
 ```text
 ~/.cache/rotor/
 ├── rotor.db
-└── conversations/
+├── conversations/
+└── logs/
+    └── YYYY-MM/
+        └── YYYY-MM-DD.log
 ```
 
 ## Docker
@@ -99,14 +107,14 @@ docker build -t rotor .
 mkdir -p "$HOME/.cache/rotor"
 
 docker run --rm \
-  -p 8000:8000 \
+  -p 127.0.0.1:8000:8000 \
   -v "$HOME/.cache/rotor:/data" \
   rotor
 ```
 
-The image stores SQLite at `/data/rotor.db` and the conversation store under
-`/data/conversations/` by default. The single mount above persists both under
-`~/.cache/rotor/` on the host.
+The image stores SQLite at `/data/rotor.db`, the conversation store under
+`/data/conversations/`, and runtime logs under `/data/logs/` by default. The
+single mount above persists all of them under `~/.cache/rotor/` on the host.
 
 Run Rotor and PostgreSQL with Docker Compose:
 
@@ -117,33 +125,17 @@ docker compose logs -f rotor
 
 The repository Compose file uses development database credentials and exposes
 the PostgreSQL port; change both before production deployment. Compose uses a
-PostgreSQL volume for the primary database and mounts the conversation store
-at `./data/conversations/` on the host. The current Docker configuration runs
+PostgreSQL volume for the primary database and mounts conversations and runtime
+logs under `./data/` on the host. The current Docker configuration runs
 Rotor only. `rotor-mcp` is intended to use a separate image.
 
 ## Make your first request
 
 ### 1. Add a channel
 
-Open the admin interface and add the provider URL, API key, model, and
-protocol under Channels. You can also call `POST /api/admin/channels`:
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/admin/channels \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "openai-compatible",
-    "type": "openai",
-    "key": "provider-api-key",
-    "base_url": "https://provider.example/v1",
-    "models": ["your-model"],
-    "model_mapping": {},
-    "priority": 10,
-    "weight": 1,
-    "enabled": true,
-    "protocol": "openai"
-  }'
-```
+Sign in to the admin interface and add the provider URL, API key, model, and
+protocol under Channels. HTTP automation must first establish an authenticated
+admin session as described in [Admin API](gitbook/reference/admin-api.md).
 
 `protocol` describes the API exposed by the upstream:
 
@@ -158,10 +150,7 @@ and conversion behavior.
 
 ### 2. Create a Rotor user token
 
-```bash
-curl -X POST \
-  "http://127.0.0.1:8000/api/admin/tokens/generate?name=demo&quota=1000000"
-```
+Generate a Rotor user token from **API Keys** in the admin interface.
 
 Save the returned `sk-` token:
 
@@ -198,7 +187,7 @@ Claude Code, and OpenCode configuration.
 | Anthropic | `POST /anthropic/v1/messages`, `POST /anthropic/v1/messages/count_tokens` |
 | Models | `GET /v1/models` |
 | Admin API | `/api/admin/channels`, `/api/admin/tokens`, `/api/admin/logs`, `/api/admin/settings` |
-| Control API | `/api/control/v1/channels`, request traces, recent failures, and model usage |
+| Control API | `/api/control/v1/channels`, request traces, recent failures, model usage, and Session Lease evaluation |
 
 The Responses API supports creation, retrieval, cancellation, deletion, input
 item listing, input-token counting, and compaction. For native Responses
@@ -240,12 +229,21 @@ usage:read
 ```
 
 `mcp/` is the independent `rotor-mcp` package. It currently exposes channel,
-request trace, recent failure, and model usage queries over stdio. See the
-[Rotor MCP README](mcp/README.md) for installation, startup, and client
-configuration.
+request trace, recent failure, model usage, and Session Lease fact evaluation
+over stdio. The evaluation only determines whether the facts are complete
+enough for further analysis; it neither recommends nor automatically enables
+cost-aware routing. See the [Rotor MCP README](mcp/README.md) for installation,
+startup, and client configuration.
+
+Besides a fixed Control token from the environment, the admin UI can create a
+database-backed `rck_` credential under **API Keys → MCP Control Keys**. The
+full value is shown only once, can be disabled or deleted independently, and
+does not accept ordinary `sk-` user tokens.
 
 The MindAgent chat in the admin UI can run independently. It loads Rotor MCP
 diagnostic tools only when an MCP command and Control token are configured.
+Its local conversation history can be created, exported as JSON, or deleted
+from the sidebar.
 
 ## Important configuration
 
@@ -253,7 +251,16 @@ diagnostic tools only when an MCP command and Control token are configured.
 | --- | --- | --- |
 | `DATABASE_URL` | `sqlite+aiosqlite:///~/.cache/rotor/rotor.db` | Primary database |
 | `CONVERSATION_STORE_DIR` | `~/.cache/rotor/conversations` | Conversation storage |
+| `ROTOR_LOG_DIR` | `~/.cache/rotor/logs` | Runtime logs, grouped into monthly directories and daily files |
 | `LOG_LEVEL` | `INFO` | Logging; `DEBUG` also enables API documentation |
+| `ROTOR_DEFAULT_ADMIN_USERNAME` | `admin` | Administrator username used only when initializing an empty database |
+| `ROTOR_DEFAULT_ADMIN_PASSWORD` | `123456` | Initial password; the first login must replace it |
+| `ROTOR_ADMIN_SESSION_IDLE_SECONDS` | `1800` | Admin session idle timeout in seconds |
+| `ROTOR_ADMIN_SESSION_TTL_SECONDS` | `43200` | Admin session absolute lifetime in seconds |
+| `ROTOR_ADMIN_COOKIE_SECURE` | `false` | Must be `true` for HTTPS deployments |
+| `ROTOR_ADMIN_LOGIN_MAX_FAILURES` | `5` | Failed-login threshold |
+| `ROTOR_ADMIN_LOGIN_WINDOW_SECONDS` | `300` | Failed-login counting window in seconds |
+| `ROTOR_ADMIN_LOGIN_LOCK_SECONDS` | `900` | Lockout duration in seconds |
 | `ROTOR_CONTROL_API_TOKEN` | unset | Control API and MCP authentication |
 | `ROTOR_CONTROL_API_SCOPES` | three read-only scopes | Control API permissions |
 | `ROTOR_MINDAGENT_MCP_COMMAND` | unset | Command used by MindAgent to start an independent MCP server |
@@ -263,8 +270,8 @@ reference.
 
 ## Security boundaries
 
-- `/api/admin/*` currently has no independent administrator authentication.
-  Keep it on a trusted network or behind an authenticated reverse proxy.
+- `/api/admin/*` uses administrator sessions and CSRF protection. Replace the
+  default password before exposing Rotor outside the local machine.
 - Treat provider API keys, Rotor user tokens, the Control token, databases, and
   conversation files as sensitive data.
 - The Control API and ordinary model requests use different tokens.

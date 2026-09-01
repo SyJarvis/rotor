@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rotor.models.conversation import ConversationRecord
 from rotor.models.request_attempt import RequestAttempt
 from rotor.models.routing_decision import RoutingDecisionRecord
+from rotor.models.session_lease import SessionLeaseEvent
 from rotor.models.usage import UsageLedger
 from rotor.schemas.request_trace import (
     AttemptErrorTrace,
@@ -14,6 +15,7 @@ from rotor.schemas.request_trace import (
     RequestTrace,
     RequestTraceMeta,
     RoutingDecisionTrace,
+    SessionLeaseEventTrace,
     UsageTrace,
 )
 
@@ -67,9 +69,27 @@ async def get_request_trace(
             )
         ).all()
     )
+    session_lease_events = list(
+        (
+            await db.scalars(
+                select(SessionLeaseEvent)
+                .where(SessionLeaseEvent.request_id == request_id)
+                .order_by(
+                    SessionLeaseEvent.created_at,
+                    SessionLeaseEvent.id,
+                )
+            )
+        ).all()
+    )
 
     if not any(
-        (routing_records, attempts, usage_records, conversation_records)
+        (
+            routing_records,
+            attempts,
+            usage_records,
+            conversation_records,
+            session_lease_events,
+        )
     ):
         return None
 
@@ -141,6 +161,7 @@ async def get_request_trace(
             *(record.created_at for record in routing_records),
             *(record.created_at for record in usage_records),
             *(record.created_at for record in conversation_records),
+            *(event.created_at for event in session_lease_events),
         ]
     )
     finished_at = _maximum_datetime(
@@ -152,6 +173,7 @@ async def get_request_trace(
             ),
             *(record.created_at for record in usage_records),
             *(record.updated_at for record in conversation_records),
+            *(event.created_at for event in session_lease_events),
         ]
     )
 
@@ -175,6 +197,16 @@ async def get_request_trace(
         ),
         routing_decision=routing_trace,
         attempts=attempt_traces,
+        session_lease_events=[
+            SessionLeaseEventTrace(
+                event_type=event.event_type,
+                previous_channel_id=event.previous_channel_id,
+                channel_id=event.channel_id,
+                reason=event.reason,
+                created_at=event.created_at,
+            )
+            for event in session_lease_events
+        ],
         final_outcome=_final_outcome(
             attempts,
             usage_records,
@@ -281,7 +313,11 @@ def _usage_trace(
 ) -> UsageTrace | None:
     if not records:
         return None
-    currencies = {record.currency for record in records if record.currency}
+    currencies = {
+        record.currency
+        for record in records
+        if record.cost_status == "calculated" and record.currency
+    }
     if len(currencies) > 1:
         warnings.append("multiple_usage_currencies")
     return UsageTrace(
@@ -291,7 +327,19 @@ def _usage_trace(
             record.completion_tokens or 0 for record in records
         ),
         total_tokens=sum(record.total_tokens or 0 for record in records),
+        uncached_input_tokens=sum(
+            record.uncached_input_tokens or 0 for record in records
+        ),
         cached_tokens=sum(record.cached_tokens or 0 for record in records),
+        cache_write_tokens=sum(
+            record.cache_write_tokens or 0 for record in records
+        ),
+        cache_write_5m_tokens=sum(
+            record.cache_write_5m_tokens or 0 for record in records
+        ),
+        cache_write_1h_tokens=sum(
+            record.cache_write_1h_tokens or 0 for record in records
+        ),
         reasoning_tokens=sum(
             record.reasoning_tokens or 0 for record in records
         ),
@@ -301,11 +349,52 @@ def _usage_trace(
         output_audio_tokens=sum(
             record.output_audio_tokens or 0 for record in records
         ),
+        input_cost=sum(record.input_cost or 0.0 for record in records),
+        output_cost=sum(record.output_cost or 0.0 for record in records),
         total_cost=sum(record.total_cost or 0.0 for record in records),
         currency=next(iter(currencies)) if len(currencies) == 1 else None,
         usage_sources=sorted(
             {record.usage_source for record in records if record.usage_source}
         ),
+        usage_schema_versions=sorted({
+            record.usage_schema_version
+            for record in records
+            if record.usage_schema_version
+        }),
+        capacity_snapshots=[
+            record.capacity_snapshot
+            for record in records
+            if record.capacity_snapshot
+        ],
+        cache_scopes=sorted({
+            record.cache_scope for record in records if record.cache_scope
+        }),
+        capacity_scopes=sorted({
+            record.capacity_scope
+            for record in records
+            if record.capacity_scope
+        }),
+        billing_scopes=sorted({
+            record.billing_scope for record in records if record.billing_scope
+        }),
+        cost_statuses=sorted({
+            record.cost_status for record in records if record.cost_status
+        }),
+        tariff_versions=sorted({
+            record.tariff_version
+            for record in records
+            if record.tariff_version
+        }),
+        tariff_periods=sorted({
+            record.tariff_period
+            for record in records
+            if record.tariff_period
+        }),
+        tariff_snapshots=[
+            record.tariff_snapshot
+            for record in records
+            if record.tariff_snapshot
+        ],
     )
 
 

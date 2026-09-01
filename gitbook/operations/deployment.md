@@ -31,8 +31,8 @@ docker run --rm -p 8000:8000 \
   rotor
 ```
 
-镜像默认使用 `/data/rotor.db` 和 `/data/conversations/`。把宿主机目录挂载到
-`/data` 后，SQLite 数据库和 Conversation store 会一起持久化。
+镜像默认使用 `/data/rotor.db`、`/data/conversations/` 和 `/data/logs/`。把宿主机
+目录挂载到 `/data` 后，SQLite 数据库、Conversation store 和运行日志会一起持久化。
 
 ## Docker Compose
 
@@ -45,13 +45,13 @@ curl http://127.0.0.1:8000/health
 
 示例 Compose 中的数据库用户名和密码是开发默认值，公开部署前必须替换，并避免
 把 PostgreSQL 的 `5432` 端口暴露到不受信任网络。Compose 使用 PostgreSQL volume
-保存主数据库，并将 Conversation store 保存到宿主机的 `./data/conversations/`。
+保存主数据库，并将 Conversation store 和运行日志保存到宿主机的 `./data/`。
 
 ## 数据库初始化
 
-应用启动会调用 SQLAlchemy `create_all` 创建缺失表。仓库也包含 Alembic 迁移，
-用于显式管理已有数据库结构。已有生产数据库应使用经过审核的迁移流程，而不是
-依赖自动建表，详见[数据库与迁移](../development/database-migrations.md)。
+当前 SQLite 启动路径会自动执行打包的 Alembic revision 并检查模型结构。能够
+识别的无版本旧库会先在原文件旁创建备份再接管；已有版本的生产数据库仍应在
+升级前执行部署备份，详见[数据库与迁移](../development/database-migrations.md)。
 
 ## 多进程注意事项
 

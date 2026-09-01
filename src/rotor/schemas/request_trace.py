@@ -50,13 +50,36 @@ class UsageTrace(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    uncached_input_tokens: int
     cached_tokens: int
+    cache_write_tokens: int
+    cache_write_5m_tokens: int
+    cache_write_1h_tokens: int
     reasoning_tokens: int
     input_audio_tokens: int
     output_audio_tokens: int
+    input_cost: float
+    output_cost: float
     total_cost: float
     currency: str | None = None
     usage_sources: list[str] = Field(default_factory=list)
+    usage_schema_versions: list[str] = Field(default_factory=list)
+    capacity_snapshots: list[dict[str, str]] = Field(default_factory=list)
+    cache_scopes: list[str] = Field(default_factory=list)
+    capacity_scopes: list[str] = Field(default_factory=list)
+    billing_scopes: list[str] = Field(default_factory=list)
+    cost_statuses: list[str] = Field(default_factory=list)
+    tariff_versions: list[str] = Field(default_factory=list)
+    tariff_periods: list[str] = Field(default_factory=list)
+    tariff_snapshots: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SessionLeaseEventTrace(BaseModel):
+    event_type: str
+    previous_channel_id: int | None = None
+    channel_id: int | None = None
+    reason: str
+    created_at: datetime
 
 
 class RequestTraceMeta(BaseModel):
@@ -72,6 +95,9 @@ class RequestTrace(BaseModel):
     request_protocol: str | None = None
     routing_decision: RoutingDecisionTrace | None = None
     attempts: list[RequestAttemptTrace] = Field(default_factory=list)
+    session_lease_events: list[SessionLeaseEventTrace] = Field(
+        default_factory=list
+    )
     final_outcome: str | None = None
     usage: UsageTrace | None = None
     started_at: datetime | None = None

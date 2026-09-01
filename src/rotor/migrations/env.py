@@ -1,12 +1,10 @@
+"""Alembic environment shared by the CLI and Rotor startup."""
+
 from logging.config import fileConfig
+
 from sqlalchemy import engine_from_config, pool
 from sqlalchemy.engine import make_url
 from alembic import context
-import sys
-import os
-
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from rotor.config import settings
 from rotor.database import Base
@@ -19,6 +17,13 @@ from rotor.models.response_route import ResponseRoute
 from rotor.models.routing_decision import RoutingDecisionRecord
 from rotor.models.request_attempt import RequestAttempt
 from rotor.models.mcp_control_key import MCPControlKey
+from rotor.models.session_lease import SessionLease, SessionLeaseEvent
+from rotor.models.admin_auth import (
+    AdminAuthEvent,
+    AdminLoginThrottle,
+    AdminSession,
+    AdminUser,
+)
 
 # this is the Alembic Config object
 config = context.config
@@ -38,9 +43,12 @@ def _sync_database_url(url: str) -> str:
     return parsed.render_as_string(hide_password=False)
 
 
-# Set the SQLAlchemy URL from settings. The app uses async drivers at runtime,
-# while Alembic runs migrations through SQLAlchemy's synchronous engine.
-config.set_main_option("sqlalchemy.url", _sync_database_url(settings.DATABASE_URL))
+# Programmatic callers provide the target URL directly. The repository CLI
+# keeps a placeholder URL in alembic.ini and falls back to application settings.
+database_url = config.get_main_option("sqlalchemy.url")
+if not database_url or database_url.startswith("driver://"):
+    database_url = settings.DATABASE_URL
+config.set_main_option("sqlalchemy.url", _sync_database_url(database_url))
 
 # add your model's MetaData object here
 target_metadata = Base.metadata
@@ -62,6 +70,16 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
+    supplied_connection = config.attributes.get("connection")
+    if supplied_connection is not None:
+        context.configure(
+            connection=supplied_connection,
+            target_metadata=target_metadata,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",

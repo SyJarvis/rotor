@@ -19,10 +19,11 @@ COPY ./alembic.ini ./alembic.ini
 
 ENV PYTHONPATH=/app/src \
     DATABASE_URL=sqlite+aiosqlite:////data/rotor.db \
-    CONVERSATION_STORE_DIR=/data/conversations
+    CONVERSATION_STORE_DIR=/data/conversations \
+    ROTOR_LOG_DIR=/data/logs
 
-# Persist the SQLite database and conversation store through one mount.
-RUN mkdir -p /data/conversations
+# Persist the SQLite database, logs, and conversation store through one mount.
+RUN mkdir -p /data/conversations /data/logs
 VOLUME ["/data"]
 
 # Expose port

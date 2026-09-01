@@ -141,6 +141,8 @@ def test_failure_accounting_stores_sanitized_provider_response() -> None:
     ))
 
     assert db.added[0].response_body == provider_response
+    assert db.added[0].capacity_scope == "channel:2"
+    assert db.added[1].billing_scope == "channel:2"
 
 
 def test_database_cleanup_finishes_before_cancellation_propagates() -> None:

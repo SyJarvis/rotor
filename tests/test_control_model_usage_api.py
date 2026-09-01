@@ -24,6 +24,8 @@ def _usage(
     created_at: datetime,
     prompt_tokens: int,
     completion_tokens: int,
+    cost: float | None = None,
+    currency: str = "USD",
 ) -> UsageLedger:
     return UsageLedger(
         request_id=request_id,
@@ -32,6 +34,10 @@ def _usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
+        uncached_input_tokens=prompt_tokens,
+        total_cost=cost or 0.0,
+        currency=currency,
+        cost_status="calculated" if cost is not None else "unknown",
         created_at=created_at,
     )
 
@@ -60,6 +66,8 @@ def test_model_usage_aggregates_distinct_requests_and_sorts_by_tokens() -> None:
                     created_at=start + timedelta(hours=1),
                     prompt_tokens=10,
                     completion_tokens=5,
+                    cost=0.1,
+                    currency="USD",
                 ),
                 _usage(
                     request_id="req-a",
@@ -67,6 +75,8 @@ def test_model_usage_aggregates_distinct_requests_and_sorts_by_tokens() -> None:
                     created_at=start + timedelta(hours=1, minutes=1),
                     prompt_tokens=2,
                     completion_tokens=1,
+                    cost=0.2,
+                    currency="CNY",
                 ),
                 _usage(
                     request_id="req-b",
@@ -74,6 +84,8 @@ def test_model_usage_aggregates_distinct_requests_and_sorts_by_tokens() -> None:
                     created_at=start + timedelta(hours=2),
                     prompt_tokens=30,
                     completion_tokens=10,
+                    cost=0.5,
+                    currency="CNY",
                 ),
                 _usage(
                     request_id="req-end",
@@ -114,6 +126,14 @@ def test_model_usage_aggregates_distinct_requests_and_sorts_by_tokens() -> None:
         assert payload["data"][1]["total_tokens"] == 18
         assert payload["data"][1]["request_count"] == 1
         assert payload["data"][1]["ledger_count"] == 2
+        assert payload["data"][1]["uncached_input_tokens"] == 12
+        assert payload["data"][1]["cache_write_tokens"] == 0
+        assert payload["data"][1]["usage_v2_ledger_count"] == 2
+        assert payload["data"][1]["costed_ledger_count"] == 2
+        assert payload["data"][1]["cost_totals_by_currency"] == {
+            "CNY": 0.2,
+            "USD": 0.1,
+        }
         assert payload["window"]["end_exclusive"] is True
 
     asyncio.run(exercise())

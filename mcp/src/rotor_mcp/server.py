@@ -15,6 +15,7 @@ from rotor_mcp.schemas import (
     ModelUsageResponse,
     RecentFailuresResponse,
     RequestTraceResponse,
+    SessionLeaseEvaluationResponse,
 )
 
 
@@ -116,6 +117,34 @@ async def rotor_list_model_usage(
                 limit=limit,
             )
         return ModelUsageResponse.from_control_payload(payload)
+    except RotorMCPError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+@server.tool(
+    name="rotor_evaluate_session_leases",
+    description=(
+        "Evaluate persisted Session Lease, cache, cost, and fallback facts "
+        "for one time window and optional logical model. This reports data "
+        "readiness and channel/tariff cohorts; it does not recommend or "
+        "enable a routing policy. Defaults to 24 hours and allows 30 days."
+    ),
+    annotations=READ_ONLY_ANNOTATIONS,
+)
+async def rotor_evaluate_session_leases(
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    model: Annotated[str | None, Field(max_length=200)] = None,
+) -> SessionLeaseEvaluationResponse:
+    """Read Stage-4 evaluation facts through the Rotor Control API."""
+    try:
+        async with create_control_client() as client:
+            payload = await client.evaluate_session_leases(
+                start_time=start_time,
+                end_time=end_time,
+                model=model,
+            )
+        return SessionLeaseEvaluationResponse.from_control_payload(payload)
     except RotorMCPError as exc:
         raise RuntimeError(str(exc)) from exc
 

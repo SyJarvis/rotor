@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from rotor.core.resource_scopes import resolve_resource_scopes
 from rotor.models.channel import Channel
 from rotor.schemas.control import (
     ChannelSecretState,
@@ -111,6 +112,7 @@ def _control_channel(channel: Channel) -> ControlChannel:
         if isinstance(channel.model_mapping, dict)
         else {}
     )
+    resource_scopes = resolve_resource_scopes(channel)
     return ControlChannel(
         id=channel.id,
         name=channel.name,
@@ -131,6 +133,9 @@ def _control_channel(channel: Channel) -> ControlChannel:
         weight=channel.weight,
         enabled=channel.enabled,
         test_only=channel.test_only,
+        cache_scope=resource_scopes.cache_scope,
+        capacity_scope=resource_scopes.capacity_scope,
+        billing_scope=resource_scopes.billing_scope,
         secret_state=ChannelSecretState(has_key=bool(channel.key)),
         updated_at=channel.updated_at,
     )

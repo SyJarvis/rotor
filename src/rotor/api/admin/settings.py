@@ -18,6 +18,15 @@ class SettingsResponse(BaseModel):
     settings_path: str
 
 
+class ConversationStoreStatus(BaseModel):
+    enabled: bool
+    worker_running: bool
+    queue_size: int
+    queue_maxsize: int
+    dropped_queue_full: int
+    dropped_retry_exhausted: int
+
+
 def _response(settings: ApplicationSettings) -> SettingsResponse:
     return SettingsResponse(
         routing=settings.routing,
@@ -39,3 +48,11 @@ async def update_application_settings(
     routing_engine.strategy = saved.routing.strategy
     routing_engine.configure_adaptive(saved.routing)
     return _response(saved)
+
+
+@router.get("/conversation-store", response_model=ConversationStoreStatus)
+async def get_conversation_store_status() -> ConversationStoreStatus:
+    """Runtime health of the conversation archive worker and its drop counters."""
+    from rotor.api.v1.chat import conversation_store
+
+    return ConversationStoreStatus(**conversation_store.status())

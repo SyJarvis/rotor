@@ -45,3 +45,18 @@ def test_routing_decision_record_preserves_training_snapshot() -> None:
         "7": {"score": 0.8123, "observations": 12}
     }
     assert record.policy_version == "adaptive-v1"
+    assert record.feature_snapshot == {
+        "message_count": 4,
+        "has_tools": True,
+        "session_lease": {
+            "preferred_channel_id": None,
+            "used": False,
+        },
+        "candidate_resource_scopes": {
+            "7": {
+                "cache_scope": "channel:7",
+                "capacity_scope": "channel:7",
+                "billing_scope": "channel:7",
+            }
+        },
+    }

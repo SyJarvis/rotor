@@ -16,6 +16,8 @@ class RoutingDecision:
     candidates: list[Channel]
     strategy: str
     scores: dict[int, dict] | None = None
+    lease_channel_id: int | None = None
+    lease_used: bool = False
 
 
 class RoutingEngine:
@@ -34,6 +36,7 @@ class RoutingEngine:
         request_protocol: str = "openai_chat",
         required_capabilities: Optional[set[str]] = None,
         affinity_key: str | None = None,
+        preferred_channel_id: int | None = None,
     ) -> RoutingDecision:
         candidates = list(channels)
         required_capabilities = required_capabilities or set()
@@ -83,10 +86,29 @@ class RoutingEngine:
         else:
             ordered = self._priority_weighted_order(candidates)
 
+        lease_used = False
+        if preferred_channel_id is not None:
+            leased = next(
+                (
+                    channel
+                    for channel in ordered
+                    if channel.id == preferred_channel_id
+                ),
+                None,
+            )
+            if leased is not None:
+                ordered = [
+                    leased,
+                    *(channel for channel in ordered if channel.id != leased.id),
+                ]
+                lease_used = True
+
         return RoutingDecision(
             candidates=ordered,
             strategy=self.strategy,
             scores=score_snapshot,
+            lease_channel_id=preferred_channel_id,
+            lease_used=lease_used,
         )
 
     def configure_adaptive(self, settings) -> None:
@@ -269,6 +291,21 @@ class RoutingEngine:
             remaining = [channel for channel in remaining if channel.id != selected.id]
 
         return ordered
+
+
+def session_lease_success_reason(
+    decision: RoutingDecision | None,
+    attempt_index: int,
+) -> str:
+    if attempt_index > 0:
+        return "fallback_success"
+    if (
+        decision is not None
+        and getattr(decision, "lease_channel_id", None) is not None
+        and not getattr(decision, "lease_used", False)
+    ):
+        return "leased_channel_unavailable"
+    return "request_success"
 
 
 _routing_settings = application_settings.get().routing

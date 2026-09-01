@@ -9,6 +9,7 @@ from sqlalchemy import case, func, select
 
 from rotor.database import get_db
 from rotor.adapters.factory import AdapterFactory
+from rotor.core.exceptions import format_error_message
 from rotor.models.channel import Channel
 from rotor.models.log import RequestLog
 from rotor.schemas.channel import ChannelCreate, ChannelUpdate, ChannelResponse, ChannelListItem
@@ -30,19 +31,19 @@ from rotor.channels.presets import (
 router = APIRouter(prefix="/channels", tags=["channels"])
 
 
-class ProbeModelsRequest(BaseModel):
-    base_url: str
-    key: str
-    type: str = "openai"
-    protocol: str = "openai"
-    models_path: str | None = None
-    auth_type: str | None = None
-
-
 class ProbeModelsResponse(BaseModel):
     models: List[str]
     latency_ms: int
     raw_count: int = 0
+
+
+class ProbeModelsRequest(BaseModel):
+    """Channel config as typed into the create/edit form, before saving."""
+    base_url: str = Field(..., min_length=1)
+    key: str = Field(..., min_length=1)
+    type: str = Field(..., min_length=1)
+    protocol: str = Field(default="openai")
+    extra: dict = Field(default_factory=dict)
 
 
 class ChannelTestResponse(BaseModel):
@@ -55,6 +56,27 @@ class ChannelTestResponse(BaseModel):
     capability_ok: bool | None = None
     probe_model: str | None = None
     error: str | None = None
+
+
+def _safe_upstream_error_text(
+    exc: Exception,
+    channel: Channel | None,
+    limit: int,
+    *,
+    key: str | None = None,
+) -> str:
+    """Sanitized upstream error text: never echo credentials back to the client.
+
+    format_error_message already redacts sensitive keys via
+    upstream_error_payload; the key replacement is a backstop for providers
+    that echo credentials inside free-form error text. The key comes from
+    `channel.key`, or from `key` for probes against unsaved channel configs.
+    """
+    text = format_error_message(exc)
+    redact_key = channel.key if channel else key
+    if redact_key:
+        text = text.replace(redact_key, "[redacted]")
+    return text[:limit]
 
 
 @router.get("", response_model=List[ChannelListItem])
@@ -138,29 +160,91 @@ async def create_channel(
 
 
 @router.post("/probe-models", response_model=ProbeModelsResponse)
-async def probe_models(
-    probe: ProbeModelsRequest,
-):
-    """Probe an upstream provider model list using base_url and API key."""
+async def probe_models_unsaved(payload: ProbeModelsRequest):
+    """Probe model list from form input before the channel is saved."""
     start = time.perf_counter()
     try:
         models = await _fetch_model_list(
-            base_url=probe.base_url,
-            key=probe.key,
-            provider_type=probe.type,
-            protocol=probe.protocol,
-            models_path=probe.models_path,
-            auth_type=probe.auth_type,
+            base_url=payload.base_url,
+            key=payload.key,
+            provider_type=payload.type,
+            protocol=payload.protocol,
+            models_path=channel_option(
+                provider=payload.type,
+                protocol=payload.protocol,
+                extra=payload.extra,
+                name="models_path",
+            ),
+            auth_type=channel_option(
+                provider=payload.type,
+                protocol=payload.protocol,
+                extra=payload.extra,
+                name="auth_type",
+            ),
+            extra_headers=(payload.extra or {}).get("headers"),
         )
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Provider returned HTTP {exc.response.status_code}: {exc.response.text[:300]}",
+            detail=f"Provider returned HTTP {exc.response.status_code}: "
+                   f"{_safe_upstream_error_text(exc, None, 300, key=payload.key)}",
         ) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Model probe failed: {exc}",
+            detail=f"Model probe failed: {_safe_upstream_error_text(exc, None, 300, key=payload.key)}",
+        ) from exc
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    return ProbeModelsResponse(models=models, latency_ms=latency_ms, raw_count=len(models))
+
+
+@router.post("/{channel_id}/probe-models", response_model=ProbeModelsResponse)
+async def probe_models(
+    channel_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Probe a saved channel's model list without exposing its credentials."""
+    result = await db.execute(select(Channel).where(Channel.id == channel_id))
+    channel = result.scalar_one_or_none()
+    if not channel:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Channel {channel_id} not found",
+        )
+
+    start = time.perf_counter()
+    try:
+        models = await _fetch_model_list(
+            base_url=channel.base_url,
+            key=channel.key,
+            provider_type=channel.type,
+            protocol=channel.protocol,
+            models_path=channel_option(
+                provider=channel.type,
+                protocol=channel.protocol,
+                extra=channel.extra,
+                name="models_path",
+            ),
+            auth_type=channel_option(
+                provider=channel.type,
+                protocol=channel.protocol,
+                extra=channel.extra,
+                name="auth_type",
+            ),
+            extra_headers=(channel.extra or {}).get("headers"),
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Provider returned HTTP {exc.response.status_code}: "
+                f"{_safe_upstream_error_text(exc, channel, 300)}"
+            ),
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Model probe failed: {_safe_upstream_error_text(exc, channel, 300)}",
         ) from exc
     latency_ms = int((time.perf_counter() - start) * 1000)
     return ProbeModelsResponse(models=models, latency_ms=latency_ms, raw_count=len(models))
@@ -236,7 +320,7 @@ async def test_channel(
             protocol=channel.protocol,
             capability=capability,
             capability_ok=False if capability else None,
-            error=exc.response.text[:500],
+            error=_safe_upstream_error_text(exc, channel, 500),
         )
     except Exception as exc:
         latency_ms = int((time.perf_counter() - start) * 1000)
@@ -246,7 +330,7 @@ async def test_channel(
             protocol=channel.protocol,
             capability=capability,
             capability_ok=False if capability else None,
-            error=str(exc),
+            error=_safe_upstream_error_text(exc, channel, 500),
         )
 
 

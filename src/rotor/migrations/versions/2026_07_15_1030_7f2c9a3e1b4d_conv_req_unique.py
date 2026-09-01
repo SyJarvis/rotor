@@ -5,6 +5,8 @@ Revises: 1b0ea4219dd0
 Create Date: 2026-07-15 10:30:00.000000
 
 """
+
+from __future__ import annotations
 from typing import Sequence, Union
 
 from alembic import op

@@ -6,7 +6,11 @@ from mcp import Client
 
 import rotor_mcp.server as server_module
 from rotor_mcp.errors import InvalidControlAPIResponse
-from rotor_mcp.schemas import ChannelResponse, RequestTraceResponse
+from rotor_mcp.schemas import (
+    ChannelResponse,
+    RequestTraceResponse,
+    SessionLeaseEvaluationResponse,
+)
 
 
 class FakeControlClient:
@@ -99,6 +103,12 @@ class FakeControlClient:
             "meta": {},
         }
 
+    async def evaluate_session_leases(
+        self,
+        **_: Any,
+    ) -> dict[str, Any]:
+        return _session_evaluation_payload()
+
     async def list_channels(
         self,
         **kwargs: Any,
@@ -145,6 +155,69 @@ def _channel_payload() -> dict[str, Any]:
     }
 
 
+def _session_evaluation_payload() -> dict[str, Any]:
+    return {
+        "schema_version": "1",
+        "request_id": "control-lease-1",
+        "data": {
+            "model": "model-a",
+            "routing_decision_count": 10,
+            "stable_session_decision_count": 8,
+            "stable_session_coverage_rate": 0.8,
+            "lease_preferred_decision_count": 6,
+            "lease_applied_decision_count": 6,
+            "lease_application_rate": 1.0,
+            "lease_event_counts": {"assigned": 2, "renewed": 6},
+            "continuation_count": 6,
+            "migration_rate": 0.0,
+            "fallback_migration_count": 0,
+            "success_usage_ledger_count": 8,
+            "provider_usage_coverage_rate": 1.0,
+            "usage_v2_coverage_rate": 1.0,
+            "cost_coverage_rate": 1.0,
+            "prompt_tokens": 100,
+            "uncached_input_tokens": 40,
+            "cached_tokens": 50,
+            "cache_write_tokens": 10,
+            "uncached_input_rate": 0.4,
+            "cache_read_rate": 0.5,
+            "cache_write_rate": 0.1,
+            "cost_totals_by_currency": {"USD": 0.25},
+            "costed_cohorts": [{
+                "channel_id": 7,
+                "tariff_version": "v1",
+                "tariff_period": "off_peak",
+                "currency": "USD",
+                "ledger_count": 8,
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "uncached_input_tokens": 40,
+                "cached_tokens": 50,
+                "cache_write_tokens": 10,
+                "cache_read_rate": 0.5,
+                "cache_write_rate": 0.1,
+                "input_cost": 0.1,
+                "output_cost": 0.15,
+                "total_cost": 0.25,
+            }],
+            "attempt_request_count": 10,
+            "fallback_request_count": 0,
+            "fallback_success_count": 0,
+            "fallback_success_rate": None,
+            "rate_limited_attempt_count": 0,
+            "server_error_attempt_count": 0,
+            "facts_complete_for_evaluation": True,
+            "blocking_reasons": [],
+        },
+        "window": {
+            "start_time": "2026-08-01T00:00:00Z",
+            "end_time": "2026-08-02T00:00:00Z",
+            "end_exclusive": True,
+        },
+        "meta": {},
+    }
+
+
 def test_mcp_server_exposes_and_calls_request_trace_tool(
     monkeypatch,
 ) -> None:
@@ -178,6 +251,10 @@ def test_mcp_server_exposes_and_calls_request_trace_tool(
                     "limit": 10,
                 },
             )
+            lease_evaluation = await client.call_tool(
+                "rotor_evaluate_session_leases",
+                {"model": "model-a"},
+            )
             channels = await client.call_tool(
                 "rotor_list_channels",
                 {
@@ -196,6 +273,7 @@ def test_mcp_server_exposes_and_calls_request_trace_tool(
         assert {tool.name for tool in tools.tools} == {
             "rotor_get_channel",
             "rotor_get_request_trace",
+            "rotor_evaluate_session_leases",
             "rotor_list_channels",
             "rotor_list_model_usage",
             "rotor_list_recent_failures",
@@ -239,6 +317,19 @@ def test_mcp_server_exposes_and_calls_request_trace_tool(
         assert usage_tool.output_schema["additionalProperties"] is False
         assert usage_tool.annotations.read_only_hint is True
         assert usage.structured_content["data"][0]["total_tokens"] == 15
+        lease_tool = next(
+            tool
+            for tool in tools.tools
+            if tool.name == "rotor_evaluate_session_leases"
+        )
+        assert lease_tool.output_schema["additionalProperties"] is False
+        assert lease_tool.annotations.read_only_hint is True
+        assert lease_evaluation.structured_content["data"][
+            "facts_complete_for_evaluation"
+        ] is True
+        assert lease_evaluation.structured_content["data"][
+            "costed_cohorts"
+        ][0]["tariff_period"] == "off_peak"
         channels_tool = next(
             tool
             for tool in tools.tools
@@ -277,6 +368,14 @@ def test_request_trace_schema_rejects_unknown_fields_without_leaking_input(
         RequestTraceResponse.from_control_payload(payload)
 
     assert "sensitive-value" not in str(captured.value)
+
+
+def test_session_lease_evaluation_schema_rejects_unknown_fields() -> None:
+    payload = _session_evaluation_payload()
+    payload["data"]["unexpected"] = "not-allowed"
+
+    with pytest.raises(InvalidControlAPIResponse):
+        SessionLeaseEvaluationResponse.from_control_payload(payload)
 
 
 def test_request_trace_schema_preserves_control_api_redactions() -> None:

@@ -1,10 +1,37 @@
-// fetch wrapper with unified error unfolding (migrated from app.js).
+// Authenticated fetch wrapper with unified error unfolding.
+
+export function adminCsrfHeaders() {
+  const prefix = "rotor_admin_csrf=";
+  const cookie = document.cookie
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(prefix));
+  if (!cookie) return {};
+  return {
+    "X-CSRF-Token": decodeURIComponent(cookie.slice(prefix.length)),
+  };
+}
+
+export function handleAdminUnauthorized(response) {
+  if (response.status === 401) {
+    window.dispatchEvent(new CustomEvent("rotorauthrequired"));
+  }
+}
 
 export async function api(path, options = {}) {
   const headers = { ...(options.headers || {}) };
   if (options.body) headers["Content-Type"] = "application/json";
+  const method = String(options.method || "GET").toUpperCase();
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+    Object.assign(headers, adminCsrfHeaders());
+  }
 
-  const response = await fetch(path, { ...options, headers });
+  const response = await fetch(path, {
+    ...options,
+    credentials: "same-origin",
+    headers,
+  });
+  handleAdminUnauthorized(response);
 
   if (!response.ok) {
     const contentType = response.headers.get("content-type") || "";

@@ -5,6 +5,7 @@ from httpx import AsyncClient, Response
 from typing import AsyncIterator, Any
 from copy import deepcopy
 from rotor.schemas.request import ChatCompletionRequest
+from rotor.core.exceptions import UpstreamOverloaded, is_overload_error_signal
 import json
 
 
@@ -87,9 +88,13 @@ class AnthropicAdapter(AnthropicCompatibleAdapter):
                     event = json.loads(data_str)
                     if event.get("type") == "error":
                         error = event.get("error") or {}
-                        raise RuntimeError(
-                            error.get("message") or "Anthropic upstream stream error"
-                        )
+                        error_message = error.get("message") or "Anthropic upstream stream error"
+                        error_type = error.get("type")
+                        if is_overload_error_signal(error_type, error_message):
+                            raise UpstreamOverloaded(
+                                error_message, error_type=error_type
+                            )
+                        raise RuntimeError(error_message)
 
                     if request.anthropic_payload is not None:
                         yield event

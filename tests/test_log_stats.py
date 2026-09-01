@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from rotor.api.admin.logs import (
+    _cache_hit_rate,
     _calendar_time_window,
     count_logs,
     get_log_stats,
@@ -23,6 +24,7 @@ def _log(*, created_at: datetime, model: str, total_tokens: int) -> RequestLog:
         prompt_tokens=total_tokens,
         completion_tokens=0,
         total_tokens=total_tokens,
+        uncached_input_tokens=total_tokens,
         success=True,
         created_at=created_at,
         latency=1.0,
@@ -30,7 +32,14 @@ def _log(*, created_at: datetime, model: str, total_tokens: int) -> RequestLog:
     )
 
 
-def _log_with_cache(*, created_at: datetime, model: str, prompt_tokens: int, cached_tokens: int) -> RequestLog:
+def _log_with_cache(
+    *,
+    created_at: datetime,
+    model: str,
+    prompt_tokens: int,
+    cached_tokens: int,
+    cache_write_tokens: int = 0,
+) -> RequestLog:
     return RequestLog(
         token_id=1,
         channel_id=1,
@@ -39,7 +48,11 @@ def _log_with_cache(*, created_at: datetime, model: str, prompt_tokens: int, cac
         prompt_tokens=prompt_tokens,
         completion_tokens=0,
         total_tokens=prompt_tokens,
+        uncached_input_tokens=(
+            prompt_tokens - cached_tokens - cache_write_tokens
+        ),
         cached_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
         success=True,
         created_at=created_at,
         latency=1.0,
@@ -96,7 +109,16 @@ def test_log_stats_respects_days_and_model_filters():
                 "total_tokens": 20,
                 "prompt_tokens": 20,
                 "completion_tokens": 0,
+                "uncached_input_tokens": 20,
                 "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_write_5m_tokens": 0,
+                "cache_write_1h_tokens": 0,
+                "usage_v2_requests": 1,
+                "total_cost": 0.0,
+                "currency": None,
+                "cost_totals_by_currency": {},
+                "costed_requests": 0,
                 "cache_hit_rate": 0.0,
             }]
 
@@ -126,6 +148,7 @@ def test_log_stats_includes_cached_tokens():
             )
             assert last_day["prompt_tokens"] == 100
             assert last_day["cached_tokens"] == 80
+            assert last_day["uncached_input_tokens"] == 20
             assert last_day["cache_hit_rate"] == 80.0
 
             stats = await get_log_stats(
@@ -133,6 +156,7 @@ def test_log_stats_includes_cached_tokens():
             )
             assert stats["cached_tokens"] == 180
             assert stats["prompt_tokens"] == 300
+            assert stats["uncached_input_tokens"] == 120
             assert stats["cache_hit_rate"] == 60.0
 
             models = await get_model_usage(
@@ -145,6 +169,63 @@ def test_log_stats_includes_cached_tokens():
             assert models[0]["cache_hit_rate"] == 60.0
 
         await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_cache_hit_rate_is_bounded_for_legacy_inconsistent_rows() -> None:
+    assert _cache_hit_rate(100, 300) == 100.0
+
+
+def test_cost_stats_do_not_add_different_currencies() -> None:
+    async def scenario() -> None:
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        now = datetime.utcnow()
+        async with sessions() as db:
+            usd = _log(created_at=now, model="mixed", total_tokens=10)
+            usd.cost = 1.25
+            usd.currency = "USD"
+            usd.cost_status = "calculated"
+            cny = _log(created_at=now, model="mixed", total_tokens=10)
+            cny.cost = 7.5
+            cny.currency = "CNY"
+            cny.cost_status = "calculated"
+            db.add_all([usd, cny])
+            await db.commit()
+
+            stats = await get_log_stats(
+                token_id=None,
+                channel_id=None,
+                model=None,
+                days=1,
+                db=db,
+            )
+            models = await get_model_usage(
+                days=1,
+                limit=20,
+                channel_id=None,
+                model="mixed",
+                db=db,
+            )
+
+        await engine.dispose()
+
+        assert stats["total_cost"] is None
+        assert stats["currency"] is None
+        assert stats["cost_totals_by_currency"] == {
+            "CNY": 7.5,
+            "USD": 1.25,
+        }
+        assert stats["costed_requests"] == 2
+        assert models[0]["total_cost"] is None
+        assert models[0]["cost_totals_by_currency"] == {
+            "CNY": 7.5,
+            "USD": 1.25,
+        }
 
     asyncio.run(scenario())
 

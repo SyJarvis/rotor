@@ -19,10 +19,12 @@ from rotor.schemas.control import (
     ModelUsageControlResponse,
     RecentFailuresControlResponse,
     RequestTraceControlResponse,
+    SessionLeaseEvaluationControlResponse,
 )
 from rotor.services.model_usage import list_model_usage
 from rotor.services.recent_failures import list_recent_failures
 from rotor.services.request_traces import get_request_trace
+from rotor.services.session_lease_evaluation import evaluate_session_leases
 
 
 router = APIRouter(tags=["control-requests"])
@@ -56,6 +58,41 @@ async def read_model_usage(
     return ModelUsageControlResponse(
         request_id=control_request_id(request),
         data=result.items,
+        window=ControlTimeWindow(
+            start_time=result.start_time,
+            end_time=result.end_time,
+        ),
+    )
+
+
+@router.get(
+    "/usage/session-leases",
+    response_model=SessionLeaseEvaluationControlResponse,
+)
+async def read_session_lease_evaluation(
+    request: Request,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    model: str | None = Query(default=None, min_length=1, max_length=200),
+    _: ActorContext = Depends(require_control_scope("usage:read")),
+    db: AsyncSession = Depends(get_db),
+) -> SessionLeaseEvaluationControlResponse:
+    try:
+        result = await evaluate_session_leases(
+            db,
+            start_time=start_time,
+            end_time=end_time,
+            model=model,
+        )
+    except ValueError as exc:
+        raise ControlAPIException(
+            status_code=400,
+            code="invalid_session_lease_evaluation_query",
+            message=str(exc),
+        ) from exc
+    return SessionLeaseEvaluationControlResponse(
+        request_id=control_request_id(request),
+        data=result.summary,
         window=ControlTimeWindow(
             start_time=result.start_time,
             end_time=result.end_time,

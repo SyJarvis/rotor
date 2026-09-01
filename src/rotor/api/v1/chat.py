@@ -1,3 +1,4 @@
+import asyncio
 import time
 import uuid
 import logging
@@ -6,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.database import async_session_maker, get_db
+from rotor.core.client_session import resolve_client_session
 from rotor.core.deps import get_current_token, get_available_channels
 from rotor.application_settings import application_settings
 from rotor.schemas.request import (
@@ -15,10 +17,15 @@ from rotor.schemas.request import (
 )
 from rotor.schemas.error import ErrorPhase
 from rotor.adapters.factory import AdapterFactory
-from rotor.gateway.accounting import AccountingService
+from rotor.gateway.accounting import AccountingService, StreamingUsageAccumulator
+from rotor.gateway.provider_facts import (
+    extract_capacity_snapshot,
+    extract_capacity_snapshot_from_error,
+)
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.conversations.store import ConversationHandle, ConversationStore
-from rotor.gateway.routing import routing_engine
+from rotor.gateway.routing import routing_engine, session_lease_success_reason
+from rotor.services.session_leases import get_preferred_channel_id
 from rotor.gateway.fallback import (
     retry_after_seconds,
     set_routing_headers,
@@ -27,8 +34,10 @@ from rotor.gateway.fallback import (
 from rotor.models.channel import Channel
 from rotor.core.exceptions import (
     ChannelException,
+    UpstreamOverloaded,
     classify_error_status,
     format_error_message,
+    is_overload_error_signal,
     normalize_upstream_error,
     upstream_error_payload,
 )
@@ -62,17 +71,35 @@ async def chat_completions(
     channels = await get_available_channels(request.model, token, db)
 
     request_id = http_request.headers.get("X-Request-Id") or f"req_{uuid.uuid4().hex}"
-    conversation_id = (
-        http_request.headers.get("X-Conversation-Id")
-        or request.user
-        or f"conv_{uuid.uuid4().hex[:24]}"
+    client_session = resolve_client_session(
+        http_request.headers,
+        legacy_user_id=request.user,
     )
+    conversation_id = client_session.session_id or f"conv_{uuid.uuid4().hex[:24]}"
     client_ip = http_request.client.host if http_request.client else "unknown"
     request_origin = getattr(http_request.state, "request_origin", "client")
     agent_run_id = getattr(http_request.state, "agent_run_id", None)
 
     # Create routing decision
-    affinity_used = application_settings.get().routing.affinity_enabled
+    routing_settings = application_settings.get().routing
+    lease_session_id = (
+        client_session.session_id
+        if routing_settings.affinity_enabled
+        and routing_settings.session_lease_enabled
+        else None
+    )
+    preferred_channel_id = await get_preferred_channel_id(
+        db,
+        token_id=token.id,
+        session_id=lease_session_id,
+        logical_model=request.model,
+    )
+    affinity_key = (
+        client_session.affinity_key(token.id)
+        if routing_settings.affinity_enabled
+        else None
+    )
+    affinity_used = affinity_key is not None
     required_capabilities = {"stream"} if request.stream else set()
     routing_decision = routing_engine.route(
         channels,
@@ -80,7 +107,8 @@ async def chat_completions(
         token=token,
         request_protocol="openai_chat",
         required_capabilities=required_capabilities,
-        affinity_key=conversation_id if affinity_used else None,
+        affinity_key=affinity_key,
+        preferred_channel_id=preferred_channel_id,
     )
     candidates = routing_decision.candidates
     accounting_service.record_routing_decision(
@@ -96,6 +124,7 @@ async def chat_completions(
             "stream": bool(request.stream),
             "message_count": len(request.messages),
             "has_tools": bool(request.tools),
+            **client_session.routing_features(),
         },
     )
     await db.commit()
@@ -105,6 +134,7 @@ async def chat_completions(
 
     # Try to get a response from available channels
     http_client = AsyncClient(timeout=120.0)
+    streaming_response_returned = False
     last_error = None
 
     conversation_handle = await conversation_store.start(
@@ -136,8 +166,15 @@ async def chat_completions(
                         http_request, http_client, request_id, conversation_handle,
                         response=response,
                         attempt_context=attempt_context,
+                        lease_session_id=lease_session_id,
+                        lease_migration_reason=session_lease_success_reason(
+                            routing_decision, attempt
+                        ),
                     )
                     set_routing_headers(result, channel, request.model, attempt > 0)
+                    # Ownership of http_client transfers to the streaming
+                    # generator, which closes it in its own finally block.
+                    streaming_response_returned = True
                     return result
                 else:
                     set_routing_headers(
@@ -147,6 +184,10 @@ async def chat_completions(
                         request, adapter, channel, token, db, start_time, http_request,
                         request_id, conversation_handle,
                         attempt_context=attempt_context,
+                        lease_session_id=lease_session_id,
+                        lease_migration_reason=session_lease_success_reason(
+                            routing_decision, attempt
+                        ),
                     )
 
             except (HTTPStatusError, RequestError) as e:
@@ -179,6 +220,7 @@ async def chat_completions(
                     latency_ms=latency_ms,
                     client_ip=client_ip,
                     provider_response=upstream_error_payload(e),
+                    capacity_snapshot=extract_capacity_snapshot_from_error(e),
                 )
                 if conversation_handle:
                     await conversation_store.append_error(
@@ -214,6 +256,7 @@ async def chat_completions(
                     error_message=format_error_message(e),
                     latency_ms=latency_ms,
                     client_ip=client_ip,
+                    capacity_snapshot=extract_capacity_snapshot_from_error(e),
                 )
                 if conversation_handle:
                     await conversation_store.append_error(
@@ -226,8 +269,11 @@ async def chat_completions(
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)
                 raise
     finally:
-        # Close client for non-streaming requests (streaming closes it in the handler)
-        if not request.stream:
+        # Close the client unless a streaming response took ownership of it.
+        # This covers non-streaming requests and streaming requests whose
+        # make_request() failed on every candidate (the generator that would
+        # normally close the client never started).
+        if not streaming_response_returned:
             await http_client.aclose()
 
     # All channels failed
@@ -253,6 +299,8 @@ async def _handle_non_streaming_request(
     conversation_handle: ConversationHandle,
     request_protocol: str = "openai_chat",
     attempt_context: AttemptContext | None = None,
+    lease_session_id: str | None = None,
+    lease_migration_reason: str = "request_success",
 ) -> dict:
     """Handle non-streaming chat completion request."""
     # Make the request
@@ -295,6 +343,28 @@ async def _handle_non_streaming_request(
             usage=usage,
             latency_ms=latency_ms,
             client_ip=client_ip,
+            capacity_snapshot=extract_capacity_snapshot(
+                getattr(response, "headers", {})
+            ),
+            tariff_at=(
+                attempt_context.started_at
+                if attempt_context is not None
+                else start_time
+            ),
+            lease_session_id=lease_session_id,
+            lease_migration_reason=lease_migration_reason,
+        )
+    else:
+        # A queued native Responses object has successfully established
+        # upstream ownership even though its token usage arrives on polling.
+        await accounting_service.record_lease_success(
+            db,
+            request_id=request_id,
+            token=token,
+            channel=channel,
+            model=request.model,
+            lease_session_id=lease_session_id,
+            lease_migration_reason=lease_migration_reason,
         )
     await conversation_store.append_response(conversation_handle, response_data)
     await conversation_store.append_usage(conversation_handle, response_data.get("usage") or {})
@@ -322,6 +392,8 @@ async def _handle_streaming_request(
     native_responses_stream: bool = False,
     native_response_callback=None,
     attempt_context: AttemptContext | None = None,
+    lease_session_id: str | None = None,
+    lease_migration_reason: str = "request_success",
 ) -> StreamingResponse:
     """Handle streaming chat completion request."""
 
@@ -335,10 +407,7 @@ async def _handle_streaming_request(
         """Generator for streaming responses."""
         try:
             # Track token usage for streaming
-            prompt_tokens = 0
-            completion_tokens = 0
-            cached_tokens = 0
-            has_provider_usage = False
+            stream_usage = StreamingUsageAccumulator()
             collected_text: list[str] = []
             collected_tool_calls: dict[int, dict] = {}
             last_finish_reason: str | None = None
@@ -352,6 +421,24 @@ async def _handle_streaming_request(
 
             async for chunk in adapter.stream_convert_response(response, request):
                 native_event_type = chunk.get("type") if native_responses_stream else None
+                if not native_responses_stream:
+                    # OpenAI-compatible upstreams can emit error objects
+                    # mid-stream (e.g. 529-style overload). Surface overload /
+                    # rate-limit signals to the routing layer; other error
+                    # chunks keep flowing to the client unchanged.
+                    error_payload = chunk.get("error")
+                    if isinstance(error_payload, (dict, str)):
+                        if isinstance(error_payload, dict):
+                            error_type = (
+                                error_payload.get("type") or error_payload.get("code")
+                            )
+                            message = error_payload.get("message")
+                        else:
+                            error_type = None
+                            message = error_payload
+                        message = message or "Upstream stream error"
+                        if is_overload_error_signal(error_type, message):
+                            raise UpstreamOverloaded(message, error_type=error_type)
                 if native_event_type in {
                     "response.completed",
                     "response.failed",
@@ -421,19 +508,17 @@ async def _handle_streaming_request(
                 if native_responses_stream and completed_native_response is not None:
                     usage = completed_native_response.get("usage") or {}
                 if usage:
-                    has_provider_usage = True
-                prompt_tokens = max(
-                    prompt_tokens,
-                    usage.get("prompt_tokens", 0),
-                    usage.get("input_tokens", 0),
-                )
-                completion_tokens = max(
-                    completion_tokens,
-                    usage.get("completion_tokens", 0),
-                    usage.get("output_tokens", 0),
-                )
-                prompt_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
-                cached_tokens = max(cached_tokens, int(prompt_details.get("cached_tokens") or 0))
+                    stream_usage.observe(accounting_service.extract_usage(
+                        {"usage": usage}
+                    ))
+
+            prompt_tokens = stream_usage.prompt_tokens
+            completion_tokens = stream_usage.completion_tokens
+            cached_tokens = stream_usage.cached_tokens
+            uncached_input_tokens = stream_usage.uncached_input_tokens
+            cache_write_tokens = stream_usage.cache_write_tokens
+            cache_write_5m_tokens = stream_usage.cache_write_5m_tokens
+            cache_write_1h_tokens = stream_usage.cache_write_1h_tokens
 
             terminal_events: list[str] = []
             if native_responses_stream:
@@ -444,6 +529,13 @@ async def _handle_streaming_request(
             elif stream_transform:
                 for event in stream_transform.finish({
                     "input_tokens": prompt_tokens,
+                    "input_tokens_details": {
+                        "cached_tokens": cached_tokens,
+                        "cache_write_tokens": cache_write_tokens,
+                        "cache_write_5m_tokens": cache_write_5m_tokens,
+                        "cache_write_1h_tokens": cache_write_1h_tokens,
+                        "uncached_tokens": uncached_input_tokens,
+                    },
                     "output_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens,
                 }):
@@ -453,12 +545,7 @@ async def _handle_streaming_request(
 
             # Update stats (estimated for streaming)
             total_tokens = prompt_tokens + completion_tokens
-            usage_data = accounting_service.streaming_usage(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                has_provider_usage=has_provider_usage,
-                cached_tokens=cached_tokens,
-            )
+            usage_data = stream_usage.to_usage_data(accounting_service)
             latency_ms = int((time.time() - start_time) * 1000)
             client_ip = http_request.client.host if http_request.client else "unknown"
             # Accounting writes to SQLite; a lock collision here must never
@@ -490,6 +577,16 @@ async def _handle_streaming_request(
                         usage=usage_data,
                         latency_ms=latency_ms,
                         client_ip=client_ip,
+                        capacity_snapshot=extract_capacity_snapshot(
+                            getattr(response, "headers", {})
+                        ),
+                        tariff_at=(
+                            attempt_context.started_at
+                            if attempt_context is not None
+                            else start_time
+                        ),
+                        lease_session_id=lease_session_id,
+                        lease_migration_reason=lease_migration_reason,
                     )
                     await stream_db.commit()
                     accounting_recorded = True
@@ -531,16 +628,55 @@ async def _handle_streaming_request(
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
                         "total_tokens": total_tokens,
+                        "prompt_tokens_details": {
+                            "cached_tokens": cached_tokens,
+                            "cache_write_tokens": cache_write_tokens,
+                            "cache_write_5m_tokens": cache_write_5m_tokens,
+                            "cache_write_1h_tokens": cache_write_1h_tokens,
+                            "uncached_tokens": uncached_input_tokens,
+                        },
                     },
                 })
                 await conversation_store.append_usage(conversation_handle, {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "total_tokens": total_tokens,
+                    "prompt_tokens_details": {
+                        "cached_tokens": cached_tokens,
+                        "cache_write_tokens": cache_write_tokens,
+                        "cache_write_5m_tokens": cache_write_5m_tokens,
+                        "cache_write_1h_tokens": cache_write_1h_tokens,
+                        "uncached_tokens": uncached_input_tokens,
+                    },
                 })
             await conversation_store.finish(conversation_handle, "success", latency_ms)
             for terminal_event in terminal_events:
                 yield terminal_event
+
+        except asyncio.CancelledError:
+            latency_ms = int((time.time() - start_time) * 1000)
+            try:
+                if attempt_context is not None:
+                    await attempt_recorder.record(
+                        context=attempt_context,
+                        request_id=request_id,
+                        channel=channel,
+                        requested_model=request.model,
+                        provider_model=adapter.map_model_name(request.model),
+                        request_protocol=request_protocol,
+                        outcome="cancelled",
+                    )
+            except Exception:
+                logger.exception(
+                    "Recording cancelled attempt failed for request_id=%s",
+                    request_id,
+                )
+            await conversation_store.finish(
+                conversation_handle,
+                "cancelled",
+                latency_ms,
+            )
+            raise
 
         except Exception as e:
             logger.error(f"Streaming error: {format_error_message(e)}")
@@ -548,27 +684,30 @@ async def _handle_streaming_request(
                 routing_engine.mark_unavailable(request.model, channel)
             latency_ms = int((time.time() - start_time) * 1000)
             client_ip = http_request.client.host if http_request.client else "unknown"
+            try:
+                if attempt_context is not None:
+                    await attempt_recorder.record(
+                        context=attempt_context,
+                        request_id=request_id,
+                        channel=channel,
+                        requested_model=request.model,
+                        provider_model=adapter.map_model_name(request.model),
+                        request_protocol=request_protocol,
+                        outcome="failed",
+                        error=normalize_upstream_error(
+                            e,
+                            phase=ErrorPhase.PROVIDER_STREAM,
+                        ),
+                    )
+            except Exception:
+                logger.exception(
+                    "Recording failed attempt failed for request_id=%s",
+                    request_id,
+                )
             # Defensive try/except: accounting failure must not swallow the
             # error chunk we send to the client below.
             try:
                 async with async_session_maker() as stream_db:
-                    if (
-                        attempt_context is not None
-                        and isinstance(e, (HTTPStatusError, RequestError))
-                    ):
-                        await attempt_recorder.record(
-                            context=attempt_context,
-                            request_id=request_id,
-                            channel=channel,
-                            requested_model=request.model,
-                            provider_model=adapter.map_model_name(request.model),
-                            request_protocol=request_protocol,
-                            outcome="failed",
-                            error=normalize_upstream_error(
-                                e,
-                                phase=ErrorPhase.PROVIDER_STREAM,
-                            ),
-                        )
                     await accounting_service.record_failure(
                         stream_db,
                         request_id=request_id,
@@ -581,6 +720,7 @@ async def _handle_streaming_request(
                         error_message=format_error_message(e),
                         latency_ms=latency_ms,
                         client_ip=client_ip,
+                        capacity_snapshot=extract_capacity_snapshot_from_error(e),
                     )
                     await stream_db.commit()
             except Exception:

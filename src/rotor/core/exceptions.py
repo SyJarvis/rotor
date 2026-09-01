@@ -71,6 +71,41 @@ def upstream_error_payload(exc: Exception) -> dict[str, Any] | None:
     }
 
 
+_OVERLOAD_ERROR_TYPES = {
+    "overloaded",
+    "overloaded_error",
+    "rate_limit",
+    "rate_limit_error",
+    "too_many_requests",
+}
+
+
+def is_overload_error_signal(error_type: str | None, message: str | None) -> bool:
+    """Whether an upstream stream error event signals overload/rate limiting.
+
+    Only explicit provider overload/rate-limit types (or the canonical
+    "overloaded" wording) count; parameter or authentication errors must not
+    be mistaken for recoverable overload.
+    """
+    normalized_type = (error_type or "").strip().lower()
+    if normalized_type in _OVERLOAD_ERROR_TYPES or normalized_type.startswith("rate_limit"):
+        return True
+    return "overloaded" in (message or "").lower()
+
+
+class UpstreamOverloaded(RuntimeError):
+    """An upstream reported overload/rate limiting mid-stream (SSE error event)."""
+
+    def __init__(
+        self,
+        message: str = "Upstream overloaded",
+        *,
+        error_type: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+
+
 def _indicates_missing_model(body: Any) -> bool:
     """Only infer model-not-found when the sanitized provider body says so."""
     if not isinstance(body, dict):
@@ -160,6 +195,12 @@ def normalize_upstream_error(
         retry_same_channel = True
         fallback_allowed = True
         message = "Upstream connection failed"
+    elif isinstance(exc, UpstreamOverloaded):
+        code = "upstream_overloaded"
+        category = ErrorCategory.UPSTREAM_AVAILABILITY
+        retry_same_channel = False
+        fallback_allowed = True
+        message = str(exc)
     else:
         code = "upstream_unknown_error"
         category = ErrorCategory.UNKNOWN

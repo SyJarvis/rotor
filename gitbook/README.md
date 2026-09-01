@@ -11,6 +11,8 @@ Messages 兼容接口。
 - 在可重试的上游错误发生时切换到其他渠道；
 - 为调用方签发独立 API Key，并限制配额和可访问渠道；
 - 查看请求日志、用量、延迟和路由决策；
+- 在首页查看最近请求的运行状态和近期异常，并按自然日、周或月分析用量；
+- 为 MCP Client 创建可单独停用的只读 Control Key；
 - 使用浏览器管理页或 HTTP 管理 API 完成配置。
 
 ## 最短路径
@@ -28,7 +30,8 @@ Messages 兼容接口。
 | OpenAI Images | `POST /v1/images/generations` |
 | Anthropic Messages | `POST /anthropic/v1/messages` |
 
-Rotor 的管理页位于 `/`，健康检查位于 `/health`。
+Rotor 的管理页位于 `/`，健康检查位于 `/health`。管理页中的 MindAgent 对话记录保存在
+本地，可新建、导出 JSON 或删除；它是实验性管理页能力，不是稳定的外部 API。
 
 ## 项目边界
 

@@ -87,6 +87,14 @@ opencode run "只回复 ROTOR_OK"
 Responses 配置使用 `@ai-sdk/openai`；Chat Completions 配置使用
 `@ai-sdk/openai-compatible`。两者不要混用，否则 OpenCode 会请求错误的上游路径。
 
+## Session Lease 行为
+
+Rotor 会识别 Codex、Claude Code 和 OpenCode 的稳定 Session 信号。同一 Rotor Token、
+Session 和 logical model 的成功请求会形成持久化 Channel 租约；fallback 成功后，后续
+turn 会保持在新 Channel，直到空闲 TTL 过期。客户端仍负责发送对话历史；租约只管理
+路由，不保存或迁移 KV Cache。使用原生 Responses `previous_response_id` 时，对象始终
+返回创建它的上游 Channel。
+
 ## 常见错误
 
 - `401`：检查 Token 是否以 Rotor 配置的 `API_KEY_PREFIX` 开头，且未禁用或过期。

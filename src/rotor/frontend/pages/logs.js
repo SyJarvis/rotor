@@ -1,6 +1,6 @@
 // Logs page — filter bar + paginated table + expandable detail.
 
-import { api } from "../api.js";
+import { api } from "../api.js?v=2";
 import { t } from "../i18n.js";
 import {
   escapeHtml, badge, formatNumber, formatTimeInTimezone, skeletonRows,

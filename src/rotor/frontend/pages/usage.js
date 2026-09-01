@@ -1,6 +1,6 @@
 // Usage page — per-model token histograms + model donut + channel success bars.
 
-import { api } from "../api.js";
+import { api } from "../api.js?v=2";
 import { t } from "../i18n.js";
 import {
   escapeHtml, formatNumber, formatRequestCount, formatLatency, skeletonKpis, refreshIcons, badge,

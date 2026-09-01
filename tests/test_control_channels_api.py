@@ -33,6 +33,7 @@ def _channel(
     enabled: bool,
     protocol: str,
     priority: int,
+    resource_scopes: dict[str, str] | None = None,
 ) -> Channel:
     return Channel(
         name=name,
@@ -50,6 +51,7 @@ def _channel(
             "headers": {
                 "Authorization": "Bearer secret-header",
             },
+            **(resource_scopes or {}),
         },
     )
 
@@ -73,6 +75,11 @@ def test_control_channels_require_scope_filter_and_exclude_secrets() -> None:
                     enabled=True,
                     protocol="openai",
                     priority=10,
+                    resource_scopes={
+                        "cache_scope": "provider/account-a/cache",
+                        "capacity_scope": "provider/account-a/capacity",
+                        "billing_scope": "provider/account-a/billing",
+                    },
                 ),
                 _channel(
                     name="disabled",
@@ -141,6 +148,9 @@ def test_control_channels_require_scope_filter_and_exclude_secrets() -> None:
         assert channel["name"] == "primary"
         assert channel["base_url_origin"] == "https://api.example.com:8443"
         assert channel["secret_state"] == {"has_key": True}
+        assert channel["cache_scope"] == "provider/account-a/cache"
+        assert channel["capacity_scope"] == "provider/account-a/capacity"
+        assert channel["billing_scope"] == "provider/account-a/billing"
         serialized = allowed.text
         for secret in (
             "provider-secret-key",
@@ -247,6 +257,9 @@ def test_control_channels_cursor_and_single_channel_errors() -> None:
         )
         assert detail.status_code == 200
         assert detail.json()["data"]["name"] == "first"
+        assert detail.json()["data"]["cache_scope"] == f"channel:{channel_id}"
+        assert detail.json()["data"]["capacity_scope"] == f"channel:{channel_id}"
+        assert detail.json()["data"]["billing_scope"] == f"channel:{channel_id}"
         assert missing.status_code == 404
         assert missing.json()["error"]["code"] == "channel_not_found"
 

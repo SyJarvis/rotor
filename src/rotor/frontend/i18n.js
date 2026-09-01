@@ -18,6 +18,9 @@ export function applyLocale() {
   document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
     el.placeholder = t(el.dataset.i18nPlaceholder);
   });
+  document.querySelectorAll("[data-i18n-title]").forEach((el) => {
+    el.title = t(el.dataset.i18nTitle);
+  });
   const localeLabel = document.getElementById("localeLabel");
   if (localeLabel) localeLabel.textContent = locale === "zh-CN" ? "EN" : "中";
   document.dispatchEvent(new CustomEvent("localechange", { detail: { locale } }));

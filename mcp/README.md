@@ -5,7 +5,7 @@ Rotor Control API 读取数据，不导入 Rotor 后端模块，也不直接连�
 
 ## 当前实现
 
-Server 使用官方 Python MCP SDK `2.0.0` 和 stdio transport，提供五个只读 Tool：
+Server 使用官方 Python MCP SDK `2.0.0` 和 stdio transport，提供六个只读 Tool：
 
 - `rotor_list_channels`：按启用状态、模型或协议查询当前安全渠道视图。
 - `rotor_get_channel`：根据 Channel ID 查询当前安全渠道详情。
@@ -14,8 +14,10 @@ Server 使用官方 Python MCP SDK `2.0.0` 和 stdio transport，提供五个只
   `total_tokens` 降序返回。
 - `rotor_list_recent_failures`：按错误类别、模型、渠道或上游状态发现近期失败，
   并返回可继续查询的样本 Request ID。
+- `rotor_evaluate_session_leases`：汇总 Session Lease 覆盖、迁移、缓存、费用和
+  fallback 事实，并按 Channel、费率版本、峰谷时段和币种给出可比较 cohort。
 
-五个 Tool 都提供严格的 JSON `outputSchema`，并声明：
+六个 Tool 都提供严格的 JSON `outputSchema`，并声明：
 
 ```json
 {
@@ -90,6 +92,7 @@ required = true
 startup_timeout_sec = 10
 tool_timeout_sec = 30
 enabled_tools = [
+  "rotor_evaluate_session_leases",
   "rotor_get_channel",
   "rotor_get_request_trace",
   "rotor_list_channels",
@@ -175,6 +178,20 @@ Agent 应将自然日换算为明确的时间窗口：
 窗口为开始时间包含、结束时间不包含，最大跨度 7 天。未传时间时默认最近 1 小时。
 `request_count` 按不同 Request ID 计数，`ledger_count` 是实际账本记录数；fallback
 产生的多条账本会累计 Token，但不会重复增加请求数。
+
+评估指定模型最近 24 小时的 Session Lease 事实：
+
+```text
+使用 Rotor MCP 评估 logical model `gpt-5.4` 最近 24 小时的 Session Lease，
+先说明 blocking_reasons，再按 channel 和 tariff period 比较 cache 与成本事实。
+不要据此修改路由设置。
+```
+
+`rotor_evaluate_session_leases` 默认查询最近 24 小时，最大跨度 30 天。返回的
+`facts_complete_for_evaluation=true` 只表示 provider usage、usage schema v2、费用、
+Session 和 Lease 事件等硬事实齐全；它不表示成本路由已经证明有收益，也不是启用建议。
+聚合接口不返回 Session ID。跨币种窗口会用 `multiple_currencies` 阻止直接比较，应按
+logical model、币种和更窄窗口重新查询。
 
 ## 接入 Rotor 内置 MindAgent
 

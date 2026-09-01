@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rotor.application_settings import application_settings
 from rotor.channels.presets import channel_option, join_api_url, provider_headers
 from rotor.config import settings
+from rotor.core.client_session import resolve_client_session
 from rotor.core.deps import get_available_channels, get_current_token
 from rotor.core.exceptions import (
     ChannelException,
@@ -27,13 +28,18 @@ from rotor.core.exceptions import (
 )
 from rotor.database import async_session_maker, get_db
 from rotor.gateway.accounting import AccountingService
+from rotor.gateway.provider_facts import (
+    extract_capacity_snapshot,
+    extract_capacity_snapshot_from_error,
+)
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.fallback import (
     retry_after_seconds,
     set_routing_headers,
     should_fallback,
 )
-from rotor.gateway.routing import routing_engine
+from rotor.gateway.routing import routing_engine, session_lease_success_reason
+from rotor.services.session_leases import get_preferred_channel_id
 from rotor.schemas.error import ErrorPhase
 
 
@@ -101,6 +107,9 @@ async def _record_success(
     start_time: float,
     client_ip: str,
     attempt_context: AttemptContext | None = None,
+    capacity_snapshot: dict[str, str] | None = None,
+    lease_session_id: str | None = None,
+    lease_migration_reason: str = "request_success",
 ) -> None:
     if attempt_context is not None:
         await attempt_recorder.record(
@@ -126,6 +135,14 @@ async def _record_success(
         usage=accounting_service.extract_usage(response_data),
         latency_ms=int((time.time() - start_time) * 1000),
         client_ip=client_ip,
+        capacity_snapshot=capacity_snapshot,
+        tariff_at=(
+            attempt_context.started_at
+            if attempt_context is not None
+            else start_time
+        ),
+        lease_session_id=lease_session_id,
+        lease_migration_reason=lease_migration_reason,
     )
     await db.commit()
 
@@ -171,6 +188,7 @@ async def _record_failure(
         latency_ms=int((time.time() - start_time) * 1000),
         client_ip=client_ip,
         provider_response=upstream_error_payload(error),
+        capacity_snapshot=extract_capacity_snapshot_from_error(error),
     )
     await db.commit()
 
@@ -202,6 +220,8 @@ async def _stream_image_response(
     start_time: float,
     client_ip: str,
     attempt_context: AttemptContext | None = None,
+    lease_session_id: str | None = None,
+    lease_migration_reason: str = "request_success",
 ) -> AsyncIterator[str]:
     terminal_blocks: list[str] = []
     response_data: dict[str, Any] = {}
@@ -239,6 +259,9 @@ async def _stream_image_response(
                 start_time=start_time,
                 client_ip=client_ip,
                 attempt_context=attempt_context,
+                capacity_snapshot=extract_capacity_snapshot(upstream.headers),
+                lease_session_id=lease_session_id,
+                lease_migration_reason=lease_migration_reason,
             )
         for block in terminal_blocks:
             yield block
@@ -281,11 +304,11 @@ async def generate_image(
     token=Depends(get_current_token),
 ):
     channels = await get_available_channels(image_request.model, token, db)
-    conversation_id = (
-        http_request.headers.get("X-Conversation-Id")
-        or image_request.user
-        or f"image_{uuid.uuid4().hex[:24]}"
+    client_session = resolve_client_session(
+        http_request.headers,
+        legacy_user_id=image_request.user,
     )
+    conversation_id = client_session.session_id or f"image_{uuid.uuid4().hex[:24]}"
     request_id = http_request.headers.get("X-Request-Id") or f"req_{uuid.uuid4().hex}"
     client_ip = http_request.client.host if http_request.client else "unknown"
     request_origin = getattr(http_request.state, "request_origin", "client")
@@ -294,14 +317,33 @@ async def generate_image(
     required = {"image_generation"}
     if image_request.stream:
         required.add("stream")
-    affinity_used = application_settings.get().routing.affinity_enabled
+    routing_settings = application_settings.get().routing
+    lease_session_id = (
+        client_session.session_id
+        if routing_settings.affinity_enabled
+        and routing_settings.session_lease_enabled
+        else None
+    )
+    preferred_channel_id = await get_preferred_channel_id(
+        db,
+        token_id=token.id,
+        session_id=lease_session_id,
+        logical_model=image_request.model,
+    )
+    affinity_key = (
+        client_session.affinity_key(token.id)
+        if routing_settings.affinity_enabled
+        else None
+    )
+    affinity_used = affinity_key is not None
     routing_decision = routing_engine.route(
         channels,
         model=image_request.model,
         token=token,
         request_protocol="openai_images",
         required_capabilities=required,
-        affinity_key=conversation_id if affinity_used else None,
+        affinity_key=affinity_key,
+        preferred_channel_id=preferred_channel_id,
     )
     candidates = routing_decision.candidates
     accounting_service.record_routing_decision(
@@ -316,6 +358,7 @@ async def generate_image(
         features={
             "stream": bool(image_request.stream),
             "size": image_request.size,
+            **client_session.routing_features(),
         },
     )
     await db.commit()
@@ -328,107 +371,121 @@ async def generate_image(
         )
 
     http_client = AsyncClient(timeout=_timeout())
+    streaming_response_returned = False
     last_error: Exception | None = None
-    for attempt, channel in enumerate(candidates):
-        attempt_context = AttemptContext.start(
-            attempt,
-            request_origin=request_origin,
-            agent_run_id=agent_run_id,
-        )
-        try:
-            routing_engine.begin_attempt(image_request.model, channel)
-            provider_model = (channel.model_mapping or {}).get(
-                image_request.model, image_request.model
-            )
-            upstream_request = http_client.build_request(
-                "POST",
-                image_generation_url(channel),
-                headers=image_generation_headers(channel, stream=image_request.stream),
-                json=image_request.provider_payload(provider_model),
-            )
-            upstream = await http_client.send(
-                upstream_request,
-                stream=image_request.stream,
+    try:
+        for attempt, channel in enumerate(candidates):
+            attempt_context = AttemptContext.start(
+                attempt,
+                request_origin=request_origin,
+                agent_run_id=agent_run_id,
             )
             try:
-                upstream.raise_for_status()
-            except Exception:
+                routing_engine.begin_attempt(image_request.model, channel)
+                provider_model = (channel.model_mapping or {}).get(
+                    image_request.model, image_request.model
+                )
+                upstream_request = http_client.build_request(
+                    "POST",
+                    image_generation_url(channel),
+                    headers=image_generation_headers(channel, stream=image_request.stream),
+                    json=image_request.provider_payload(provider_model),
+                )
+                upstream = await http_client.send(
+                    upstream_request,
+                    stream=image_request.stream,
+                )
+                try:
+                    upstream.raise_for_status()
+                except Exception:
+                    if image_request.stream:
+                        await upstream.aread()
+                    await upstream.aclose()
+                    raise
+
                 if image_request.stream:
-                    await upstream.aread()
+                    await db.close()
+                    response = StreamingResponse(
+                        _stream_image_response(
+                            upstream=upstream,
+                            http_client=http_client,
+                            request=image_request,
+                            channel=channel,
+                            token=token,
+                            request_id=request_id,
+                            conversation_id=conversation_id,
+                            start_time=start_time,
+                            client_ip=client_ip,
+                            attempt_context=attempt_context,
+                            lease_session_id=lease_session_id,
+                            lease_migration_reason=session_lease_success_reason(
+                                routing_decision, attempt
+                            ),
+                        ),
+                        media_type="text/event-stream",
+                    )
+                    set_routing_headers(response, channel, image_request.model, attempt > 0)
+                    # Ownership of http_client transfers to the streaming
+                    # generator, which closes it in its own finally block.
+                    streaming_response_returned = True
+                    return response
+
+                response_data = upstream.json()
                 await upstream.aclose()
-                raise
-
-            if image_request.stream:
-                await db.close()
-                response = StreamingResponse(
-                    _stream_image_response(
-                        upstream=upstream,
-                        http_client=http_client,
-                        request=image_request,
-                        channel=channel,
-                        token=token,
-                        request_id=request_id,
-                        conversation_id=conversation_id,
-                        start_time=start_time,
-                        client_ip=client_ip,
-                        attempt_context=attempt_context,
+                await _record_success(
+                    db,
+                    token=token,
+                    channel=channel,
+                    request=image_request,
+                    response_data=response_data,
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    start_time=start_time,
+                    client_ip=client_ip,
+                    attempt_context=attempt_context,
+                    capacity_snapshot=extract_capacity_snapshot(upstream.headers),
+                    lease_session_id=lease_session_id,
+                    lease_migration_reason=session_lease_success_reason(
+                        routing_decision, attempt
                     ),
-                    media_type="text/event-stream",
                 )
-                set_routing_headers(response, channel, image_request.model, attempt > 0)
-                return response
-
-            response_data = upstream.json()
-            await upstream.aclose()
-            await _record_success(
-                db,
-                token=token,
-                channel=channel,
-                request=image_request,
-                response_data=response_data,
-                request_id=request_id,
-                conversation_id=conversation_id,
-                start_time=start_time,
-                client_ip=client_ip,
-                attempt_context=attempt_context,
-            )
-            set_routing_headers(api_response, channel, image_request.model, attempt > 0)
-            await http_client.aclose()
-            return response_data
-        except (HTTPStatusError, RequestError) as exc:
-            last_error = exc
-            await _record_failure(
-                db,
-                token=token,
-                channel=channel,
-                model=image_request.model,
-                error=exc,
-                request_id=request_id,
-                conversation_id=conversation_id,
-                start_time=start_time,
-                client_ip=client_ip,
-                attempt_context=attempt_context,
-            )
-            if should_fallback(exc):
-                routing_engine.mark_unavailable(
-                    image_request.model,
-                    channel,
-                    retry_after_seconds(exc),
+                set_routing_headers(api_response, channel, image_request.model, attempt > 0)
+                return response_data
+            except (HTTPStatusError, RequestError) as exc:
+                last_error = exc
+                await _record_failure(
+                    db,
+                    token=token,
+                    channel=channel,
+                    model=image_request.model,
+                    error=exc,
+                    request_id=request_id,
+                    conversation_id=conversation_id,
+                    start_time=start_time,
+                    client_ip=client_ip,
+                    attempt_context=attempt_context,
                 )
-                continue
-            await http_client.aclose()
-            raise ChannelException(
-                f"Image generation failed for model '{image_request.model}'",
-                status_code=classify_error_status(exc),
-                original_error=format_error_message(exc),
-            ) from exc
-        except Exception:
-            await http_client.aclose()
-            raise
+                if should_fallback(exc):
+                    routing_engine.mark_unavailable(
+                        image_request.model,
+                        channel,
+                        retry_after_seconds(exc),
+                    )
+                    continue
+                raise ChannelException(
+                    f"Image generation failed for model '{image_request.model}'",
+                    status_code=classify_error_status(exc),
+                    original_error=format_error_message(exc),
+                ) from exc
 
-    await http_client.aclose()
-    raise ChannelException(
-        f"All image generation channels failed for model '{image_request.model}'",
-        status_code=classify_error_status(last_error),
-        original_error=format_error_message(last_error),
-    )
+        raise ChannelException(
+            f"All image generation channels failed for model '{image_request.model}'",
+            status_code=classify_error_status(last_error),
+            original_error=format_error_message(last_error),
+        )
+    finally:
+        # Close the client unless a streaming response took ownership of it.
+        # The finally also covers paths where _record_failure itself raises,
+        # which previously leaked the client.
+        if not streaming_response_returned:
+            await http_client.aclose()

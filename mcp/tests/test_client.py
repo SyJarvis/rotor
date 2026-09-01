@@ -279,6 +279,109 @@ def test_list_model_usage_forwards_window_and_validates_response() -> None:
     asyncio.run(exercise())
 
 
+def test_evaluate_session_leases_forwards_model_and_window() -> None:
+    async def exercise() -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == (
+                "/api/control/v1/usage/session-leases"
+            )
+            assert request.url.params["start_time"] == (
+                "2026-08-01T00:00:00+00:00"
+            )
+            assert request.url.params["end_time"] == (
+                "2026-08-02T00:00:00+00:00"
+            )
+            assert request.url.params["model"] == "model-a"
+            return httpx.Response(200, json=_session_evaluation_payload())
+
+        http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+        async with RotorControlClient(
+            _settings(),
+            http_client=http_client,
+        ) as client:
+            result = await client.evaluate_session_leases(
+                start_time=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                end_time=datetime(2026, 8, 2, tzinfo=timezone.utc),
+                model="model-a",
+            )
+        await http_client.aclose()
+
+        assert result["data"]["facts_complete_for_evaluation"] is True
+        assert result["data"]["costed_cohorts"][0]["channel_id"] == 7
+
+    asyncio.run(exercise())
+
+
+def _session_evaluation_payload() -> dict:
+    return {
+        "schema_version": "1",
+        "request_id": "control-lease-1",
+        "data": {
+            "model": "model-a",
+            "routing_decision_count": 10,
+            "stable_session_decision_count": 8,
+            "stable_session_coverage_rate": 0.8,
+            "lease_preferred_decision_count": 6,
+            "lease_applied_decision_count": 6,
+            "lease_application_rate": 1.0,
+            "lease_event_counts": {
+                "assigned": 2,
+                "renewed": 5,
+                "migrated": 1,
+                "expired": 0,
+            },
+            "continuation_count": 6,
+            "migration_rate": 1 / 6,
+            "fallback_migration_count": 1,
+            "success_usage_ledger_count": 8,
+            "provider_usage_coverage_rate": 1.0,
+            "usage_v2_coverage_rate": 1.0,
+            "cost_coverage_rate": 1.0,
+            "prompt_tokens": 100,
+            "uncached_input_tokens": 40,
+            "cached_tokens": 50,
+            "cache_write_tokens": 10,
+            "uncached_input_rate": 0.4,
+            "cache_read_rate": 0.5,
+            "cache_write_rate": 0.1,
+            "cost_totals_by_currency": {"USD": 0.25},
+            "costed_cohorts": [{
+                "channel_id": 7,
+                "tariff_version": "v1",
+                "tariff_period": "off_peak",
+                "currency": "USD",
+                "ledger_count": 8,
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "uncached_input_tokens": 40,
+                "cached_tokens": 50,
+                "cache_write_tokens": 10,
+                "cache_read_rate": 0.5,
+                "cache_write_rate": 0.1,
+                "input_cost": 0.1,
+                "output_cost": 0.15,
+                "total_cost": 0.25,
+            }],
+            "attempt_request_count": 10,
+            "fallback_request_count": 1,
+            "fallback_success_count": 1,
+            "fallback_success_rate": 1.0,
+            "rate_limited_attempt_count": 1,
+            "server_error_attempt_count": 0,
+            "facts_complete_for_evaluation": True,
+            "blocking_reasons": [],
+        },
+        "window": {
+            "start_time": "2026-08-01T00:00:00Z",
+            "end_time": "2026-08-02T00:00:00Z",
+            "end_exclusive": True,
+        },
+        "meta": {},
+    }
+
+
 def test_list_and_get_channels_forward_filters_and_validate_response() -> None:
     async def exercise() -> None:
         async def handler(request: httpx.Request) -> httpx.Response:

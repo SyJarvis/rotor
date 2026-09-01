@@ -2,7 +2,14 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from httpx import AsyncByteStream, AsyncClient, MockTransport, Request, Response
+from httpx import (
+    AsyncByteStream,
+    AsyncClient,
+    HTTPStatusError,
+    MockTransport,
+    Request,
+    Response,
+)
 import pytest
 
 from rotor.adapters.factory import AdapterFactory
@@ -10,7 +17,9 @@ from rotor.adapters.protocol.responses import (
     responses_request_to_chat,
     responses_required_capabilities,
 )
+from rotor.core.exceptions import UpstreamOverloaded
 from rotor.api.v1.responses import ResponsesStreamTransform, chat_response_to_response
+from rotor.schemas.request import ChatCompletionRequest, ChatMessage
 from rotor.schemas.responses import ResponsesRequest
 from rotor.gateway.accounting import AccountingService
 
@@ -226,6 +235,165 @@ def test_responses_protocol_channel_uses_native_adapter_and_payload() -> None:
     assert body["store"] is False
 
 
+def test_chat_conversion_drops_tool_choice_when_no_function_tools_remain() -> None:
+    request = ResponsesRequest.model_validate({
+        "model": "test-model",
+        "input": "hello",
+        "tools": [
+            {"type": "web_search"},
+            {"type": "namespace", "name": "multi_agent_v1", "tools": []},
+        ],
+        "tool_choice": "auto",
+    })
+
+    converted = responses_request_to_chat(request)
+
+    assert converted.tools is None
+    assert converted.tool_choice is None
+
+
+def test_native_responses_retries_without_unsupported_cache_retention() -> None:
+    bodies: list[dict] = []
+
+    async def handler(request: Request) -> Response:
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return Response(400, json={
+                "error": {
+                    "message": (
+                        "prompt_cache_retention is not supported on this model"
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "prompt_cache_retention",
+                    "code": "invalid_parameter",
+                }
+            })
+        return Response(200, json={"id": "resp_1", "status": "completed"})
+
+    channel = SimpleNamespace(
+        id=1,
+        type="openai",
+        protocol="openai_responses",
+        base_url="https://example.com/v1",
+        key="secret",
+        extra={},
+        model_mapping={},
+    )
+    request = responses_request_to_chat(ResponsesRequest.model_validate({
+        "model": "test-model",
+        "input": "hello",
+        "prompt_cache_key": "session-1",
+        "prompt_cache_retention": "24h",
+    }))
+
+    async def exercise() -> Response:
+        async with AsyncClient(transport=MockTransport(handler)) as client:
+            adapter = AdapterFactory.create_adapter(channel, client)
+            return await adapter.make_request(request)
+
+    response = asyncio.run(exercise())
+
+    assert response.status_code == 200
+    assert bodies[0]["prompt_cache_retention"] == "24h"
+    assert "prompt_cache_retention" not in bodies[1]
+    assert bodies[1]["prompt_cache_key"] == "session-1"
+    assert request.responses_payload["prompt_cache_retention"] == "24h"
+
+
+def test_native_responses_stream_retries_unsupported_cache_retention() -> None:
+    bodies: list[dict] = []
+
+    async def handler(request: Request) -> Response:
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return Response(400, json={
+                "error": {
+                    "message": (
+                        "prompt_cache_retention is not supported on this model"
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "prompt_cache_retention",
+                    "code": "invalid_parameter",
+                }
+            })
+        return Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b'data: {"type":"response.completed"}\n\n',
+        )
+
+    channel = SimpleNamespace(
+        id=1,
+        type="openai",
+        protocol="openai_responses",
+        base_url="https://example.com/v1",
+        key="secret",
+        extra={},
+        model_mapping={},
+    )
+    request = responses_request_to_chat(ResponsesRequest.model_validate({
+        "model": "test-model",
+        "input": "hello",
+        "stream": True,
+        "prompt_cache_retention": "24h",
+    }))
+
+    async def exercise() -> bytes:
+        async with AsyncClient(transport=MockTransport(handler)) as client:
+            adapter = AdapterFactory.create_adapter(channel, client)
+            response = await adapter.make_request(request)
+            try:
+                return await response.aread()
+            finally:
+                await response.aclose()
+
+    content = asyncio.run(exercise())
+
+    assert b"response.completed" in content
+    assert len(bodies) == 2
+    assert "prompt_cache_retention" not in bodies[1]
+
+
+def test_native_responses_does_not_retry_other_invalid_parameter() -> None:
+    bodies: list[dict] = []
+
+    async def handler(request: Request) -> Response:
+        bodies.append(json.loads(request.content))
+        return Response(400, json={
+            "error": {
+                "message": "temperature is not supported on this model",
+                "type": "invalid_request_error",
+                "param": "temperature",
+                "code": "invalid_parameter",
+            }
+        })
+
+    channel = SimpleNamespace(
+        id=1,
+        type="openai",
+        protocol="openai_responses",
+        base_url="https://example.com/v1",
+        key="secret",
+        extra={},
+        model_mapping={},
+    )
+    request = responses_request_to_chat(ResponsesRequest.model_validate({
+        "model": "test-model",
+        "input": "hello",
+        "prompt_cache_retention": "24h",
+    }))
+
+    async def exercise() -> None:
+        async with AsyncClient(transport=MockTransport(handler)) as client:
+            adapter = AdapterFactory.create_adapter(channel, client)
+            with pytest.raises(HTTPStatusError):
+                await adapter.make_request(request)
+
+    asyncio.run(exercise())
+
+    assert len(bodies) == 1
+
+
 def test_native_responses_resource_methods_preserve_path_query_and_model_mapping() -> None:
     seen: list[Request] = []
 
@@ -392,6 +560,206 @@ def test_native_responses_stream_events_are_forwarded_without_downgrade() -> Non
         "response.completed",
     ]
     assert events[-1]["response"]["usage"]["total_tokens"] == 15
+
+
+def test_cross_protocol_responses_stream_preserves_cache_usage_details() -> None:
+    class EventStream(AsyncByteStream):
+        async def __aiter__(self):
+            event = {
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": 100,
+                        "input_tokens_details": {
+                            "cached_tokens": 60,
+                            "cache_write_tokens": 30,
+                        },
+                        "output_tokens": 5,
+                        "output_tokens_details": {"reasoning_tokens": 3},
+                        "total_tokens": 105,
+                    },
+                },
+            }
+            yield (
+                f"event: response.completed\ndata: {json.dumps(event)}\n\n"
+            ).encode()
+
+    channel = SimpleNamespace(
+        id=1,
+        type="openai",
+        protocol="openai_responses",
+        base_url="https://example.com/v1",
+        key="secret",
+        extra={},
+        model_mapping={},
+    )
+    adapter = AdapterFactory.create_adapter(channel, http_client=None)
+    response = Response(
+        200,
+        stream=EventStream(),
+        request=Request("POST", "https://example.com/v1/responses"),
+    )
+    request = ChatCompletionRequest(
+        model="gpt-5.6-sol",
+        messages=[ChatMessage(role="user", content="hello")],
+        stream=True,
+    )
+
+    async def collect():
+        return [
+            event
+            async for event in adapter.stream_convert_response(response, request)
+        ]
+
+    events = asyncio.run(collect())
+
+    assert events[-1]["usage"]["prompt_tokens_details"] == {
+        "cached_tokens": 60,
+        "cache_write_tokens": 30,
+    }
+    assert events[-1]["usage"]["completion_tokens_details"] == {
+        "reasoning_tokens": 3,
+    }
+
+
+def _collect_stream_events(adapter, response, request):
+    async def collect():
+        return [
+            event
+            async for event in adapter.stream_convert_response(
+                response,
+                responses_request_to_chat(request),
+            )
+        ]
+
+    return asyncio.run(collect())
+
+
+def test_responses_stream_overload_error_raises_upstream_overloaded() -> None:
+    class OverloadedStream(AsyncByteStream):
+        async def __aiter__(self):
+            events = [
+                {"type": "response.created", "response": {"id": "resp_1"}},
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "overloaded_error",
+                        "message": "Our servers are currently overloaded.",
+                    },
+                },
+            ]
+            yield "".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                for event in events
+            ).encode()
+
+    channel = SimpleNamespace(
+        id=1,
+        type="openai",
+        protocol="openai_responses",
+        base_url="https://example.com/v1",
+        key="secret",
+        extra={},
+        model_mapping={},
+    )
+    request = ResponsesRequest.model_validate({
+        "model": "test-model",
+        "input": "hello",
+        "stream": True,
+    })
+    adapter = AdapterFactory.create_adapter(channel, http_client=None)
+    response = Response(
+        200,
+        stream=OverloadedStream(),
+        request=Request("POST", "https://example.com/v1/responses"),
+    )
+
+    with pytest.raises(UpstreamOverloaded) as captured:
+        _collect_stream_events(adapter, response, request)
+
+    assert captured.value.error_type == "overloaded_error"
+
+
+def test_responses_stream_overload_by_wording_raises_upstream_overloaded() -> None:
+    class OverloadedStream(AsyncByteStream):
+        async def __aiter__(self):
+            events = [{
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_1",
+                    "error": {"message": "Upstream is overloaded, retry later"},
+                },
+            }]
+            yield "".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                for event in events
+            ).encode()
+
+    channel = SimpleNamespace(
+        id=1,
+        type="openai",
+        protocol="openai_responses",
+        base_url="https://example.com/v1",
+        key="secret",
+        extra={},
+        model_mapping={},
+    )
+    request = ResponsesRequest.model_validate({
+        "model": "test-model",
+        "input": "hello",
+        "stream": True,
+    })
+    adapter = AdapterFactory.create_adapter(channel, http_client=None)
+    response = Response(
+        200,
+        stream=OverloadedStream(),
+        request=Request("POST", "https://example.com/v1/responses"),
+    )
+
+    with pytest.raises(UpstreamOverloaded):
+        _collect_stream_events(adapter, response, request)
+
+
+def test_responses_stream_parameter_error_still_raises_runtime_error() -> None:
+    class InvalidRequestStream(AsyncByteStream):
+        async def __aiter__(self):
+            events = [{
+                "type": "error",
+                "error": {
+                    "code": "invalid_request_error",
+                    "message": "max_tokens too large",
+                },
+            }]
+            yield "".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                for event in events
+            ).encode()
+
+    channel = SimpleNamespace(
+        id=1,
+        type="openai",
+        protocol="openai_responses",
+        base_url="https://example.com/v1",
+        key="secret",
+        extra={},
+        model_mapping={},
+    )
+    request = ResponsesRequest.model_validate({
+        "model": "test-model",
+        "input": "hello",
+        "stream": True,
+    })
+    adapter = AdapterFactory.create_adapter(channel, http_client=None)
+    response = Response(
+        200,
+        stream=InvalidRequestStream(),
+        request=Request("POST", "https://example.com/v1/responses"),
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        _collect_stream_events(adapter, response, request)
+
+    assert not isinstance(captured.value, UpstreamOverloaded)
 
 
 def test_native_only_responses_features_require_native_channel() -> None:

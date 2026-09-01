@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +30,7 @@ async def save_response_route(
     model: str | None = None,
     status: str | None = None,
     usage_accounted: bool = False,
+    request_started_at: datetime | None = None,
 ) -> ResponseRoute:
     result = await db.execute(
         select(ResponseRoute).where(
@@ -37,10 +40,15 @@ async def save_response_route(
     )
     route = result.scalar_one_or_none()
     if route is None:
+        route_kwargs = {
+            "response_id": response_id,
+            "token_id": token_id,
+            "channel_id": channel_id,
+        }
+        if request_started_at is not None:
+            route_kwargs["created_at"] = request_started_at
         route = ResponseRoute(
-            response_id=response_id,
-            token_id=token_id,
-            channel_id=channel_id,
+            **route_kwargs,
         )
         db.add(route)
     route.channel_id = channel_id

@@ -1,6 +1,6 @@
 // Channels page — card grid with filter + actions.
 
-import { api } from "../api.js";
+import { api } from "../api.js?v=2";
 import { t } from "../i18n.js";
 import {
   escapeHtml, parseCsv, parseJson, badge, statusBadge,
@@ -170,6 +170,9 @@ function renderCard(c) {
             <i data-lucide="more-vertical"></i>
           </button>
           <div class="dropdown-menu ${menuOpen ? "" : "hidden"}" data-menu-for="${c.id}">
+            <button class="dropdown-item" data-channel-probe="${c.id}">
+              <i data-lucide="radar"></i>${t("probeModels")}
+            </button>
             <button class="dropdown-item" data-channel-test="${c.id}">
               <i data-lucide="activity"></i>${t("test")}
             </button>
@@ -252,6 +255,14 @@ export async function onClick(target) {
     return true;
   }
 
+  const probe = target.closest("[data-channel-probe]")?.dataset.channelProbe;
+  if (probe) {
+    state.openMenu = null;
+    render();
+    await probeModels(probe);
+    return true;
+  }
+
   const editId = target.dataset.channelEdit;
   if (editId) {
     const channel = state.channels.find((c) => String(c.id) === String(editId));
@@ -310,4 +321,39 @@ async function runTest(id) {
     state.testResult[id] = { ok: false, message: e.message };
   }
   render();
+}
+
+async function probeModels(id) {
+  try {
+    const result = await api(`/api/admin/channels/${id}/probe-models`, {
+      method: "POST",
+    });
+    const models = result.models || [];
+    const channel = state.channels.find((c) => String(c.id) === String(id));
+    if (!models.length) {
+      toast(t("probeNoModels") || "upstream returned no models", "warning", 5000);
+      return;
+    }
+    const current = (channel?.models || []).join(", ");
+    const next = models.join(", ");
+    const confirmed = current === next
+      || confirm(
+        (t("confirmUpdateModels") || "Update channel models to the probed list?") +
+        `\n\n[${next}]\n\n→ #${id} ${channel?.name || ""}` +
+        (current ? `\n\n${t("currentLabel") || "current"}: [${current}]` : ""),
+      );
+    if (!confirmed) return;
+    await api(`/api/admin/channels/${id}`, {
+      method: "PUT",
+      body: JSON.stringify({ models }),
+    });
+    toast(
+      `${t("updated")} · ${models.length} ${t("foundModels")} ${result.latency_ms} ms`,
+      "success",
+      5000,
+    );
+    await load();
+  } catch (error) {
+    toast(error.message, "error", 5000);
+  }
 }

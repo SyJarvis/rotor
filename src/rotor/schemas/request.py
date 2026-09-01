@@ -69,6 +69,13 @@ class ChatCompletionRequest(BaseModel):
     # Preserve the original Responses request for a native /responses upstream.
     # Cross-protocol adapters consume the normalized messages/tools instead.
     responses_payload: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
+    # Internal cache hints used only when converting another protocol to
+    # OpenAI Responses. They must not leak into generic provider payloads.
+    responses_cacheable_system_content: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        exclude=True,
+    )
+    responses_prompt_cache_key: Optional[str] = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def move_system_messages_to_prefix(self) -> "ChatCompletionRequest":
@@ -278,6 +285,7 @@ class AnthropicUsage(BaseModel):
     output_tokens: int
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
+    cache_creation: Optional[Dict[str, int]] = None
 
 
 class AnthropicMessageResponse(BaseModel):

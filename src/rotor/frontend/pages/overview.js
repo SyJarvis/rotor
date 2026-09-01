@@ -1,9 +1,9 @@
 // Overview page — KPI cards + endpoints + system status.
 
-import { api } from "../api.js";
+import { api } from "../api.js?v=2";
 import { locale, t } from "../i18n.js";
 import {
-  escapeHtml, formatNumber, formatLatency, formatTimeInTimezone, badge, refreshIcons,
+  escapeHtml, formatNumber, formatRequestCount, formatLatency, formatTimeInTimezone, badge, refreshIcons,
   skeletonKpis, copy, toast,
 } from "../ui.js?v=12";
 import { sparkline } from "../charts.js";
@@ -73,8 +73,8 @@ export function render() {
     <div class="kpi-grid">
       <div class="kpi">
         <div class="kpi-label"><i data-lucide="activity"></i>${t("metrics")[0]}</div>
-        <div class="kpi-value">${formatNumber(s.total_requests)}</div>
-        <div class="kpi-delta">${s.success_requests || 0} ${t("successLabel") || "✓"} · ${s.failed_requests || 0} ${t("failedLabel") || "✗"}</div>
+        <div class="kpi-value">${formatRequestCount(s.total_requests)}</div>
+        <div class="kpi-delta">${formatRequestCount(s.success_requests)} ${t("successLabel") || "✓"} · ${formatRequestCount(s.failed_requests)} ${t("failedLabel") || "✗"}</div>
         ${reqSpark}
       </div>
       <div class="kpi">
@@ -86,7 +86,7 @@ export function render() {
       <div class="kpi">
         <div class="kpi-label"><i data-lucide="check-circle"></i>${t("successRate") || "Success rate"}</div>
         <div class="kpi-value">${successRate.toFixed(1)}%</div>
-        <div class="kpi-delta">${s.success_requests || 0} / ${s.total_requests || 0}</div>
+        <div class="kpi-delta">${formatRequestCount(s.success_requests)} / ${formatRequestCount(s.total_requests)}</div>
       </div>
       <div class="kpi">
         <div class="kpi-label"><i data-lucide="gauge"></i>${t("metrics")[7]}</div>
@@ -191,9 +191,9 @@ function renderHealthCard(health) {
         <div><strong>${health.label}</strong><span>${health.detail}</span></div>
       </div>
       <div class="overview-health-metrics">
-        <div><span>${t("recentRequests")}</span><strong>${formatNumber(health.total)}</strong></div>
-        <div><span>${t("successLabel")}</span><strong>${formatNumber(health.succeeded)}</strong></div>
-        <div><span>${t("failedLabel")}</span><strong>${formatNumber(health.failed)}</strong></div>
+        <div><span>${t("recentRequests")}</span><strong>${formatRequestCount(health.total)}</strong></div>
+        <div><span>${t("successLabel")}</span><strong>${formatRequestCount(health.succeeded)}</strong></div>
+        <div><span>${t("failedLabel")}</span><strong>${formatRequestCount(health.failed)}</strong></div>
         <div><span>${t("lastSuccess")}</span><strong title="${escapeHtml(lastSuccessTitle)}">${escapeHtml(lastSuccessText)}</strong></div>
       </div>
     </section>`;

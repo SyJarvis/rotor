@@ -39,6 +39,10 @@ curl http://127.0.0.1:8000/health
 http://127.0.0.1:8000/
 ```
 
+首次启动的管理员账号为 `admin`，默认密码为 `123456`。第一次登录会进入强制改密
+页面，完成修改前不能访问渠道、Token、日志或设置接口。请在把服务绑定到非本机地址
+之前完成此步骤。
+
 ## 默认数据位置
 
 首次通过 CLI 启动时，Rotor 会创建：
@@ -46,10 +50,13 @@ http://127.0.0.1:8000/
 ```text
 ~/.cache/rotor/
 ├── rotor.db
-└── conversations/
+├── conversations/
+└── logs/
+    └── YYYY-MM/
+        └── YYYY-MM-DD.log
 ```
 
-运行时路由设置另存为 `~/.rotor/settings.json`。可以通过环境变量更改数据库和
-会话目录，详见[运行时配置](../operations/configuration.md)。
+运行时路由设置另存为 `~/.rotor/settings.json`。可以通过环境变量更改数据库、
+会话和日志目录，详见[运行时配置](../operations/configuration.md)。
 
 下一步：[完成第一次请求](quickstart.md)。

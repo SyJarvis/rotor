@@ -7,6 +7,10 @@ Channel 表示一个具体的上游调用入口：一个供应商地址、一把
 
 可以在浏览器管理页中添加渠道，也可以调用 `POST /api/admin/channels`：
 
+HTTP 调用需要先按[管理 API 认证](../reference/admin-api.md#认证端点)建立 Session；
+下面的读取示例使用 `ROTOR_ADMIN_COOKIE_JAR`，写操作还需要
+`ROTOR_ADMIN_CSRF`。
+
 ```json
 {
   "name": "zhipu-main",
@@ -61,14 +65,16 @@ Channel 表示一个具体的上游调用入口：一个供应商地址、一把
 获取供应商预设：
 
 ```bash
-curl http://127.0.0.1:8000/api/admin/channels/presets
+curl -b "$ROTOR_ADMIN_COOKIE_JAR" \
+  http://127.0.0.1:8000/api/admin/channels/presets
 ```
 
 普通渠道连通性测试调用上游 `GET /models`，不生成模型内容。显式的能力测试可能
 产生上游费用：
 
 ```bash
-curl -X POST \
+curl -X POST -b "$ROTOR_ADMIN_COOKIE_JAR" \
+  -H "X-CSRF-Token: $ROTOR_ADMIN_CSRF" \
   "http://127.0.0.1:8000/api/admin/channels/1/test?capability=function_call&test_model=your-model"
 ```
 
@@ -77,8 +83,12 @@ curl -X POST \
 ## 启停渠道
 
 ```bash
-curl -X POST http://127.0.0.1:8000/api/admin/channels/1/disable
-curl -X POST http://127.0.0.1:8000/api/admin/channels/1/enable
+curl -X POST -b "$ROTOR_ADMIN_COOKIE_JAR" \
+  -H "X-CSRF-Token: $ROTOR_ADMIN_CSRF" \
+  http://127.0.0.1:8000/api/admin/channels/1/disable
+curl -X POST -b "$ROTOR_ADMIN_COOKIE_JAR" \
+  -H "X-CSRF-Token: $ROTOR_ADMIN_CSRF" \
+  http://127.0.0.1:8000/api/admin/channels/1/enable
 ```
 
 被禁用的渠道不会进入候选集。删除渠道前，应确认没有原生 Responses 对象仍依赖

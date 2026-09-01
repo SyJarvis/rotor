@@ -1,3 +1,4 @@
+import asyncio
 import time
 import uuid
 import logging
@@ -8,6 +9,10 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.database import async_session_maker, get_db
+from rotor.core.client_session import (
+    build_responses_prompt_cache_key,
+    resolve_client_session,
+)
 from rotor.core.deps import get_current_token, get_available_channels
 from rotor.application_settings import application_settings
 from rotor.schemas.request import (
@@ -25,9 +30,14 @@ from rotor.schemas.request import (
     ToolCall,
 )
 from rotor.adapters.factory import AdapterFactory
-from rotor.gateway.accounting import AccountingService
+from rotor.gateway.accounting import AccountingService, StreamingUsageAccumulator
+from rotor.gateway.provider_facts import (
+    extract_capacity_snapshot,
+    extract_capacity_snapshot_from_error,
+)
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
-from rotor.gateway.routing import routing_engine
+from rotor.gateway.routing import routing_engine, session_lease_success_reason
+from rotor.services.session_leases import get_preferred_channel_id
 from rotor.gateway.fallback import (
     retry_after_seconds,
     set_routing_headers,
@@ -88,15 +98,15 @@ def _is_claude_code_billing_header(text: object) -> bool:
     )
 
 
-def _anthropic_system_to_chat_text(
+def _anthropic_system_blocks(
     system: str | list[dict] | None,
-) -> Optional[str]:
-    """Build cross-protocol system text without transient client metadata."""
+) -> list[dict]:
+    """Return system text blocks without transient client metadata."""
     if isinstance(system, str):
         first_line, separator, remainder = system.partition("\n")
         if _is_claude_code_billing_header(first_line.rstrip("\r")):
             system = remainder if separator else ""
-        return system or None
+        return [{"type": "text", "text": system}] if system else []
 
     blocks = system or []
     if (
@@ -108,12 +118,52 @@ def _anthropic_system_to_chat_text(
     ):
         blocks = blocks[1:]
 
-    parts = [
-        block.get("text", "")
+    return [
+        block
         for block in blocks
         if isinstance(block, dict) and block.get("type") == "text"
     ]
+
+
+def _anthropic_system_to_chat_text(
+    system: str | list[dict] | None,
+) -> Optional[str]:
+    """Build cross-protocol system text without transient client metadata."""
+    blocks = _anthropic_system_blocks(system)
+
+    parts = [
+        block.get("text", "")
+        for block in blocks
+    ]
     return "\n".join(parts) or None
+
+
+def _anthropic_system_to_responses_cache_content(
+    system: str | list[dict] | None,
+) -> list[dict] | None:
+    """Map Anthropic system cache markers to GPT-5.6 content blocks."""
+    blocks = _anthropic_system_blocks(system)
+    breakpoint_indexes = [
+        index
+        for index, block in enumerate(blocks)
+        if isinstance(block.get("cache_control"), dict)
+        and block["cache_control"].get("type") == "ephemeral"
+    ]
+    if not breakpoint_indexes:
+        return None
+
+    # The Responses API accepts at most four new explicit breakpoints.
+    enabled_breakpoints = set(breakpoint_indexes[-4:])
+    content: list[dict] = []
+    for index, block in enumerate(blocks):
+        item = {
+            "type": "input_text",
+            "text": f"{block.get('text', '')}{'\n' if index < len(blocks) - 1 else ''}",
+        }
+        if index in enabled_breakpoints:
+            item["prompt_cache_breakpoint"] = {"mode": "explicit"}
+        content.append(item)
+    return content
 
 
 def anthropic_to_openai_request(anthropic_request: AnthropicMessageRequest) -> ChatCompletionRequest:
@@ -134,27 +184,37 @@ def anthropic_to_openai_request(anthropic_request: AnthropicMessageRequest) -> C
                 messages.append(ChatMessage(role=Role.USER, content=content))
                 continue
 
-            text_parts = []
+            text_parts: list[str] = []
+            image_parts: list[dict[str, Any]] = []
+
+            def _flush_user_content() -> None:
+                # Emit text and images as separate user messages: the text
+                # stays a plain string, which Qwen-style chat templates
+                # require when scanning for the user query, while images
+                # become multimodal image_url parts.
+                text = "".join(text_parts)
+                if text:
+                    messages.append(ChatMessage(role=Role.USER, content=text))
+                if image_parts:
+                    messages.append(ChatMessage(role=Role.USER, content=list(image_parts)))
+                text_parts.clear()
+                image_parts.clear()
+
             for block in content:
                 if block.get("type") == "text":
                     text_parts.append(block.get("text", ""))
+                elif block.get("type") == "image":
+                    part = _anthropic_image_to_openai_part(block)
+                    if part is not None:
+                        image_parts.append(part)
                 elif block.get("type") == "tool_result":
-                    if text_parts:
-                        messages.append(ChatMessage(
-                            role=Role.USER,
-                            content="".join(text_parts),
-                        ))
-                        text_parts = []
+                    _flush_user_content()
                     messages.append(ChatMessage(
                         role=Role.TOOL,
                         content=_anthropic_block_content_to_text(block.get("content")),
                         tool_call_id=block.get("tool_use_id"),
                     ))
-            if text_parts:
-                messages.append(ChatMessage(
-                    role=Role.USER,
-                    content="".join(text_parts),
-                ))
+            _flush_user_content()
         elif msg.role == "assistant":
             content = msg.content
             if isinstance(content, str):
@@ -195,6 +255,27 @@ def anthropic_to_openai_request(anthropic_request: AnthropicMessageRequest) -> C
             for tool in anthropic_request.tools
         ]
 
+    # Some providers (Qwen-style chat templates) reject conversations whose
+    # user turns are all tool results or empty content ("No user query found
+    # in messages."). Guarantee one non-empty string user message.
+    has_user_query = any(
+        message.role == Role.USER and isinstance(message.content, str) and message.content.strip()
+        for message in messages
+    )
+    if not has_user_query:
+        if any(message.role == Role.TOOL for message in messages):
+            fallback = "[Continue with the task based on the tool results above.]"
+        elif any(
+            message.role == Role.USER and isinstance(message.content, list)
+            for message in messages
+        ):
+            fallback = "[User sent an image]"
+        else:
+            fallback = "[No user content]"
+        # Insert right after the system prefix so tool results stay last.
+        has_system = any(message.role == Role.SYSTEM for message in messages)
+        messages.insert(1 if has_system else 0, ChatMessage(role=Role.USER, content=fallback))
+
     return ChatCompletionRequest(
         model=anthropic_request.model,
         messages=messages,
@@ -206,6 +287,9 @@ def anthropic_to_openai_request(anthropic_request: AnthropicMessageRequest) -> C
         tools=tools,
         tool_choice=_anthropic_tool_choice_to_openai(anthropic_request.tool_choice),
         anthropic_payload=anthropic_request.model_dump(exclude_none=True),
+        responses_cacheable_system_content=(
+            _anthropic_system_to_responses_cache_content(anthropic_request.system)
+        ),
     )
 
 
@@ -230,6 +314,27 @@ def _anthropic_block_content_to_text(content) -> str:
     return text or json.dumps(content, ensure_ascii=False)
 
 
+def _anthropic_image_to_openai_part(block: dict) -> Optional[dict]:
+    """Convert an Anthropic image block to an OpenAI image_url content part."""
+    source = block.get("source")
+    if not isinstance(source, dict):
+        return None
+    if source.get("type") == "base64":
+        media_type = source.get("media_type") or "image/png"
+        data = source.get("data") or ""
+        if not data:
+            return None
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{media_type};base64,{data}"},
+        }
+    if source.get("type") == "url":
+        url = source.get("url")
+        if isinstance(url, str) and url:
+            return {"type": "image_url", "image_url": {"url": url}}
+    return None
+
+
 def _anthropic_tool_choice_to_openai(tool_choice):
     if not tool_choice:
         return None
@@ -246,6 +351,63 @@ def _anthropic_tool_choice_to_openai(tool_choice):
             "function": {"name": tool_choice["name"]},
         }
     return None
+
+
+def _openai_usage_to_anthropic(usage: dict) -> dict:
+    prompt_details = (
+        usage.get("prompt_tokens_details")
+        or usage.get("input_tokens_details")
+        or {}
+    )
+    prompt_tokens = int(
+        usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+    )
+    cache_read_tokens = int(
+        prompt_details.get("cached_tokens")
+        or usage.get("prompt_cache_hit_tokens")
+        or usage.get("cache_read_input_tokens")
+        or usage.get("cached_tokens")
+        or 0
+    )
+    cache_write_tokens = int(
+        prompt_details.get("cache_write_tokens")
+        or usage.get("cache_creation_input_tokens")
+        or usage.get("cache_write_tokens")
+        or 0
+    )
+    cache_write_5m_tokens = int(
+        prompt_details.get("cache_write_5m_tokens")
+        or usage.get("cache_write_5m_tokens")
+        or 0
+    )
+    cache_write_1h_tokens = int(
+        prompt_details.get("cache_write_1h_tokens")
+        or usage.get("cache_write_1h_tokens")
+        or 0
+    )
+    if "uncached_tokens" in prompt_details:
+        uncached_tokens = int(prompt_details.get("uncached_tokens") or 0)
+    elif "prompt_cache_miss_tokens" in usage:
+        uncached_tokens = int(usage.get("prompt_cache_miss_tokens") or 0)
+    else:
+        uncached_tokens = max(
+            prompt_tokens - cache_read_tokens - cache_write_tokens,
+            0,
+        )
+    result = {
+        "input_tokens": uncached_tokens,
+        "output_tokens": int(
+            usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        ),
+        "cache_creation_input_tokens": cache_write_tokens,
+        "cache_read_input_tokens": cache_read_tokens,
+    }
+    if cache_write_5m_tokens or cache_write_1h_tokens:
+        result["cache_creation"] = {
+            "ephemeral_5m_input_tokens": cache_write_5m_tokens,
+            "ephemeral_1h_input_tokens": cache_write_1h_tokens,
+        }
+    return result
 
 
 def openai_to_anthropic_response(openai_response: dict, model: str) -> dict:
@@ -295,13 +457,9 @@ def openai_to_anthropic_response(openai_response: dict, model: str) -> dict:
     stop_reason = finish_reason_map.get(choice.get("finish_reason", "stop"), "end_turn")
 
     # Convert usage
-    usage = openai_response.get("usage") or {}
-    prompt_details = usage.get("prompt_tokens_details") or {}
-    anthropic_usage = {
-        "input_tokens": usage.get("prompt_tokens", 0),
-        "output_tokens": usage.get("completion_tokens", 0),
-        "cache_read_input_tokens": int(prompt_details.get("cached_tokens") or 0),
-    }
+    anthropic_usage = _openai_usage_to_anthropic(
+        openai_response.get("usage") or {}
+    )
 
     return {
         "id": openai_response.get("id", f"msg_{uuid.uuid4().hex[:24]}"),
@@ -436,17 +594,14 @@ class OpenAIToAnthropicStreamConverter:
             "tool_calls": "tool_use",
             "content_filter": "stop_sequence",
         }
-        usage = usage or {}
+        anthropic_usage = _openai_usage_to_anthropic(usage or {})
         events.append({
             "type": "message_delta",
             "delta": {
                 "stop_reason": stop_reason_map.get(finish_reason, "end_turn"),
                 "stop_sequence": None,
             },
-            "usage": {
-                "output_tokens": usage.get("completion_tokens", 0),
-                "cache_read_input_tokens": int(usage.get("cached_tokens") or 0),
-            },
+            "usage": anthropic_usage,
         })
         events.append({"type": "message_stop"})
         return events
@@ -485,15 +640,38 @@ async def messages(
     # Record start time
     start_time = time.time()
     request_id = http_request.headers.get("X-Request-Id") or f"req_{uuid.uuid4().hex}"
-    conversation_id = (
-        http_request.headers.get("X-Conversation-Id")
-        or (request.metadata or {}).get("user_id")
-        or f"conv_{uuid.uuid4().hex[:24]}"
+    client_session = resolve_client_session(
+        http_request.headers,
+        metadata=request.metadata,
     )
+    internal_request.responses_prompt_cache_key = build_responses_prompt_cache_key(
+        token_id=token.id,
+        model=request.model,
+        session_id=client_session.session_id,
+    )
+    conversation_id = client_session.session_id or f"conv_{uuid.uuid4().hex[:24]}"
     client_ip = http_request.client.host if http_request.client else "unknown"
     request_origin = getattr(http_request.state, "request_origin", "client")
     agent_run_id = getattr(http_request.state, "agent_run_id", None)
-    affinity_used = application_settings.get().routing.affinity_enabled
+    routing_settings = application_settings.get().routing
+    lease_session_id = (
+        client_session.session_id
+        if routing_settings.affinity_enabled
+        and routing_settings.session_lease_enabled
+        else None
+    )
+    preferred_channel_id = await get_preferred_channel_id(
+        db,
+        token_id=token.id,
+        session_id=lease_session_id,
+        logical_model=request.model,
+    )
+    affinity_key = (
+        client_session.affinity_key(token.id)
+        if routing_settings.affinity_enabled
+        else None
+    )
+    affinity_used = affinity_key is not None
     required_capabilities = {"stream"} if request.stream else set()
     routing_decision = routing_engine.route(
         channels,
@@ -501,7 +679,8 @@ async def messages(
         token=token,
         request_protocol="anthropic_messages",
         required_capabilities=required_capabilities,
-        affinity_key=conversation_id if affinity_used else None,
+        affinity_key=affinity_key,
+        preferred_channel_id=preferred_channel_id,
     )
     accounting_service.record_routing_decision(
         db,
@@ -516,12 +695,14 @@ async def messages(
             "stream": bool(request.stream),
             "message_count": len(request.messages),
             "has_tools": bool(request.tools),
+            **client_session.routing_features(),
         },
     )
     await db.commit()
 
     # Try to get a response from available channels
     http_client = AsyncClient(timeout=120.0)
+    streaming_response_returned = False
     last_error = None
 
     conversation_handle = await conversation_store.start(
@@ -558,8 +739,15 @@ async def messages(
                         conversation_id, response, conversation_handle,
                         native_anthropic_stream=native_anthropic,
                         attempt_context=attempt_context,
+                        lease_session_id=lease_session_id,
+                        lease_migration_reason=session_lease_success_reason(
+                            routing_decision, attempt
+                        ),
                     )
                     set_routing_headers(result, channel, request.model, attempt > 0)
+                    # Ownership of http_client transfers to the streaming
+                    # generator, which closes it in its own finally block.
+                    streaming_response_returned = True
                     return result
                 else:
                     set_routing_headers(
@@ -569,6 +757,10 @@ async def messages(
                         request, internal_request, adapter, channel, token, db, start_time,
                         http_request, request_id, conversation_id, conversation_handle,
                         attempt_context=attempt_context,
+                        lease_session_id=lease_session_id,
+                        lease_migration_reason=session_lease_success_reason(
+                            routing_decision, attempt
+                        ),
                     )
 
             except (HTTPStatusError, RequestError) as e:
@@ -601,6 +793,7 @@ async def messages(
                     latency_ms=latency_ms,
                     client_ip=client_ip,
                     provider_response=upstream_error_payload(e),
+                    capacity_snapshot=extract_capacity_snapshot_from_error(e),
                 )
                 if conversation_handle:
                     await conversation_store.append_error(
@@ -634,6 +827,7 @@ async def messages(
                     error_message=format_error_message(e),
                     latency_ms=latency_ms,
                     client_ip=client_ip,
+                    capacity_snapshot=extract_capacity_snapshot_from_error(e),
                 )
                 if conversation_handle:
                     await conversation_store.append_error(
@@ -644,8 +838,11 @@ async def messages(
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)
                 raise
     finally:
-        # Close client for non-streaming requests (streaming closes it in the handler)
-        if not request.stream:
+        # Close the client unless a streaming response took ownership of it.
+        # This covers non-streaming requests and streaming requests whose
+        # make_request() failed on every candidate (the generator that would
+        # normally close the client never started).
+        if not streaming_response_returned:
             await http_client.aclose()
 
     # All channels failed
@@ -672,6 +869,8 @@ async def _handle_non_streaming_request(
     conversation_id: str,
     conversation_handle: ConversationHandle,
     attempt_context: AttemptContext | None = None,
+    lease_session_id: str | None = None,
+    lease_migration_reason: str = "request_success",
 ) -> dict:
     """Handle non-streaming Anthropic message request."""
     # Make the request
@@ -712,6 +911,16 @@ async def _handle_non_streaming_request(
         usage=usage,
         latency_ms=latency_ms,
         client_ip=client_ip,
+        capacity_snapshot=extract_capacity_snapshot(
+            getattr(response, "headers", {})
+        ),
+        tariff_at=(
+            attempt_context.started_at
+            if attempt_context is not None
+            else start_time
+        ),
+        lease_session_id=lease_session_id,
+        lease_migration_reason=lease_migration_reason,
     )
     await conversation_store.append_response(conversation_handle, response_data)
     await conversation_store.append_usage(
@@ -740,6 +949,8 @@ async def _handle_streaming_request(
     conversation_handle: ConversationHandle,
     native_anthropic_stream: bool = False,
     attempt_context: AttemptContext | None = None,
+    lease_session_id: str | None = None,
+    lease_migration_reason: str = "request_success",
 ) -> StreamingResponse:
     """Handle streaming Anthropic message request."""
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -753,10 +964,7 @@ async def _handle_streaming_request(
         """Generator for streaming responses in Anthropic SSE format."""
         try:
             # Track token usage for streaming
-            input_tokens = 0
-            output_tokens = 0
-            cached_tokens = 0
-            has_provider_usage = False
+            stream_usage = StreamingUsageAccumulator()
             collected_text: list[str] = []
             collected_tool_calls: list[dict] = []
             last_finish_reason: str | None = None
@@ -782,6 +990,13 @@ async def _handle_streaming_request(
             if not native_anthropic_stream:
                 yield f"event: message_start\ndata: {_json_dumps(start_event)}\n\n"
 
+            def observe_usage(provider_usage: dict) -> None:
+                if not provider_usage:
+                    return
+                stream_usage.observe(accounting_service.extract_usage(
+                    {"usage": provider_usage}
+                ))
+
             # Convert and stream chunks
             stream_converter = OpenAIToAnthropicStreamConverter()
             native_message: dict | None = None
@@ -792,16 +1007,10 @@ async def _handle_streaming_request(
                     if event_type == "message_start":
                         native_message = openai_chunk.get("message") or native_message
                         usage = (openai_chunk.get("message") or {}).get("usage") or {}
-                        input_tokens = max(input_tokens, usage.get("input_tokens", 0))
-                        output_tokens = max(output_tokens, usage.get("output_tokens", 0))
-                        cached_tokens = max(cached_tokens, usage.get("cache_read_input_tokens", 0))
-                        has_provider_usage = has_provider_usage or bool(usage)
+                        observe_usage(usage)
                     elif event_type == "message_delta":
                         usage = openai_chunk.get("usage") or {}
-                        input_tokens = max(input_tokens, usage.get("input_tokens", 0))
-                        output_tokens = max(output_tokens, usage.get("output_tokens", 0))
-                        cached_tokens = max(cached_tokens, usage.get("cache_read_input_tokens", 0))
-                        has_provider_usage = has_provider_usage or bool(usage)
+                        observe_usage(usage)
                         if openai_chunk.get("delta", {}).get("stop_reason"):
                             last_finish_reason = openai_chunk["delta"]["stop_reason"]
                     continue
@@ -821,35 +1030,39 @@ async def _handle_streaming_request(
 
                 # Try to extract usage info if available
                 usage = openai_chunk.get("usage") or {}
-                if usage:
-                    has_provider_usage = True
-                input_tokens = max(input_tokens, usage.get("prompt_tokens", 0))
-                output_tokens = max(output_tokens, usage.get("completion_tokens", 0))
-                prompt_details = usage.get("prompt_tokens_details") or {}
-                cached_tokens = max(cached_tokens, int(prompt_details.get("cached_tokens") or 0))
+                observe_usage(usage)
 
                 for event in stream_converter.feed(openai_chunk):
                     event_type = event["type"]
                     yield f"event: {event_type}\ndata: {_json_dumps(event)}\n\n"
+
+            input_tokens = stream_usage.prompt_tokens
+            output_tokens = stream_usage.completion_tokens
+            cached_tokens = stream_usage.cached_tokens
+            uncached_input_tokens = stream_usage.uncached_input_tokens
+            cache_write_tokens = stream_usage.cache_write_tokens
+            cache_write_5m_tokens = stream_usage.cache_write_5m_tokens
+            cache_write_1h_tokens = stream_usage.cache_write_1h_tokens
 
             if not native_anthropic_stream:
                 for event in stream_converter.finish(
                     usage={
                         "prompt_tokens": input_tokens,
                         "completion_tokens": output_tokens,
-                        "cached_tokens": cached_tokens,
+                        "prompt_tokens_details": {
+                            "cached_tokens": cached_tokens,
+                            "cache_write_tokens": cache_write_tokens,
+                            "cache_write_5m_tokens": cache_write_5m_tokens,
+                            "cache_write_1h_tokens": cache_write_1h_tokens,
+                            "uncached_tokens": uncached_input_tokens,
+                        },
                     },
                 ):
                     event_type = event["type"]
                     yield f"event: {event_type}\ndata: {_json_dumps(event)}\n\n"
 
             total_tokens = input_tokens + output_tokens
-            usage = accounting_service.streaming_usage(
-                prompt_tokens=input_tokens,
-                completion_tokens=output_tokens,
-                has_provider_usage=has_provider_usage,
-                cached_tokens=cached_tokens,
-            )
+            usage = stream_usage.to_usage_data(accounting_service)
             latency_ms = int((time.time() - start_time) * 1000)
             client_ip = http_request.client.host if http_request.client else "unknown"
             async with async_session_maker() as stream_db:
@@ -880,6 +1093,16 @@ async def _handle_streaming_request(
                     usage=usage,
                     latency_ms=latency_ms,
                     client_ip=client_ip,
+                    capacity_snapshot=extract_capacity_snapshot(
+                        getattr(response, "headers", {})
+                    ),
+                    tariff_at=(
+                        attempt_context.started_at
+                        if attempt_context is not None
+                        else start_time
+                    ),
+                    lease_session_id=lease_session_id,
+                    lease_migration_reason=lease_migration_reason,
                 )
                 await stream_db.commit()
             if native_anthropic_stream:
@@ -904,14 +1127,55 @@ async def _handle_streaming_request(
                     "usage": {
                         "prompt_tokens": input_tokens,
                         "completion_tokens": output_tokens,
+                        "prompt_tokens_details": {
+                            "cached_tokens": cached_tokens,
+                            "cache_write_tokens": cache_write_tokens,
+                            "cache_write_5m_tokens": cache_write_5m_tokens,
+                            "cache_write_1h_tokens": cache_write_1h_tokens,
+                            "uncached_tokens": uncached_input_tokens,
+                        },
                     },
                 })
             await conversation_store.append_usage(conversation_handle, {
                 "prompt_tokens": input_tokens,
                 "completion_tokens": output_tokens,
                 "total_tokens": total_tokens,
+                "prompt_tokens_details": {
+                    "cached_tokens": cached_tokens,
+                    "cache_write_tokens": cache_write_tokens,
+                    "cache_write_5m_tokens": cache_write_5m_tokens,
+                    "cache_write_1h_tokens": cache_write_1h_tokens,
+                    "uncached_tokens": uncached_input_tokens,
+                },
             })
             await conversation_store.finish(conversation_handle, "success", latency_ms)
+
+        except asyncio.CancelledError:
+            latency_ms = int((time.time() - start_time) * 1000)
+            try:
+                if attempt_context is not None:
+                    await attempt_recorder.record(
+                        context=attempt_context,
+                        request_id=request_id,
+                        channel=channel,
+                        requested_model=anthropic_request.model,
+                        provider_model=adapter.map_model_name(
+                            anthropic_request.model
+                        ),
+                        request_protocol="anthropic_messages",
+                        outcome="cancelled",
+                    )
+            except Exception:
+                logger.exception(
+                    "Recording cancelled attempt failed for request_id=%s",
+                    request_id,
+                )
+            await conversation_store.finish(
+                conversation_handle,
+                "cancelled",
+                latency_ms,
+            )
+            raise
 
         except Exception as e:
             logger.error(f"Streaming error: {format_error_message(e)}")
@@ -919,11 +1183,8 @@ async def _handle_streaming_request(
                 routing_engine.mark_unavailable(anthropic_request.model, channel)
             latency_ms = int((time.time() - start_time) * 1000)
             client_ip = http_request.client.host if http_request.client else "unknown"
-            async with async_session_maker() as stream_db:
-                if (
-                    attempt_context is not None
-                    and isinstance(e, (HTTPStatusError, RequestError))
-                ):
+            try:
+                if attempt_context is not None:
                     await attempt_recorder.record(
                         context=attempt_context,
                         request_id=request_id,
@@ -939,20 +1200,36 @@ async def _handle_streaming_request(
                             phase=ErrorPhase.PROVIDER_STREAM,
                         ),
                     )
-                await accounting_service.record_failure(
-                    stream_db,
-                    request_id=request_id,
-                    conversation_id=conversation_id,
-                    request_protocol="anthropic_messages",
-                    token=token,
-                    channel=channel,
-                    model=anthropic_request.model,
-                    error_code=type(e).__name__,
-                    error_message=format_error_message(e),
-                    latency_ms=latency_ms,
-                    client_ip=client_ip,
+            except Exception:
+                logger.exception(
+                    "Recording failed attempt failed for request_id=%s",
+                    request_id,
                 )
-                await stream_db.commit()
+            try:
+                async with async_session_maker() as stream_db:
+                    await accounting_service.record_failure(
+                        stream_db,
+                        request_id=request_id,
+                        conversation_id=conversation_id,
+                        request_protocol="anthropic_messages",
+                        token=token,
+                        channel=channel,
+                        model=anthropic_request.model,
+                        error_code=type(e).__name__,
+                        error_message=format_error_message(e),
+                        latency_ms=latency_ms,
+                        client_ip=client_ip,
+                        capacity_snapshot=(
+                            extract_capacity_snapshot_from_error(e)
+                        ),
+                    )
+                    await stream_db.commit()
+            except Exception:
+                logger.exception(
+                    "Accounting record_failure failed for request_id=%s; "
+                    "sending error event to client anyway",
+                    request_id,
+                )
             await conversation_store.append_error(
                 conversation_handle, type(e).__name__, format_error_message(e)
             )

@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from sqlalchemy import event
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import DeclarativeBase
@@ -81,6 +81,53 @@ async def get_db() -> AsyncSession:
 
 
 async def init_db():
-    """Initialize database tables."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """Migrate the database and ensure the default administrator exists."""
+    from rotor.migrations.runner import run_startup_migrations
+
+    await asyncio.to_thread(run_startup_migrations, settings.DATABASE_URL)
+
+    from rotor.core.admin_auth import ensure_default_admin
+
+    async with async_session_maker() as session:
+        admin = await ensure_default_admin(session)
+        if admin.must_change_password:
+            logger.warning(
+                "Default administrator password must be changed before "
+                "the management API can be used"
+            )
+
+
+_USAGE_FACT_COLUMNS = {
+    "uncached_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "cache_write_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "cache_write_5m_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "cache_write_1h_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "usage_schema_version": "VARCHAR(10) NOT NULL DEFAULT '1'",
+    "capacity_snapshot": "JSON",
+    "cache_scope": "VARCHAR(100)",
+    "capacity_scope": "VARCHAR(100)",
+    "billing_scope": "VARCHAR(100)",
+    "currency": "VARCHAR(10) NOT NULL DEFAULT 'USD'",
+    "cost_status": "VARCHAR(30) NOT NULL DEFAULT 'unknown'",
+    "tariff_version": "VARCHAR(100)",
+    "tariff_period": "VARCHAR(100)",
+    "tariff_snapshot": "JSON",
+}
+
+
+def _ensure_usage_fact_columns(connection) -> None:
+    """Add phase-2 usage columns to databases created before this release."""
+    schema = inspect(connection)
+    for table_name in ("usage_ledger", "request_logs"):
+        if not schema.has_table(table_name):
+            continue
+        existing = {
+            column["name"] for column in schema.get_columns(table_name)
+        }
+        for column_name, definition in _USAGE_FACT_COLUMNS.items():
+            if column_name in existing:
+                continue
+            connection.execute(text(
+                f'ALTER TABLE "{table_name}" ADD COLUMN '
+                f'"{column_name}" {definition}'
+            ))

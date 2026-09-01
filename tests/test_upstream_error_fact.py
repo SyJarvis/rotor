@@ -1,6 +1,10 @@
 import httpx
 
-from rotor.core.exceptions import normalize_upstream_error
+from rotor.core.exceptions import (
+    UpstreamOverloaded,
+    is_overload_error_signal,
+    normalize_upstream_error,
+)
 from rotor.schemas.error import ErrorCategory, ErrorPhase
 
 
@@ -109,3 +113,43 @@ def test_normalize_upstream_error_detects_explicit_missing_model() -> None:
 
     assert fact.code == "upstream_model_not_found"
     assert fact.category == ErrorCategory.MODEL_NOT_FOUND
+
+
+def test_normalize_upstream_error_classifies_stream_overload_as_fallbackable() -> None:
+    fact = normalize_upstream_error(
+        UpstreamOverloaded(
+            "Our servers are currently overloaded. Please try again later.",
+            error_type="overloaded_error",
+        )
+    )
+
+    assert fact.code == "upstream_overloaded"
+    assert fact.category == ErrorCategory.UPSTREAM_AVAILABILITY
+    assert fact.fallback_allowed is True
+    assert fact.retry_same_channel is False
+    assert fact.retryable is True
+    assert fact.message == (
+        "Our servers are currently overloaded. Please try again later."
+    )
+
+
+def test_is_overload_error_signal_matches_explicit_types_and_prefixes() -> None:
+    assert is_overload_error_signal("overloaded_error", None)
+    assert is_overload_error_signal("Overloaded", None)
+    assert is_overload_error_signal("rate_limit", None)
+    assert is_overload_error_signal("rate_limit_exceeded", None)
+    assert is_overload_error_signal("Too_Many_Requests", None)
+
+
+def test_is_overload_error_signal_matches_message_wording() -> None:
+    assert is_overload_error_signal(
+        None, "Our servers are currently Overloaded. Please try again later."
+    )
+    assert is_overload_error_signal("api_error", "upstream is overloaded right now")
+
+
+def test_is_overload_error_signal_rejects_parameter_and_auth_errors() -> None:
+    assert not is_overload_error_signal("invalid_request_error", "max_tokens too large")
+    assert not is_overload_error_signal("authentication_error", "invalid api key")
+    assert not is_overload_error_signal(None, "internal server error")
+    assert not is_overload_error_signal(None, None)

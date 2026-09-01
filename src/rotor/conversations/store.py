@@ -76,6 +76,10 @@ class ConversationStore:
     def __init__(self) -> None:
         self._queue: Optional[asyncio.Queue[_Event]] = None
         self._worker_task: Optional[asyncio.Task[None]] = None
+        # Drop observability: queue-full and retry-exhausted counters so the
+        # loss rate is visible without guessing from logs.
+        self.dropped_queue_full: int = 0
+        self.dropped_retry_exhausted: int = 0
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -289,15 +293,38 @@ class ConversationStore:
     # ------------------------------------------------------------------ #
     # Worker
     # ------------------------------------------------------------------ #
+    def drop_stats(self) -> dict[str, int]:
+        """Cumulative dropped-event counters (queue-full / retry-exhausted)."""
+        return {
+            "dropped_queue_full": self.dropped_queue_full,
+            "dropped_retry_exhausted": self.dropped_retry_exhausted,
+        }
+
+    def status(self) -> dict[str, object]:
+        """Runtime health snapshot for observability endpoints."""
+        from rotor.config import settings as config_settings
+
+        return {
+            "enabled": config_settings.CONVERSATION_STORE_ENABLED,
+            "worker_running": self._worker_task is not None
+            and not self._worker_task.done(),
+            "queue_size": self._queue.qsize() if self._queue is not None else 0,
+            "queue_maxsize": config_settings.CONVERSATION_QUEUE_MAXSIZE,
+            **self.drop_stats(),
+        }
+
     def _enqueue(self, ev: _Event) -> None:
         assert self._queue is not None, "ConversationStore.attach() not called"
         try:
             self._queue.put_nowait(ev)
         except asyncio.QueueFull:
+            self.dropped_queue_full += 1
             logger.warning(
-                "Conversation queue full (maxsize=%d), dropping kind=%s",
+                "Conversation queue full (maxsize=%d), dropping kind=%s "
+                "(dropped_total=%d)",
                 settings.CONVERSATION_QUEUE_MAXSIZE,
                 ev.kind,
+                self.dropped_queue_full + self.dropped_retry_exhausted,
             )
 
     async def _worker(self) -> None:
@@ -320,7 +347,14 @@ class ConversationStore:
                 ev.attempt += 1
                 self._enqueue(ev)
             else:
-                logger.error("Dropping event kind=%s after %d attempts", ev.kind, _MAX_ATTEMPTS)
+                self.dropped_retry_exhausted += 1
+                logger.error(
+                    "Dropping event kind=%s after %d attempts "
+                    "(dropped_total=%d)",
+                    ev.kind,
+                    _MAX_ATTEMPTS,
+                    self.dropped_queue_full + self.dropped_retry_exhausted,
+                )
 
     async def _process(self, db: AsyncSession, ev: _Event) -> None:
         # File write — only on commit, one complete line per request.

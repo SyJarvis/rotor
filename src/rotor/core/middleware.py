@@ -9,6 +9,15 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _header_value(scope: Scope, name: str) -> str | None:
+    """Read a header from the raw ASGI scope (names are lowercase bytes)."""
+    wanted = name.lower().encode("latin-1")
+    for key, value in scope.get("headers") or []:
+        if key == wanted:
+            return value.decode("latin-1")
+    return None
+
+
 class LoggingMiddleware:
     """Middleware for logging requests and responses."""
 
@@ -31,12 +40,14 @@ class LoggingMiddleware:
         path = scope.get("path", "")
         client = scope.get("client")
         client_host = client[0] if client else "unknown"
+        user_agent = _header_value(scope, "user-agent") or "-"
 
         logger.info(
-            "Request: %s %s from %s",
+            "Request: %s %s from %s UA=%s",
             method,
             path,
             client_host,
+            user_agent[:200],
         )
 
         async def send_with_logging(message: Message) -> None:

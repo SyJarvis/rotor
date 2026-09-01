@@ -1,7 +1,12 @@
 // MindAgent chat page — local conversation history + streaming Rotor responses.
 
 import { t } from "../i18n.js";
-import { copyText } from "../api.js";
+import {
+  adminCsrfHeaders,
+  api,
+  copyText,
+  handleAdminUnauthorized,
+} from "../api.js?v=2";
 import { escapeHtml, refreshIcons, toast } from "../ui.js";
 
 const STORAGE_KEY = "rotor.mindagent.conversations.v1";
@@ -522,9 +527,7 @@ function setGenerating(generating) {
 }
 
 async function refreshModels() {
-  const response = await fetch("/api/admin/mindagent/models");
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-  status = await response.json();
+  status = await api("/api/admin/mindagent/models");
   models = status.models || [];
   renderModels();
   if (!status.mindagent_available) setRuntimeStatus(t("mindagentUnavailable"));
@@ -584,6 +587,7 @@ async function sendMessage() {
       headers: {
         "Content-Type": "application/json",
         "X-Conversation-Id": conversation.id,
+        ...adminCsrfHeaders(),
       },
       body: JSON.stringify({
         conversation_id: conversation.id,
@@ -600,6 +604,7 @@ async function sendMessage() {
       }),
       signal: abortController.signal,
     });
+    handleAdminUnauthorized(response);
     if (!response.ok) throw new Error(await response.text() || `${response.status} ${response.statusText}`);
     if (!response.body) throw new Error(t("streamUnavailable"));
 

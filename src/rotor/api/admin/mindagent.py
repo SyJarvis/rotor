@@ -271,6 +271,7 @@ async def _build_rotor_mcp_registry(run_id: str):
         allowed_tools={
             "rotor_get_channel",
             "rotor_get_request_trace",
+            "rotor_evaluate_session_leases",
             "rotor_list_channels",
             "rotor_list_model_usage",
             "rotor_list_recent_failures",
@@ -291,6 +292,11 @@ async def _run_mindagent(
 
     event_queue: asyncio.Queue[str] = asyncio.Queue()
     run_id = f"chat-{uuid.uuid4().hex}"
+    # Mark in-process gateway calls so their attempts are recorded with
+    # request_origin="rotor_agent" and this run id, which keeps the
+    # agent's own failures out of its recent-failures view.
+    http_request.state.request_origin = "rotor_agent"
+    http_request.state.agent_run_id = run_id
 
     async def handle_event(event) -> None:
         if event.event_type == EventType.TEXT_DELTA:

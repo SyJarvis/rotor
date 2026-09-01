@@ -169,6 +169,33 @@ class RotorControlClient:
             )
         return payload
 
+    async def evaluate_session_leases(
+        self,
+        *,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._get(
+            "/usage/session-leases",
+            params={
+                "start_time": (
+                    start_time.isoformat() if start_time else None
+                ),
+                "end_time": end_time.isoformat() if end_time else None,
+                "model": model,
+            },
+        )
+        if not isinstance(payload.get("data"), dict) or not isinstance(
+            payload.get("window"),
+            dict,
+        ):
+            raise InvalidControlAPIResponse(
+                "Rotor Control API returned an invalid Session Lease "
+                "evaluation"
+            )
+        return payload
+
     async def _get(
         self,
         path: str,

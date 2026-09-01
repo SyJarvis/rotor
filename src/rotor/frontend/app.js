@@ -2,17 +2,17 @@
 
 import { t, applyLocale, toggleLocale } from "./i18n.js";
 import { toggleTheme } from "./theme.js";
-import { api, copyText } from "./api.js";
+import { api, copyText } from "./api.js?v=2";
 import { parseCsv, parseJson, refreshIcons, toast } from "./ui.js?v=12";
 import { refreshTheme } from "./charts.js?v=8";
 
-import * as overview from "./pages/overview.js?v=3";
+import * as overview from "./pages/overview.js?v=5";
 import * as channels from "./pages/channels.js";
 import { editState as channelEditState } from "./pages/channels.js";
 import * as tokens from "./pages/tokens.js?v=9";
 import * as usage from "./pages/usage.js?v=12";
 import * as logs from "./pages/logs.js?v=3";
-import * as mindagent from "./pages/mindagent.js?v=14";
+import * as mindagent from "./pages/mindagent.js?v=15";
 
 const PAGES = { overview, channels, tokens, usage, logs, mindagent };
 const TITLES = {
@@ -177,15 +177,21 @@ document.getElementById("closeChannelModal")?.addEventListener("click", () => {
 /* ---------- settings modal ---------- */
 const settingsModal = document.getElementById("settingsModal");
 const settingsForm = document.getElementById("settingsForm");
+let currentApplicationSettings = null;
 
 async function openSettings() {
   settingsModal.classList.remove("hidden");
   closeSidebar();
   try {
     const currentSettings = await api("/api/admin/settings");
+    currentApplicationSettings = currentSettings;
     settingsForm.elements.strategy.value = currentSettings.routing.strategy;
     settingsForm.elements.affinity_enabled.checked =
       currentSettings.routing.affinity_enabled;
+    settingsForm.elements.session_lease_enabled.checked =
+      currentSettings.routing.session_lease_enabled;
+    settingsForm.elements.session_lease_idle_ttl_seconds.value =
+      currentSettings.routing.session_lease_idle_ttl_seconds;
     settingsForm.elements.display_timezone.value =
       currentSettings.display_timezone;
     document.getElementById("settingsPath").textContent =
@@ -207,8 +213,14 @@ settingsForm?.addEventListener("submit", async (event) => {
       method: "PUT",
       body: JSON.stringify({
         routing: {
+          ...(currentApplicationSettings?.routing || {}),
           strategy: settingsForm.elements.strategy.value,
           affinity_enabled: settingsForm.elements.affinity_enabled.checked,
+          session_lease_enabled:
+            settingsForm.elements.session_lease_enabled.checked,
+          session_lease_idle_ttl_seconds: Number(
+            settingsForm.elements.session_lease_idle_ttl_seconds.value,
+          ),
         },
         display_timezone: settingsForm.elements.display_timezone.value,
       }),
@@ -216,6 +228,7 @@ settingsForm?.addEventListener("submit", async (event) => {
     for (const page of Object.values(PAGES)) {
       page.setDisplayTimezone?.(savedSettings.display_timezone);
     }
+    currentApplicationSettings = savedSettings;
     settingsModal.classList.add("hidden");
     toast(t("settingsSaved"), "success");
     refreshActive();
@@ -226,26 +239,42 @@ settingsForm?.addEventListener("submit", async (event) => {
   }
 });
 
-document.getElementById("probeModels")?.addEventListener("click", async () => {
-  const form = new FormData(document.getElementById("channelForm"));
-  const payload = {
-    base_url: form.get("base_url"),
-    key: form.get("key"),
-    type: form.get("type"),
-    protocol: form.get("protocol"),
-    models_path: form.get("models_path"),
-    auth_type: form.get("auth_type"),
-  };
-  if (!payload.base_url || !payload.key) {
-    toast(t("requireProbeFields"), "warning");
-    return;
-  }
+document.getElementById("probeModels")?.addEventListener("click", async (event) => {
+  const form = document.getElementById("channelForm");
+  const keyInput = form?.elements.key?.value?.trim();
+  const channelId = channelEditState.id;
+  // Editing a saved channel with a blank key field → probe with the stored key.
+  const useSaved = channelId && !keyInput;
+  const button = event.currentTarget;
+  if (button.disabled) return;
+  button.disabled = true;
+  const original = button.innerHTML;
+  button.innerHTML = `<i data-lucide="loader-2" class="spin"></i>${t("probing") || "..."}`;
+  refreshIcons(button);
   try {
-    const result = await api("/api/admin/channels/probe-models", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    document.getElementById("channelForm").elements.models.value = result.models.join(", ");
+    let result;
+    if (useSaved) {
+      result = await api(`/api/admin/channels/${channelId}/probe-models`, {
+        method: "POST",
+      });
+    } else {
+      result = await api("/api/admin/channels/probe-models", {
+        method: "POST",
+        body: JSON.stringify({
+          base_url: form.elements.base_url.value.trim(),
+          key: keyInput,
+          type: form.elements.type.value,
+          protocol: form.elements.protocol.value,
+          extra: {
+            ...parseJson(form.elements.extra.value, {}),
+            models_path: form.elements.models_path.value.trim(),
+            request_path: form.elements.request_path.value.trim(),
+            auth_type: form.elements.auth_type.value,
+          },
+        }),
+      });
+    }
+    form.elements.models.value = result.models.join(", ");
     const probeResult = document.getElementById("probeResult");
     probeResult.textContent = `${result.models.length} ${t("foundModels")} ${result.latency_ms} ms`;
     probeResult.className = "inline-result success";
@@ -253,6 +282,10 @@ document.getElementById("probeModels")?.addEventListener("click", async () => {
     const probeResult = document.getElementById("probeResult");
     probeResult.textContent = e.message;
     probeResult.className = "inline-result error";
+  } finally {
+    button.disabled = false;
+    button.innerHTML = original;
+    refreshIcons(button);
   }
 });
 

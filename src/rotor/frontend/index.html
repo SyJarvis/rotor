@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
-    <link rel="stylesheet" href="/styles.css?v=16">
+    <link rel="stylesheet" href="/styles.css?v=18">
     <script>
       // FOUC guard — must run before body paints.
       (function () {
@@ -31,7 +31,7 @@
       defer
     ></script>
   </head>
-  <body>
+  <body class="auth-pending">
     <div class="app-shell">
       <aside class="sidebar" id="sidebar">
         <div class="brand">
@@ -103,6 +103,9 @@
             </button>
             <button class="icon-btn" id="localeToggle" title="Language">
               <span id="localeLabel">EN</span>
+            </button>
+            <button class="icon-btn" id="logoutBtn" title="退出登录" data-i18n-title="signOut">
+              <i data-lucide="log-out"></i>
             </button>
           </div>
         </header>
@@ -256,9 +259,21 @@
                 <label class="setting-toggle">
                   <span>
                     <strong data-i18n="affinityEnabled">启用会话亲和</strong>
-                    <small data-i18n="affinityDescription">分摊流量时让相同会话稳定使用同一渠道；固定主备策略不受此项影响。</small>
+                    <small data-i18n="affinityDescription">为尚无租约的会话提供稳定分配；关闭后 Session Lease 也停用。</small>
                   </span>
                   <input name="affinity_enabled" type="checkbox">
+                </label>
+                <label class="setting-toggle">
+                  <span>
+                    <strong data-i18n="sessionLeaseEnabled">启用 Session Lease</strong>
+                    <small data-i18n="sessionLeaseDescription">将活跃会话固定在最后成功的渠道，fallback 成功后迁移；关闭会话亲和时同时失效。</small>
+                  </span>
+                  <input name="session_lease_enabled" type="checkbox">
+                </label>
+                <label>
+                  <span data-i18n="sessionLeaseIdleTtl">Session Lease 空闲 TTL（秒）</span>
+                  <small data-i18n="sessionLeaseIdleTtlDescription">租约在最后一次成功请求后保持的时间；可在 Channel extra 中按渠道或模型覆盖。</small>
+                  <input name="session_lease_idle_ttl_seconds" type="number" min="60" max="86400" step="1" value="900" required>
                 </label>
                 <label>
                   <span data-i18n="displayTimezone">日期与时间</span>
@@ -307,7 +322,7 @@
       </div>
     </div>
 
-    <script src="/config.js?v=17"></script>
-    <script type="module" src="/app.js?v=20"></script>
+    <script src="/config.js?v=22"></script>
+    <script type="module" src="/auth.js?v=4"></script>
   </body>
 </html>

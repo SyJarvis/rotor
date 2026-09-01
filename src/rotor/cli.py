@@ -5,6 +5,7 @@ from pathlib import Path
 import uvicorn
 
 from rotor.config import DEFAULT_CACHE_DIR, settings
+from rotor.core.logging_config import configure_file_logging
 
 
 def main() -> None:
@@ -23,6 +24,7 @@ def main() -> None:
 
 def serve(args: argparse.Namespace) -> None:
     ensure_runtime_dirs()
+    configure_file_logging(settings.ROTOR_LOG_DIR, settings.LOG_LEVEL)
     uvicorn.run(
         "rotor.main:app",
         host=args.host,
@@ -35,6 +37,7 @@ def serve(args: argparse.Namespace) -> None:
 def ensure_runtime_dirs() -> None:
     cache_dir = DEFAULT_CACHE_DIR
     cache_dir.mkdir(parents=True, exist_ok=True)
+    Path(settings.ROTOR_LOG_DIR).expanduser().mkdir(parents=True, exist_ok=True)
     Path(settings.CONVERSATION_STORE_DIR).expanduser().mkdir(parents=True, exist_ok=True)
 
     db_path = sqlite_path_from_url(settings.DATABASE_URL)

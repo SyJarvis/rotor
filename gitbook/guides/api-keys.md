@@ -5,8 +5,12 @@ Rotor API Key 用于认证客户端请求，并可限制配额、有效期和允
 
 ## 生成 Key
 
+下面的命令假定已按[管理 API 认证](../reference/admin-api.md#认证端点)设置
+`ROTOR_ADMIN_COOKIE_JAR` 和 `ROTOR_ADMIN_CSRF`。
+
 ```bash
-curl -X POST \
+curl -X POST -b "$ROTOR_ADMIN_COOKIE_JAR" \
+  -H "X-CSRF-Token: $ROTOR_ADMIN_CSRF" \
   "http://127.0.0.1:8000/api/admin/tokens/generate?name=team-a&quota=1000000"
 ```
 
@@ -57,3 +61,20 @@ Token 的 `allowed_channels` 是渠道 ID 列表。值为 `null` 时可以访问
 而不是猜测 Token 数量。
 
 管理接口本身的安全边界见[安全边界](../operations/security.md)。
+
+## MCP Control Key
+
+MCP Client 访问 Rotor Control API 时不能使用普通的 `sk-` 用户 API Key。可在管理页
+的“API Key → MCP Control Key”创建以 `rck_` 开头的专用凭据，供 Codex、Claude Code
+或其他 MCP Client 使用。
+
+创建时 Rotor 只返回一次完整 Key，同时显示可复制的 `ROTOR_CONTROL_API_URL` 与
+`ROTOR_CONTROL_API_TOKEN` 环境变量。之后列表只保存名称、掩码提示、启用状态、scope
+与最后使用时间，不会再次返回完整值。
+
+MCP Control Key 使用当前 Control API 的只读 scope。可以在管理页停用、启用或删除：
+停用和删除会立即使该 Key 失效。不要将其提交到仓库、写入客户端配置文件或发送到
+聊天记录中。
+
+接口路径见[管理 API](../reference/admin-api.md)；MCP Server 的安装和客户端配置见
+仓库中的 `mcp/README.md`。

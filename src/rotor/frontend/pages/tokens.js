@@ -1,6 +1,6 @@
 // Tokens page — compact API key list with create/view/delete modals.
 
-import { api, copyText } from "../api.js";
+import { api, copyText } from "../api.js?v=2";
 import { t } from "../i18n.js";
 import {
   escapeHtml, formatTime, skeletonRows, refreshIcons, toast,

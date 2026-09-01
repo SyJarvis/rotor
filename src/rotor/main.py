@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,8 +14,10 @@ from rotor.core.exceptions import (
     general_exception_handler,
 )
 from rotor.core.middleware import LoggingMiddleware
+from rotor.core.logging_config import LOG_FORMAT, configure_file_logging
 from rotor.api.v1 import chat, images, models, anthropic, responses
 from rotor.api.admin import (
+    auth as admin_auth,
     channels,
     mcp_control_keys,
     tokens,
@@ -29,6 +31,7 @@ from rotor.core.control_auth import (
     ControlAPIException,
     control_api_exception_handler,
 )
+from rotor.core.admin_auth import require_admin_access
 # Model imports register tables in Base.metadata during application startup.
 from rotor.models.conversation import ConversationRecord  # noqa: F401
 from rotor.models.usage import UsageLedger  # noqa: F401
@@ -36,11 +39,21 @@ from rotor.models.response_route import ResponseRoute  # noqa: F401
 from rotor.models.routing_decision import RoutingDecisionRecord  # noqa: F401
 from rotor.models.request_attempt import RequestAttempt  # noqa: F401
 from rotor.models.mcp_control_key import MCPControlKey  # noqa: F401
+from rotor.models.session_lease import (  # noqa: F401
+    SessionLease,
+    SessionLeaseEvent,
+)
+from rotor.models.admin_auth import (  # noqa: F401
+    AdminAuthEvent,
+    AdminLoginThrottle,
+    AdminSession,
+    AdminUser,
+)
 
 # Configure logging
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format=LOG_FORMAT,
 )
 logger = logging.getLogger(__name__)
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
@@ -50,6 +63,7 @@ FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     # Startup
+    configure_file_logging(settings.ROTOR_LOG_DIR, settings.LOG_LEVEL)
     logger.info("Starting Rotor...")
     await init_db()
     logger.info("Database initialized")
@@ -96,6 +110,18 @@ app.add_exception_handler(
     control_api_exception_handler,
 )
 app.add_exception_handler(Exception, general_exception_handler)
+
+
+@app.get("/anthropic/api/hello")
+async def anthropic_api_hello():
+    """Anthropic-compatible connectivity probe."""
+    return {"message": "hello"}
+
+
+@app.head("/anthropic/api/hello", include_in_schema=False)
+async def anthropic_api_hello_head():
+    """Answer HEAD probes without adding a duplicate OpenAPI operation."""
+    return {"message": "hello"}
 
 
 @app.get("/api")
@@ -147,12 +173,38 @@ app.include_router(models.router, prefix=settings.API_V1_STR, tags=["models"])
 app.include_router(anthropic.router, prefix="/anthropic/v1", tags=["anthropic"])
 
 # Admin routes
-app.include_router(channels.router, prefix="/api/admin")
-app.include_router(tokens.router, prefix="/api/admin")
-app.include_router(mcp_control_keys.router, prefix="/api/admin")
-app.include_router(logs.router, prefix="/api/admin")
-app.include_router(admin_settings.router, prefix="/api/admin")
-app.include_router(mindagent.router, prefix="/api/admin")
+app.include_router(admin_auth.router, prefix="/api/admin")
+admin_dependencies = [Depends(require_admin_access)]
+app.include_router(
+    channels.router,
+    prefix="/api/admin",
+    dependencies=admin_dependencies,
+)
+app.include_router(
+    tokens.router,
+    prefix="/api/admin",
+    dependencies=admin_dependencies,
+)
+app.include_router(
+    mcp_control_keys.router,
+    prefix="/api/admin",
+    dependencies=admin_dependencies,
+)
+app.include_router(
+    logs.router,
+    prefix="/api/admin",
+    dependencies=admin_dependencies,
+)
+app.include_router(
+    admin_settings.router,
+    prefix="/api/admin",
+    dependencies=admin_dependencies,
+)
+app.include_router(
+    mindagent.router,
+    prefix="/api/admin",
+    dependencies=admin_dependencies,
+)
 
 # Independently authenticated Control API.
 app.include_router(control_channels.router, prefix="/api/control/v1")
@@ -166,7 +218,7 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "rotor.main:app",
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=8000,
         reload=True,
         log_level=settings.LOG_LEVEL.lower()

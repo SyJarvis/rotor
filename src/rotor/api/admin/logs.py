@@ -18,7 +18,24 @@ def _cache_hit_rate(prompt_tokens: int | None, cached_tokens: int | None) -> flo
     prompt = int(prompt_tokens or 0)
     if prompt <= 0:
         return 0.0
-    return int(cached_tokens or 0) / prompt * 100
+    return min(max(int(cached_tokens or 0), 0) / prompt * 100, 100.0)
+
+
+def _cost_summary(
+    rows,
+) -> tuple[float | None, str | None, dict[str, float], int]:
+    totals = {
+        row.currency: float(row.total_cost or 0.0)
+        for row in rows
+        if row.currency
+    }
+    costed_requests = sum(int(row.costed_requests or 0) for row in rows)
+    if not totals:
+        return 0.0, None, {}, costed_requests
+    if len(totals) == 1:
+        currency, total = next(iter(totals.items()))
+        return total, currency, totals, costed_requests
+    return None, None, totals, costed_requests
 
 
 def _usage_time_window(
@@ -101,8 +118,22 @@ class RequestLogResponse(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    uncached_input_tokens: int
     cached_tokens: int
+    cache_write_tokens: int
+    cache_write_5m_tokens: int
+    cache_write_1h_tokens: int
+    usage_schema_version: str
+    capacity_snapshot: Optional[dict] = None
+    cache_scope: Optional[str]
+    capacity_scope: Optional[str]
+    billing_scope: Optional[str]
     cost: Optional[float]
+    currency: str
+    cost_status: str
+    tariff_version: Optional[str]
+    tariff_period: Optional[str]
+    tariff_snapshot: Optional[dict] = None
     success: bool
     error_code: Optional[str]
     error_message: Optional[str]
@@ -285,14 +316,37 @@ async def get_log_stats(
             func.sum(RequestLog.total_tokens).label('total_tokens'),
             func.sum(RequestLog.prompt_tokens).label('prompt_tokens'),
             func.sum(RequestLog.completion_tokens).label('completion_tokens'),
+            func.sum(RequestLog.uncached_input_tokens).label('uncached_input_tokens'),
             func.sum(RequestLog.cached_tokens).label('cached_tokens'),
-            func.sum(RequestLog.cost).label('total_cost'),
+            func.sum(RequestLog.cache_write_tokens).label('cache_write_tokens'),
+            func.sum(RequestLog.cache_write_5m_tokens).label('cache_write_5m_tokens'),
+            func.sum(RequestLog.cache_write_1h_tokens).label('cache_write_1h_tokens'),
+            func.sum(case(
+                (RequestLog.usage_schema_version == "2", 1),
+                else_=0,
+            )).label('usage_v2_requests'),
             func.avg(RequestLog.latency).label('avg_latency'),
         )
         .where(and_(*conditions))
     )
 
     row = result.one()
+
+    cost_rows = (await db.execute(
+        select(
+            RequestLog.currency,
+            func.sum(RequestLog.cost).label("total_cost"),
+            func.count(RequestLog.id).label("costed_requests"),
+        )
+        .where(and_(
+            *conditions,
+            RequestLog.cost_status == "calculated",
+        ))
+        .group_by(RequestLog.currency)
+    )).all()
+    total_cost, currency, cost_totals, costed_requests = _cost_summary(
+        cost_rows
+    )
 
     # Get failed count separately
     failed_result = await db.execute(
@@ -309,12 +363,20 @@ async def get_log_stats(
         "total_tokens": row.total_tokens or 0,
         "prompt_tokens": row.prompt_tokens or 0,
         "completion_tokens": row.completion_tokens or 0,
+        "uncached_input_tokens": row.uncached_input_tokens or 0,
         "cached_tokens": row.cached_tokens or 0,
+        "cache_write_tokens": row.cache_write_tokens or 0,
+        "cache_write_5m_tokens": row.cache_write_5m_tokens or 0,
+        "cache_write_1h_tokens": row.cache_write_1h_tokens or 0,
+        "usage_v2_requests": row.usage_v2_requests or 0,
         "cache_hit_rate": _cache_hit_rate(
             row.prompt_tokens,
             row.cached_tokens,
         ),
-        "total_cost": float(row.total_cost or 0),
+        "total_cost": total_cost,
+        "currency": currency,
+        "cost_totals_by_currency": cost_totals,
+        "costed_requests": costed_requests,
         "avg_latency": float(row.avg_latency or 0),
     }
 
@@ -510,7 +572,15 @@ async def get_model_usage(
             func.sum(RequestLog.total_tokens).label('total_tokens'),
             func.sum(RequestLog.prompt_tokens).label('prompt_tokens'),
             func.sum(RequestLog.completion_tokens).label('completion_tokens'),
+            func.sum(RequestLog.uncached_input_tokens).label('uncached_input_tokens'),
             func.sum(RequestLog.cached_tokens).label('cached_tokens'),
+            func.sum(RequestLog.cache_write_tokens).label('cache_write_tokens'),
+            func.sum(RequestLog.cache_write_5m_tokens).label('cache_write_5m_tokens'),
+            func.sum(RequestLog.cache_write_1h_tokens).label('cache_write_1h_tokens'),
+            func.sum(case(
+                (RequestLog.usage_schema_version == "2", 1),
+                else_=0,
+            )).label('usage_v2_requests'),
         )
         .where(and_(*conditions))
         .group_by(RequestLog.model)
@@ -519,6 +589,31 @@ async def get_model_usage(
     )
 
     rows = result.all()
+    selected_models = [row.model for row in rows]
+    cost_rows = []
+    if selected_models:
+        cost_rows = (await db.execute(
+            select(
+                RequestLog.model,
+                RequestLog.currency,
+                func.sum(RequestLog.cost).label("total_cost"),
+                func.count(RequestLog.id).label("costed_requests"),
+            )
+            .where(and_(
+                *conditions,
+                RequestLog.model.in_(selected_models),
+                RequestLog.cost_status == "calculated",
+            ))
+            .group_by(RequestLog.model, RequestLog.currency)
+        )).all()
+    costs_by_model = {
+        selected_model: _cost_summary([
+            cost_row
+            for cost_row in cost_rows
+            if cost_row.model == selected_model
+        ])
+        for selected_model in selected_models
+    }
 
     return [
         {
@@ -527,7 +622,16 @@ async def get_model_usage(
             "total_tokens": row.total_tokens or 0,
             "prompt_tokens": row.prompt_tokens or 0,
             "completion_tokens": row.completion_tokens or 0,
+            "uncached_input_tokens": row.uncached_input_tokens or 0,
             "cached_tokens": row.cached_tokens or 0,
+            "cache_write_tokens": row.cache_write_tokens or 0,
+            "cache_write_5m_tokens": row.cache_write_5m_tokens or 0,
+            "cache_write_1h_tokens": row.cache_write_1h_tokens or 0,
+            "usage_v2_requests": row.usage_v2_requests or 0,
+            "total_cost": costs_by_model[row.model][0],
+            "currency": costs_by_model[row.model][1],
+            "cost_totals_by_currency": costs_by_model[row.model][2],
+            "costed_requests": costs_by_model[row.model][3],
             "cache_hit_rate": _cache_hit_rate(
                 row.prompt_tokens,
                 row.cached_tokens,

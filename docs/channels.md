@@ -35,6 +35,23 @@ curl -X POST http://localhost:8000/api/admin/channels \
 - 不同 provider、不同 key 应配置为**独立渠道**。
 - 服务同一模型的多个渠道,按 **priority → weight** 进行负载均衡。
 - 上游失败时按 priority 降级 fallback。
+- 携带稳定 Session ID 时，成功渠道会形成持久化 Session Lease；活跃租约优先于新会话排序，fallback 成功后迁移。
+
+Session Lease 默认空闲 TTL 为 900 秒。可在运行时设置中修改全局值，也可在 Channel
+`extra` 中覆盖整个渠道或指定 logical model：
+
+```json
+{
+  "session_lease_idle_ttl_seconds": 600,
+  "session_lease_idle_ttl_by_model": {
+    "coding-model": 3600,
+    "*": 900
+  }
+}
+```
+
+TTL 必须在 60–86400 秒之间；非法覆盖会回退到全局值。Lease TTL 是 Rotor 的路由
+驻留时间，不等同于 provider 的 KV Cache TTL，也不表示 Rotor 保存了模型上下文。
 
 ## 内置 provider 类型
 

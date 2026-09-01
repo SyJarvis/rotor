@@ -14,12 +14,17 @@
 检查：
 
 ```bash
-curl http://127.0.0.1:8000/api/admin/tokens
 curl http://127.0.0.1:8000/v1/models \
   -H "Authorization: Bearer $ROTOR_API_KEY"
 ```
 
-管理 API 仅应从受信任网络执行。
+查看 Token 管理记录请登录管理页面；命令行访问管理 API 需要先建立管理员 Session。
+
+## 管理页面要求修改密码
+
+首次启动的默认账号是 `admin / 123456`。该密码只能创建受限 Session，必须在页面中
+设置不少于 6 个字符的新密码后才能访问管理功能。若已经修改过密码，启动环境中的
+`ROTOR_DEFAULT_ADMIN_PASSWORD` 不会覆盖数据库记录。
 
 ## `Model not found`
 

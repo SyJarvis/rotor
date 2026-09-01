@@ -1,4 +1,4 @@
-from typing import Any, List, Union, Dict, Optional
+from typing import Any, List, Union, Dict, Mapping, Optional
 from rotor.schemas.request import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -18,6 +18,37 @@ from rotor.schemas.request import (
     AnthropicToolUseBlock,
     AnthropicToolResultBlock,
 )
+
+
+def _anthropic_usage_to_openai(usage: Mapping[str, Any]) -> Dict[str, Any]:
+    uncached_tokens = int(usage.get("input_tokens") or 0)
+    cache_read_tokens = int(usage.get("cache_read_input_tokens") or 0)
+    cache_write_tokens = int(usage.get("cache_creation_input_tokens") or 0)
+    cache_creation = usage.get("cache_creation") or {}
+    cache_write_5m_tokens = int(
+        cache_creation.get("ephemeral_5m_input_tokens") or 0
+    )
+    cache_write_1h_tokens = int(
+        cache_creation.get("ephemeral_1h_input_tokens") or 0
+    )
+    cache_write_tokens = max(
+        cache_write_tokens,
+        cache_write_5m_tokens + cache_write_1h_tokens,
+    )
+    output_tokens = int(usage.get("output_tokens") or 0)
+    prompt_tokens = uncached_tokens + cache_read_tokens + cache_write_tokens
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": prompt_tokens + output_tokens,
+        "prompt_tokens_details": {
+            "cached_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "cache_write_5m_tokens": cache_write_5m_tokens,
+            "cache_write_1h_tokens": cache_write_1h_tokens,
+            "uncached_tokens": uncached_tokens,
+        },
+    }
 
 
 class ProtocolConverter:
@@ -234,12 +265,7 @@ class ProtocolConverter:
     @staticmethod
     def anthropic_to_openai_usage(usage: AnthropicUsage) -> Usage:
         """Convert Anthropic usage to OpenAI format."""
-        return Usage(
-            prompt_tokens=usage.input_tokens,
-            completion_tokens=usage.output_tokens,
-            total_tokens=usage.input_tokens + usage.output_tokens,
-            prompt_tokens_details={"cached_tokens": usage.cache_read_input_tokens},
-        )
+        return Usage(**_anthropic_usage_to_openai(usage.model_dump()))
 
     @staticmethod
     def anthropic_content_to_openai(content: List[Dict[str, Any]]) -> tuple[Optional[str], List[ToolCall]]:
@@ -357,17 +383,7 @@ class ProtocolConverter:
             }
             usage = (stream_event.get("message") or {}).get("usage") or {}
             if usage:
-                chunk["usage"] = {
-                    "prompt_tokens": usage.get("input_tokens", 0),
-                    "completion_tokens": usage.get("output_tokens", 0),
-                    "total_tokens": (
-                        usage.get("input_tokens", 0)
-                        + usage.get("output_tokens", 0)
-                    ),
-                    "prompt_tokens_details": {
-                        "cached_tokens": usage.get("cache_read_input_tokens", 0),
-                    },
-                }
+                chunk["usage"] = _anthropic_usage_to_openai(usage)
             return chunk
 
         # Handle content_block_start (tool_use start)
@@ -478,17 +494,7 @@ class ProtocolConverter:
                 }]
             }
             if usage:
-                chunk["usage"] = {
-                    "prompt_tokens": usage.get("input_tokens", 0),
-                    "completion_tokens": usage.get("output_tokens", 0),
-                    "total_tokens": (
-                        usage.get("input_tokens", 0)
-                        + usage.get("output_tokens", 0)
-                    ),
-                    "prompt_tokens_details": {
-                        "cached_tokens": usage.get("cache_read_input_tokens", 0),
-                    },
-                }
+                chunk["usage"] = _anthropic_usage_to_openai(usage)
             return chunk
 
         # Ignore other event types

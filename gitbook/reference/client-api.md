@@ -54,4 +54,10 @@ response ID 的上游归属。
 | `Authorization: Bearer ...` | 与 `x-api-key` 二选一 | Rotor Token |
 | `x-api-key` | 与 Bearer 二选一 | Anthropic 风格认证 |
 | `X-Conversation-Id` | 否 | 会话亲和、usage 关联和会话存储 |
+| `X-Rotor-Session-Id` | 否 | 与 `X-Conversation-Id` 等价的显式 Rotor Session ID |
 | `Content-Type: application/json` | JSON 请求需要 | 请求体类型 |
+
+Rotor 也会识别 Codex 的 `session-id`、Claude Code 的
+`x-claude-code-session-id`，以及 OpenCode 的 `x-session-affinity` / `x-session-id`。
+显式 `X-Conversation-Id` 优先级最高。没有稳定 Session 信号时，请求仍可执行，但不启用
+会话亲和；Rotor 为会话归档生成的临时 ID 不参与路由。

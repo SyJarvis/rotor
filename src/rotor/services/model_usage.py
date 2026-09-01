@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import distinct, func, select
+from sqlalchemy import case, distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.models.usage import UsageLedger
@@ -45,7 +45,23 @@ async def list_model_usage(
                 "completion_tokens"
             ),
             total_tokens.label("total_tokens"),
+            func.sum(UsageLedger.uncached_input_tokens).label(
+                "uncached_input_tokens"
+            ),
             func.sum(UsageLedger.cached_tokens).label("cached_tokens"),
+            func.sum(UsageLedger.cache_write_tokens).label(
+                "cache_write_tokens"
+            ),
+            func.sum(UsageLedger.cache_write_5m_tokens).label(
+                "cache_write_5m_tokens"
+            ),
+            func.sum(UsageLedger.cache_write_1h_tokens).label(
+                "cache_write_1h_tokens"
+            ),
+            func.sum(case(
+                (UsageLedger.usage_schema_version == "2", 1),
+                else_=0,
+            )).label("usage_v2_ledger_count"),
             func.sum(UsageLedger.reasoning_tokens).label(
                 "reasoning_tokens"
             ),
@@ -65,6 +81,36 @@ async def list_model_usage(
         .limit(limit)
     )
     rows = (await db.execute(query)).all()
+    selected_models = [row.model for row in rows]
+    cost_rows = []
+    if selected_models:
+        cost_rows = (await db.execute(
+            select(
+                UsageLedger.model,
+                UsageLedger.currency,
+                func.sum(UsageLedger.total_cost).label("total_cost"),
+                func.count(UsageLedger.id).label("ledger_count"),
+            )
+            .where(
+                UsageLedger.created_at >= effective_start,
+                UsageLedger.created_at < effective_end,
+                UsageLedger.model.in_(selected_models),
+                UsageLedger.cost_status == "calculated",
+            )
+            .group_by(UsageLedger.model, UsageLedger.currency)
+        )).all()
+    cost_totals_by_model: dict[str, dict[str, float]] = {
+        model: {} for model in selected_models
+    }
+    costed_ledgers_by_model = {model: 0 for model in selected_models}
+    for cost_row in cost_rows:
+        if cost_row.currency:
+            cost_totals_by_model[cost_row.model][cost_row.currency] = float(
+                cost_row.total_cost or 0.0
+            )
+        costed_ledgers_by_model[cost_row.model] += int(
+            cost_row.ledger_count or 0
+        )
     return ModelUsageResult(
         items=[
             ModelUsageSummary(
@@ -74,7 +120,14 @@ async def list_model_usage(
                 prompt_tokens=row.prompt_tokens or 0,
                 completion_tokens=row.completion_tokens or 0,
                 total_tokens=row.total_tokens or 0,
+                uncached_input_tokens=row.uncached_input_tokens or 0,
                 cached_tokens=row.cached_tokens or 0,
+                cache_write_tokens=row.cache_write_tokens or 0,
+                cache_write_5m_tokens=row.cache_write_5m_tokens or 0,
+                cache_write_1h_tokens=row.cache_write_1h_tokens or 0,
+                usage_v2_ledger_count=row.usage_v2_ledger_count or 0,
+                costed_ledger_count=costed_ledgers_by_model[row.model],
+                cost_totals_by_currency=cost_totals_by_model[row.model],
                 reasoning_tokens=row.reasoning_tokens or 0,
                 input_audio_tokens=row.input_audio_tokens or 0,
                 output_audio_tokens=row.output_audio_tokens or 0,

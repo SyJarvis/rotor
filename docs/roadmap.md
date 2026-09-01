@@ -5,9 +5,9 @@
 
 ## P0：网关生产化基础
 
-- [ ] 为管理页面和 `/api/admin/*` 增加管理员鉴权。
+- [x] 为管理页面和 `/api/admin/*` 增加管理员鉴权、登录限流与认证审计。
 - [ ] 对上游 API Key 和 Rotor Token 做安全存储与响应脱敏。
-- [ ] 补齐并验证 Alembic 迁移链，生产环境不再依赖 `create_all` 升级数据库。
+- [x] 补齐并验证 SQLite Alembic 迁移链，启动不再依赖 `create_all` 升级数据库。
 - [ ] 验证 SQLite 与 PostgreSQL 双数据库兼容性。
 - [ ] 实现 Channel RPM、TPM、并发限制和原子配额更新。
 - [ ] 整理单元测试与真实集成测试，接入 CI。

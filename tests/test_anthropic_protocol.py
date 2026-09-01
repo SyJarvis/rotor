@@ -5,9 +5,13 @@ from types import SimpleNamespace
 import pytest
 from httpx import AsyncByteStream, AsyncClient, MockTransport, Request, Response
 from pydantic import ValidationError
+from starlette.requests import Request as StarletteRequest
 
+import rotor.api.v1.anthropic as anthropic_endpoint
 from rotor.adapters.protocol.converter import ProtocolConverter
 from rotor.adapters.protocol.anthropic import AnthropicAdapter
+from rotor.adapters.protocol.responses import OpenAIResponsesAdapter
+from rotor.core.exceptions import UpstreamOverloaded
 from rotor.adapters.protocol.openai import OpenAIAdapter
 from rotor.adapters.providers.kimi import KimiAdapter
 from rotor.adapters.providers.minimax import MiniMaxAdapter
@@ -88,6 +92,110 @@ def test_dynamic_billing_header_does_not_change_cross_protocol_system() -> None:
     assert first.messages == second.messages
     assert first.anthropic_payload["system"][0]["text"].endswith("cch=11111;")
     assert second.anthropic_payload["system"][0]["text"].endswith("cch=22222;")
+
+
+def test_anthropic_cache_control_maps_to_gpt56_responses_breakpoints() -> None:
+    request = AnthropicMessageRequest.model_validate({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 256,
+        "system": [
+            {
+                "type": "text",
+                "text": (
+                    "x-anthropic-billing-header: "
+                    "cc_version=2.1.98.3ea; cc_entrypoint=cli; cch=abc12;"
+                ),
+            },
+            {"type": "text", "text": "Stable A."},
+            {
+                "type": "text",
+                "text": "Stable B.",
+                "cache_control": {"type": "ephemeral"},
+            },
+        ],
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    internal = anthropic_to_openai_request(request)
+    internal.responses_prompt_cache_key = "rotor_cache_key"
+    adapter = OpenAIResponsesAdapter(
+        SimpleNamespace(model_mapping={}, extra={}),
+        None,
+    )
+
+    body = asyncio.run(adapter.convert_request(internal))
+
+    assert body["prompt_cache_key"] == "rotor_cache_key"
+    assert body["prompt_cache_options"] == {
+        "mode": "implicit",
+        "ttl": "30m",
+    }
+    assert body["input"][0] == {
+        "type": "message",
+        "role": "developer",
+        "content": [
+            {"type": "input_text", "text": "Stable A.\n"},
+            {
+                "type": "input_text",
+                "text": "Stable B.",
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            },
+        ],
+    }
+
+
+def test_anthropic_cache_control_does_not_add_gpt56_fields_to_older_model() -> None:
+    request = AnthropicMessageRequest.model_validate({
+        "model": "gpt-5.5",
+        "max_tokens": 256,
+        "system": [{
+            "type": "text",
+            "text": "Stable system.",
+            "cache_control": {"type": "ephemeral"},
+        }],
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    internal = anthropic_to_openai_request(request)
+    internal.responses_prompt_cache_key = "rotor_cache_key"
+    adapter = OpenAIResponsesAdapter(
+        SimpleNamespace(model_mapping={}, extra={}),
+        None,
+    )
+
+    body = asyncio.run(adapter.convert_request(internal))
+
+    assert "prompt_cache_key" not in body
+    assert "prompt_cache_options" not in body
+    assert "prompt_cache_breakpoint" not in json.dumps(body)
+
+
+def test_anthropic_cache_control_limits_gpt56_breakpoints_to_last_four() -> None:
+    request = AnthropicMessageRequest.model_validate({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 256,
+        "system": [
+            {
+                "type": "text",
+                "text": f"Stable {index}.",
+                "cache_control": {"type": "ephemeral"},
+            }
+            for index in range(5)
+        ],
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    internal = anthropic_to_openai_request(request)
+    adapter = OpenAIResponsesAdapter(
+        SimpleNamespace(model_mapping={}, extra={}),
+        None,
+    )
+
+    body = asyncio.run(adapter.convert_request(internal))
+    content = body["input"][0]["content"]
+
+    assert "prompt_cache_breakpoint" not in content[0]
+    assert all(
+        block["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        for block in content[1:]
+    )
 
 
 def test_dynamic_billing_header_line_is_removed_from_string_system() -> None:
@@ -199,7 +307,42 @@ def test_openai_text_response_converts_to_anthropic_message() -> None:
     assert response["usage"] == {
         "input_tokens": 8,
         "output_tokens": 4,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
+    }
+
+
+def test_openai_cache_usage_converts_to_disjoint_anthropic_fields() -> None:
+    response = openai_to_anthropic_response(
+        {
+            "choices": [{
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 5,
+                "total_tokens": 105,
+                "prompt_tokens_details": {
+                    "cached_tokens": 60,
+                    "cache_write_tokens": 30,
+                    "cache_write_5m_tokens": 20,
+                    "cache_write_1h_tokens": 10,
+                },
+            },
+        },
+        "claude-test",
+    )
+
+    assert response["usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "cache_creation_input_tokens": 30,
+        "cache_read_input_tokens": 60,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 20,
+            "ephemeral_1h_input_tokens": 10,
+        },
     }
 
 
@@ -345,8 +488,7 @@ def test_streaming_usage_provider_when_usage_chunk_is_seen() -> None:
     assert usage.total_tokens == 12
 
 
-def test_anthropic_to_openai_usage_preserves_cache_read_tokens() -> None:
-    """Non-streaming usage conversion maps cache_read_input_tokens into OpenAI details."""
+def test_anthropic_to_openai_usage_preserves_cache_breakdown() -> None:
     from rotor.schemas.request import AnthropicUsage
 
     usage = AnthropicUsage(
@@ -354,12 +496,23 @@ def test_anthropic_to_openai_usage_preserves_cache_read_tokens() -> None:
         output_tokens=50,
         cache_creation_input_tokens=200,
         cache_read_input_tokens=300,
+        cache_creation={
+            "ephemeral_5m_input_tokens": 120,
+            "ephemeral_1h_input_tokens": 80,
+        },
     )
     result = ProtocolConverter.anthropic_to_openai_usage(usage)
 
-    assert result.prompt_tokens == 100
+    assert result.prompt_tokens == 600
     assert result.completion_tokens == 50
-    assert result.prompt_tokens_details == {"cached_tokens": 300}
+    assert result.total_tokens == 650
+    assert result.prompt_tokens_details == {
+        "cached_tokens": 300,
+        "cache_write_tokens": 200,
+        "cache_write_5m_tokens": 120,
+        "cache_write_1h_tokens": 80,
+        "uncached_tokens": 100,
+    }
 
 
 def test_anthropic_stream_message_start_preserves_cache_tokens() -> None:
@@ -380,8 +533,9 @@ def test_anthropic_stream_message_start_preserves_cache_tokens() -> None:
 
     assert chunk is not None
     usage = chunk["usage"]
-    assert usage["prompt_tokens"] == 100
+    assert usage["prompt_tokens"] == 600
     assert usage["prompt_tokens_details"]["cached_tokens"] == 300
+    assert usage["prompt_tokens_details"]["cache_write_tokens"] == 200
 
 
 def test_anthropic_stream_message_delta_preserves_cache_tokens() -> None:
@@ -449,13 +603,14 @@ def test_anthropic_request_preserves_tools_and_tool_messages() -> None:
         "type": "function",
         "function": {"name": "Bash"},
     }
-    assert converted.messages[0].tool_calls[0].id == "toolu_1"
-    assert json.loads(converted.messages[0].tool_calls[0].function.arguments) == {
+    assert converted.messages[0].role.value == "user"
+    assert converted.messages[1].tool_calls[0].id == "toolu_1"
+    assert json.loads(converted.messages[1].tool_calls[0].function.arguments) == {
         "command": "ls"
     }
-    assert converted.messages[1].role.value == "tool"
-    assert converted.messages[1].tool_call_id == "toolu_1"
-    assert converted.messages[1].content == "README.md"
+    assert converted.messages[2].role.value == "tool"
+    assert converted.messages[2].tool_call_id == "toolu_1"
+    assert converted.messages[2].content == "README.md"
 
 
 def test_standard_anthropic_stream_events_convert_to_openai() -> None:
@@ -550,10 +705,11 @@ def test_internal_request_round_trips_to_anthropic_provider_format() -> None:
     )
 
     assert round_tripped["tool_choice"] == {"type": "tool", "name": "Bash"}
-    assert round_tripped["messages"][0]["content"][0]["input"] == {
+    assert round_tripped["messages"][0]["role"] == "user"
+    assert round_tripped["messages"][1]["content"][0]["input"] == {
         "command": "ls"
     }
-    assert round_tripped["messages"][1]["content"][0] == {
+    assert round_tripped["messages"][2]["content"][0] == {
         "type": "tool_result",
         "tool_use_id": "toolu_1",
         "content": "README.md",
@@ -787,6 +943,124 @@ def test_native_anthropic_response_and_sse_events_are_not_downgraded() -> None:
     assert events[1]["delta"]["type"] == "thinking_delta"
 
 
+def test_anthropic_stream_overload_error_raises_upstream_overloaded() -> None:
+    class OverloadedStream(AsyncByteStream):
+        async def __aiter__(self):
+            events = [
+                {"type": "message_start", "message": {"id": "msg_1", "type": "message"}},
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "overloaded_error",
+                        "message": "Our servers are currently overloaded. Please try again later.",
+                    },
+                },
+            ]
+            yield "".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                for event in events
+            ).encode()
+
+    request = AnthropicMessageRequest.model_validate({
+        "model": "claude-test",
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    internal = anthropic_to_openai_request(request)
+    adapter = AnthropicAdapter(SimpleNamespace(model_mapping={}, extra={}), None)
+    response = Response(
+        200,
+        stream=OverloadedStream(),
+        request=Request("POST", "https://example.com/v1/messages"),
+    )
+
+    async def collect():
+        return [
+            event
+            async for event in adapter.stream_convert_response(response, internal)
+        ]
+
+    with pytest.raises(UpstreamOverloaded) as captured:
+        asyncio.run(collect())
+
+    assert captured.value.error_type == "overloaded_error"
+
+
+def test_anthropic_stream_overload_by_wording_raises_upstream_overloaded() -> None:
+    class OverloadedStream(AsyncByteStream):
+        async def __aiter__(self):
+            events = [{
+                "type": "error",
+                "error": {"type": "api_error", "message": "Upstream is overloaded now"},
+            }]
+            yield "".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                for event in events
+            ).encode()
+
+    request = AnthropicMessageRequest.model_validate({
+        "model": "claude-test",
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    internal = anthropic_to_openai_request(request)
+    adapter = AnthropicAdapter(SimpleNamespace(model_mapping={}, extra={}), None)
+    response = Response(
+        200,
+        stream=OverloadedStream(),
+        request=Request("POST", "https://example.com/v1/messages"),
+    )
+
+    async def collect():
+        return [
+            event
+            async for event in adapter.stream_convert_response(response, internal)
+        ]
+
+    with pytest.raises(UpstreamOverloaded):
+        asyncio.run(collect())
+
+
+def test_anthropic_stream_parameter_error_still_raises_runtime_error() -> None:
+    class InvalidRequestStream(AsyncByteStream):
+        async def __aiter__(self):
+            events = [{
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "max_tokens is too large",
+                },
+            }]
+            yield "".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                for event in events
+            ).encode()
+
+    request = AnthropicMessageRequest.model_validate({
+        "model": "claude-test",
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    internal = anthropic_to_openai_request(request)
+    adapter = AnthropicAdapter(SimpleNamespace(model_mapping={}, extra={}), None)
+    response = Response(
+        200,
+        stream=InvalidRequestStream(),
+        request=Request("POST", "https://example.com/v1/messages"),
+    )
+
+    async def collect():
+        return [
+            event
+            async for event in adapter.stream_convert_response(response, internal)
+        ]
+
+    with pytest.raises(RuntimeError) as captured:
+        asyncio.run(collect())
+
+    assert not isinstance(captured.value, UpstreamOverloaded)
+
+
 def test_native_anthropic_count_tokens_and_beta_headers_are_forwarded() -> None:
     seen: list[Request] = []
 
@@ -885,3 +1159,138 @@ def test_moonshot_adapter_allows_missing_extra_config() -> None:
 
     assert body["model"] == "test-model"
     assert "enable_search" not in body
+
+
+class _TerminalStreamAccounting:
+    def __init__(self) -> None:
+        self.attempts = []
+        self.successes = []
+
+    async def record(self, **kwargs) -> bool:
+        self.attempts.append(kwargs)
+        kwargs["context"].recorded = True
+        return True
+
+    async def record_failure(self, db, **kwargs) -> None:
+        return None
+
+    async def record_success(self, db, **kwargs) -> None:
+        self.successes.append(kwargs)
+
+
+class _TerminalConversationStore:
+    def __init__(self) -> None:
+        self.finishes = []
+
+    async def append_error(self, handle, code, message) -> None:
+        return None
+
+    async def finish(self, handle, status, latency_ms) -> None:
+        self.finishes.append(status)
+
+
+class _TerminalStreamDatabase:
+    async def close(self) -> None:
+        return None
+
+    async def commit(self) -> None:
+        return None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+
+class _TerminalStreamClient:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize(
+    ("error_type", "expected_outcome", "expected_status"),
+    [
+        (RuntimeError, "failed", "failed"),
+        (asyncio.CancelledError, "cancelled", "cancelled"),
+    ],
+)
+def test_anthropic_stream_records_terminal_attempt_without_lease(
+    monkeypatch,
+    error_type,
+    expected_outcome,
+    expected_status,
+) -> None:
+    class FailingAdapter:
+        async def stream_convert_response(self, response, request):
+            if False:
+                yield {}
+            raise error_type("stream stopped")
+
+        def map_model_name(self, model):
+            return f"provider-{model}"
+
+    accounting = _TerminalStreamAccounting()
+    conversation_store = _TerminalConversationStore()
+    http_client = _TerminalStreamClient()
+    monkeypatch.setattr(anthropic_endpoint, "accounting_service", accounting)
+    monkeypatch.setattr(anthropic_endpoint, "attempt_recorder", accounting)
+    monkeypatch.setattr(
+        anthropic_endpoint,
+        "conversation_store",
+        conversation_store,
+    )
+    monkeypatch.setattr(
+        anthropic_endpoint,
+        "async_session_maker",
+        _TerminalStreamDatabase,
+    )
+
+    request = AnthropicMessageRequest.model_validate({
+        "model": "model-a",
+        "max_tokens": 128,
+        "stream": True,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    http_request = StarletteRequest({
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "headers": [],
+        "client": ("127.0.0.1", 1),
+    })
+
+    async def exercise() -> type[BaseException] | None:
+        response = await anthropic_endpoint._handle_streaming_request(
+            request,
+            anthropic_to_openai_request(request),
+            FailingAdapter(),
+            SimpleNamespace(id=2, protocol="openai"),
+            SimpleNamespace(id=1),
+            _TerminalStreamDatabase(),
+            0.0,
+            http_request,
+            http_client,
+            "req-terminal",
+            "conv-1",
+            object(),
+            SimpleNamespace(conversation_id="conv-1"),
+            attempt_context=anthropic_endpoint.AttemptContext.start(0),
+            lease_session_id="session-a",
+        )
+        try:
+            [chunk async for chunk in response.body_iterator]
+        except BaseException as exc:
+            return type(exc)
+        return None
+
+    raised = asyncio.run(exercise())
+
+    assert accounting.attempts[0]["outcome"] == expected_outcome
+    assert accounting.successes == []
+    assert conversation_store.finishes[-1] == expected_status
+    assert http_client.closed is True
+    assert raised is (asyncio.CancelledError if expected_outcome == "cancelled" else None)

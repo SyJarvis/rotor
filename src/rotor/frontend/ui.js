@@ -1,7 +1,7 @@
 // UI primitives — toast, skeleton, badges, progress, formatters, escape.
 
 import { t } from "./i18n.js";
-import { copyText } from "./api.js";
+import { copyText } from "./api.js?v=2";
 
 /* ---------- escape & parse ---------- */
 export function escapeHtml(value) {

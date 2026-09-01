@@ -50,6 +50,37 @@ def test_retryable_failure_temporarily_removes_channel() -> None:
     assert [channel.id for channel in decision.candidates] == [2]
 
 
+def test_active_session_lease_overrides_new_session_order() -> None:
+    engine = RoutingEngine(strategy="fallback_order")
+    channels = [_channel(1, priority=10), _channel(2, priority=1)]
+
+    decision = engine.route(
+        channels,
+        "model",
+        preferred_channel_id=2,
+    )
+
+    assert [channel.id for channel in decision.candidates] == [2, 1]
+    assert decision.lease_channel_id == 2
+    assert decision.lease_used is True
+
+
+def test_session_lease_never_overrides_cooldown() -> None:
+    engine = RoutingEngine()
+    channels = [_channel(1), _channel(2)]
+    engine.mark_unavailable("model", channels[0], cooldown_seconds=60)
+
+    decision = engine.route(
+        channels,
+        "model",
+        preferred_channel_id=1,
+    )
+
+    assert [channel.id for channel in decision.candidates] == [2]
+    assert decision.lease_channel_id == 1
+    assert decision.lease_used is False
+
+
 def test_cooldown_does_not_make_only_compatible_channel_unroutable() -> None:
     engine = RoutingEngine()
     channel = _channel(1, protocol="openai_responses")

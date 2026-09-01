@@ -9,9 +9,10 @@ import uuid
 from typing import Any, AsyncIterator
 from urllib.parse import quote
 
-from httpx import Response, Timeout
+from httpx import HTTPStatusError, Response, Timeout
 
 from rotor.adapters.base import BaseAdapter
+from rotor.core.exceptions import UpstreamOverloaded, is_overload_error_signal
 from rotor.schemas.request import (
     ChatCompletionRequest,
     ChatMessage,
@@ -28,6 +29,11 @@ def _stringify(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _supports_gpt56_prompt_cache(model: str) -> bool:
+    normalized = model.strip().lower()
+    return normalized == "gpt-5.6" or normalized.startswith("gpt-5.6-")
 
 
 def _content_text(content: Any) -> str:
@@ -149,6 +155,7 @@ def responses_input_to_chat_messages(input_data: Any) -> list[ChatMessage]:
 
 def responses_request_to_chat(request: ResponsesRequest) -> ChatCompletionRequest:
     messages = responses_input_to_chat_messages(request.input)
+    tools = responses_tools_to_chat(request.tools)
     if request.instructions:
         instructions = _content_text(request.instructions)
         if instructions:
@@ -160,8 +167,12 @@ def responses_request_to_chat(request: ResponsesRequest) -> ChatCompletionReques
         temperature=request.temperature,
         top_p=request.top_p,
         stream=request.stream,
-        tools=responses_tools_to_chat(request.tools),
-        tool_choice=responses_tool_choice_to_chat(request.tool_choice),
+        tools=tools,
+        tool_choice=(
+            responses_tool_choice_to_chat(request.tool_choice)
+            if tools is not None
+            else None
+        ),
         user=request.user,
         responses_payload=request.provider_payload(),
     )
@@ -416,6 +427,42 @@ class OpenAIResponsesAdapter(BaseAdapter):
 
     native_responses = True
 
+    async def make_request(
+        self,
+        request: ChatCompletionRequest,
+        timeout: float | None = None,
+    ) -> Response:
+        try:
+            return await super().make_request(request, timeout)
+        except HTTPStatusError as exc:
+            payload = request.responses_payload
+            if (
+                not isinstance(payload, dict)
+                or "prompt_cache_retention" not in payload
+                or not self._rejects_prompt_cache_retention(exc.response)
+            ):
+                raise
+
+            await exc.response.aclose()
+            retry_request = request.model_copy(deep=True)
+            retry_request.responses_payload.pop("prompt_cache_retention", None)
+            return await super().make_request(retry_request, timeout)
+
+    @staticmethod
+    def _rejects_prompt_cache_retention(response: Response) -> bool:
+        if response.status_code != 400:
+            return False
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+        error = payload.get("error") if isinstance(payload, dict) else None
+        return (
+            isinstance(error, dict)
+            and error.get("param") == "prompt_cache_retention"
+            and error.get("code") == "invalid_parameter"
+        )
+
     def responses_url(self, suffix: str = "") -> str:
         """Build a resource URL from the channel's configured collection path."""
         return f"{self.build_request_url('/responses').rstrip('/')}{suffix}"
@@ -513,8 +560,29 @@ class OpenAIResponsesAdapter(BaseAdapter):
             if request.responses_payload is not None
             else chat_request_to_responses_payload(request)
         )
-        body["model"] = self.map_model_name(request.model)
+        mapped_model = self.map_model_name(request.model)
+        body["model"] = mapped_model
         body["stream"] = bool(request.stream)
+        if not _supports_gpt56_prompt_cache(mapped_model):
+            return body
+
+        if request.responses_prompt_cache_key:
+            body["prompt_cache_key"] = request.responses_prompt_cache_key
+
+        cache_content = request.responses_cacheable_system_content
+        if cache_content:
+            for item in body.get("input") or []:
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "message"
+                    and item.get("role") == "developer"
+                ):
+                    item["content"] = deepcopy(cache_content)
+                    body["prompt_cache_options"] = {
+                        "mode": "implicit",
+                        "ttl": "30m",
+                    }
+                    break
         return body
 
     async def convert_response(
@@ -554,7 +622,11 @@ class OpenAIResponsesAdapter(BaseAdapter):
             event_type = event.get("type")
             if event_type == "error" or event_type == "response.failed":
                 error = event.get("error") or (event.get("response") or {}).get("error") or {}
-                raise RuntimeError(error.get("message") or "Responses upstream stream failed")
+                error_message = error.get("message") or "Responses upstream stream failed"
+                error_type = error.get("type") or error.get("code")
+                if is_overload_error_signal(error_type, error_message):
+                    raise UpstreamOverloaded(error_message, error_type=error_type)
+                raise RuntimeError(error_message)
             if request.responses_payload is not None:
                 yield event
                 continue
@@ -633,6 +705,12 @@ class OpenAIResponsesAdapter(BaseAdapter):
                         "prompt_tokens": int(usage.get("input_tokens") or 0),
                         "completion_tokens": int(usage.get("output_tokens") or 0),
                         "total_tokens": int(usage.get("total_tokens") or 0),
+                        "prompt_tokens_details": (
+                            usage.get("input_tokens_details") or {}
+                        ),
+                        "completion_tokens_details": (
+                            usage.get("output_tokens_details") or {}
+                        ),
                     },
                 )
 
@@ -643,7 +721,7 @@ def _chat_stream_chunk(
     *,
     delta: dict[str, Any],
     finish_reason: str | None = None,
-    usage: dict[str, int] | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     chunk: dict[str, Any] = {
         "id": chunk_id,

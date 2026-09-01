@@ -61,7 +61,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
 
-rotor serve --host 0.0.0.0 --port 8000
+rotor serve --host 127.0.0.1 --port 8000
 ```
 
 检查服务：
@@ -76,12 +76,19 @@ curl http://127.0.0.1:8000/health
 http://127.0.0.1:8000/
 ```
 
+首次启动会创建管理员 `admin`，默认密码为 `123456`。首次登录后必须修改密码，完成
+修改前管理接口保持锁定。请先在本机完成首次登录和改密，再把 Rotor 绑定到非本机
+网络地址。
+
 默认运行数据位于：
 
 ```text
 ~/.cache/rotor/
 ├── rotor.db
-└── conversations/
+├── conversations/
+└── logs/
+    └── YYYY-MM/
+        └── YYYY-MM-DD.log
 ```
 
 ## Docker
@@ -93,14 +100,14 @@ docker build -t rotor .
 mkdir -p "$HOME/.cache/rotor"
 
 docker run --rm \
-  -p 8000:8000 \
+  -p 127.0.0.1:8000:8000 \
   -v "$HOME/.cache/rotor:/data" \
   rotor
 ```
 
-镜像默认把 SQLite 数据库写入 `/data/rotor.db`，把 Conversation store 写入
-`/data/conversations/`。上面的单一挂载会同时持久化两者，对应宿主机目录为
-`~/.cache/rotor/`。
+镜像默认把 SQLite 数据库写入 `/data/rotor.db`，把 Conversation store 和
+运行日志分别写入 `/data/conversations/` 和 `/data/logs/`。上面的单一挂载会
+持久化这些运行数据，对应宿主机目录为 `~/.cache/rotor/`。
 
 使用 Docker Compose 启动 Rotor 和 PostgreSQL：
 
@@ -110,33 +117,17 @@ docker compose logs -f rotor
 ```
 
 仓库 Compose 使用开发用数据库凭据并暴露 PostgreSQL 端口，上线前必须修改。当前
-Compose 使用 PostgreSQL volume 持久化主数据库，并把 Conversation store 挂载到
-宿主机的 `./data/conversations/`。当前 Docker 配置只运行 Rotor；`rotor-mcp` 后续
+Compose 使用 PostgreSQL volume 持久化主数据库，并把 Conversation store 和运行日志
+挂载到宿主机的 `./data/`。当前 Docker 配置只运行 Rotor；`rotor-mcp` 后续
 应使用独立镜像运行。
 
 ## 完成第一次请求
 
 ### 1. 添加 Channel
 
-打开管理页面，在“渠道”中添加供应商地址、API Key、模型和协议。也可以调用
-`POST /api/admin/channels`：
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/admin/channels \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "openai-compatible",
-    "type": "openai",
-    "key": "provider-api-key",
-    "base_url": "https://provider.example/v1",
-    "models": ["your-model"],
-    "model_mapping": {},
-    "priority": 10,
-    "weight": 1,
-    "enabled": true,
-    "protocol": "openai"
-  }'
-```
+使用管理员账号登录管理页面，在“渠道”中添加供应商地址、API Key、模型和协议。
+需要通过 HTTP 自动化管理时，先按[管理 API](gitbook/reference/admin-api.md)建立管理
+Session。
 
 `protocol` 描述上游实际使用的接口：
 
@@ -150,10 +141,7 @@ Provider 类型负责鉴权规则，协议只决定请求路径和转换方式�
 
 ### 2. 创建 Rotor 用户 Token
 
-```bash
-curl -X POST \
-  "http://127.0.0.1:8000/api/admin/tokens/generate?name=demo&quota=1000000"
-```
+在管理页面的“API Key”中生成 Rotor 用户 Token。
 
 保存响应中的 `sk-` Token：
 
@@ -190,7 +178,7 @@ Codex、Claude Code 和 OpenCode 的配置方式见
 | Anthropic | `POST /anthropic/v1/messages`、`POST /anthropic/v1/messages/count_tokens` |
 | 模型 | `GET /v1/models` |
 | 管理 API | `/api/admin/channels`、`/api/admin/tokens`、`/api/admin/logs`、`/api/admin/settings` |
-| Control API | `/api/control/v1/channels`、请求 trace、近期失败和模型用量 |
+| Control API | `/api/control/v1/channels`、请求 trace、近期失败、模型用量和 Session Lease 评估 |
 
 Responses API 支持创建、查询、取消、删除、输入项查询、输入 Token 计数和 compact。
 当上游是原生 Responses Channel 时，Rotor 会把后续资源操作路由回原 Channel 和账号。
@@ -225,11 +213,16 @@ request_trace:read
 usage:read
 ```
 
-`mcp/` 是独立的 `rotor-mcp` 包，当前通过 stdio 提供 Channel、请求 trace、近期失败
-和模型用量查询。安装、启动和客户端配置见 [Rotor MCP README](mcp/README.md)。
+`mcp/` 是独立的 `rotor-mcp` 包，当前通过 stdio 提供 Channel、请求 trace、近期失败、
+模型用量和 Session Lease 事实评估。评估结果只判断事实是否足以继续分析，不会建议或
+自动启用成本路由。安装、启动和客户端配置见 [Rotor MCP README](mcp/README.md)。
+
+除环境变量中的固定 Control Token 外，也可以在管理页面的“API Key → MCP Control Key”
+创建数据库保存的 `rck_` 凭据。完整值只在创建时显示一次；可以单独停用或删除，且不
+接受普通的 `sk-` 用户 Token。
 
 管理页面中的 MindAgent 可以独立运行；只有配置 MCP 命令和 Control Token 后，才会
-加载 Rotor MCP 诊断工具。
+加载 Rotor MCP 诊断工具。对话记录位于管理页侧边栏，可新建、导出 JSON 或删除。
 
 ## 重要配置
 
@@ -237,7 +230,16 @@ usage:read
 | --- | --- | --- |
 | `DATABASE_URL` | `sqlite+aiosqlite:///~/.cache/rotor/rotor.db` | 主数据库 |
 | `CONVERSATION_STORE_DIR` | `~/.cache/rotor/conversations` | 会话存储目录 |
+| `ROTOR_LOG_DIR` | `~/.cache/rotor/logs` | 按月分目录、按日保存运行日志的目录 |
 | `LOG_LEVEL` | `INFO` | 日志级别；`DEBUG` 时开放 API 文档页面 |
+| `ROTOR_DEFAULT_ADMIN_USERNAME` | `admin` | 仅首次初始化数据库时使用的管理员用户名 |
+| `ROTOR_DEFAULT_ADMIN_PASSWORD` | `123456` | 仅首次初始化数据库时使用的管理员密码；首次登录必须修改 |
+| `ROTOR_ADMIN_SESSION_IDLE_SECONDS` | `1800` | 管理员 Session 空闲超时秒数 |
+| `ROTOR_ADMIN_SESSION_TTL_SECONDS` | `43200` | 管理员 Session 绝对有效期秒数 |
+| `ROTOR_ADMIN_COOKIE_SECURE` | `false` | HTTPS 部署时必须设为 `true` |
+| `ROTOR_ADMIN_LOGIN_MAX_FAILURES` | `5` | 登录失败次数上限 |
+| `ROTOR_ADMIN_LOGIN_WINDOW_SECONDS` | `300` | 登录失败计数窗口秒数 |
+| `ROTOR_ADMIN_LOGIN_LOCK_SECONDS` | `900` | 达到失败上限后的锁定秒数 |
 | `ROTOR_CONTROL_API_TOKEN` | 未设置 | Control API 和 MCP 鉴权 |
 | `ROTOR_CONTROL_API_SCOPES` | 三个只读 scope | Control API 权限 |
 | `ROTOR_MINDAGENT_MCP_COMMAND` | 未设置 | MindAgent 启动独立 MCP Server 的命令 |
@@ -246,8 +248,8 @@ usage:read
 
 ## 安全边界
 
-- 当前 `/api/admin/*` 没有独立管理员鉴权，只应部署在受信任网络或受保护的反向代理
-  后面。
+- `/api/admin/*` 使用管理员 Session 和 CSRF 保护；默认账号必须在对外暴露前完成首次
+  改密。
 - Provider API Key、Rotor 用户 Token、Control Token、数据库和会话文件都应视为
   敏感数据。
 - Control API 与普通模型调用使用不同 Token，不应混用。

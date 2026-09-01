@@ -7,6 +7,7 @@ from rotor.database import Base
 from rotor.models.conversation import ConversationRecord
 from rotor.models.request_attempt import RequestAttempt
 from rotor.models.routing_decision import RoutingDecisionRecord
+from rotor.models.session_lease import SessionLeaseEvent
 from rotor.models.usage import UsageLedger
 from rotor.services.request_traces import get_request_trace
 
@@ -120,9 +121,27 @@ def test_request_trace_aggregates_complete_request_facts() -> None:
                         prompt_tokens=10,
                         completion_tokens=5,
                         total_tokens=15,
+                        uncached_input_tokens=5,
                         cached_tokens=2,
+                        cache_write_tokens=3,
+                        cache_write_5m_tokens=2,
+                        cache_write_1h_tokens=1,
                         usage_source="provider",
                         status="success",
+                        capacity_snapshot={
+                            "x-ratelimit-remaining-requests": "9"
+                        },
+                        cache_scope="provider/account-b/cache",
+                        capacity_scope="provider/account-b/capacity",
+                        billing_scope="provider/account-b/billing",
+                        input_cost=0.00001,
+                        output_cost=0.00002,
+                        total_cost=0.00003,
+                        currency="USD",
+                        cost_status="calculated",
+                        tariff_version="model-a-v1",
+                        tariff_period="off_peak",
+                        tariff_snapshot={"version": "model-a-v1"},
                     ),
                 ]
             )
@@ -139,6 +158,20 @@ def test_request_trace_aggregates_complete_request_facts() -> None:
                     status="success",
                 )
             )
+            db.add(
+                SessionLeaseEvent(
+                    lease_id=1,
+                    request_id="req-1",
+                    token_id=1,
+                    session_id="session-a",
+                    logical_model="model-a",
+                    event_type="migrated",
+                    previous_channel_id=1,
+                    channel_id=2,
+                    reason="fallback_success",
+                    created_at=_now(),
+                )
+            )
             await db.commit()
 
             trace = await get_request_trace(db, "req-1")
@@ -152,8 +185,35 @@ def test_request_trace_aggregates_complete_request_facts() -> None:
         assert [attempt.attempt_index for attempt in trace.attempts] == [0, 1]
         assert trace.attempts[0].error.code == "upstream_unavailable"
         assert trace.attempts[0].error.fallback_allowed is True
+        assert len(trace.session_lease_events) == 1
+        assert trace.session_lease_events[0].event_type == "migrated"
+        assert trace.session_lease_events[0].previous_channel_id == 1
+        assert trace.session_lease_events[0].channel_id == 2
+        assert trace.session_lease_events[0].reason == "fallback_success"
         assert trace.usage.total_tokens == 15
+        assert trace.usage.uncached_input_tokens == 5
         assert trace.usage.cached_tokens == 2
+        assert trace.usage.cache_write_tokens == 3
+        assert trace.usage.cache_write_5m_tokens == 2
+        assert trace.usage.cache_write_1h_tokens == 1
+        assert trace.usage.usage_schema_versions == ["2"]
+        assert trace.usage.capacity_snapshots == [{
+            "x-ratelimit-remaining-requests": "9"
+        }]
+        assert trace.usage.cache_scopes == ["provider/account-b/cache"]
+        assert trace.usage.capacity_scopes == [
+            "provider/account-b/capacity"
+        ]
+        assert trace.usage.billing_scopes == [
+            "provider/account-b/billing"
+        ]
+        assert trace.usage.input_cost == 0.00001
+        assert trace.usage.output_cost == 0.00002
+        assert trace.usage.total_cost == 0.00003
+        assert trace.usage.cost_statuses == ["calculated", "unknown"]
+        assert trace.usage.tariff_versions == ["model-a-v1"]
+        assert trace.usage.tariff_periods == ["off_peak"]
+        assert trace.usage.tariff_snapshots == [{"version": "model-a-v1"}]
         assert trace.final_outcome == "success"
         assert trace.meta.warnings == []
 

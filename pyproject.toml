@@ -1,6 +1,6 @@
 [project]
 name = "rotor-gateway"
-version = "0.2.5"
+version = "0.3.2"
 description = ""
 authors = [
     {name = "runkezhong",email = "jarvisshangye@gmail.com"}
@@ -36,7 +36,10 @@ packages = [
     {include = "rotor", from = "src"},
     {include = "mindagent", from = "src"},
 ]
-include = ["src/rotor/frontend/**/*"]
+include = [
+    "src/rotor/frontend/**/*",
+    "src/rotor/migrations/script.py.mako",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

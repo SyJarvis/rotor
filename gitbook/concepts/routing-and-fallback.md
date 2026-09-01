@@ -23,6 +23,10 @@
 adaptive 的在线成功率、延迟和 in-flight 负载保存在当前进程内，重启后重置。
 用于后续分析的候选集、特征和评分快照会写入数据库。
 
+携带稳定 Session ID 的请求还会读取数据库 Session Lease。租约渠道通过上述硬约束且
+未冷却时，会移动到候选集首位；因此新 Session 的策略负责初始分配，活跃 Session
+默认保持最后成功渠道。租约状态是多 worker 共享的，不随进程重启丢失。
+
 ## 何时切换渠道
 
 Rotor 对网络请求错误以及以下上游 HTTP 状态执行 fallback：
@@ -33,6 +37,10 @@ Rotor 对网络请求错误以及以下上游 HTTP 状态执行 fallback：
 
 普通 4xx 参数或协议错误不会自动换渠道，以免重复发送一个确定无效的请求。
 429 的 `Retry-After` 可用于设置冷却时间。
+
+失败 attempt 不修改 Session Lease。fallback 到其他 Channel 并成功后才迁移租约，
+下一 turn 会继续使用新 Channel；旧 Channel 恢复不会立即抢回。租约空闲过期后，
+请求重新按新 Session 规则选择。
 
 一旦流式响应已经向客户端发送字节，就无法透明地重放整个响应到另一个渠道。
 详见[流式响应与故障转移](../troubleshooting/streaming-and-fallback.md)。
