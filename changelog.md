@@ -53,7 +53,7 @@
 
 ### 打包与依赖
 
-- 移除仓库内自带的 `mindagent` 副本，改为依赖已发布的 `mindagent>=0.5.3`；wheel 顶层包因此只剩 `rotor`，不再有第二个可被 `pip` 覆盖的顶层导入名。仓库内副本已移出并改名，见本地 `agent` 项目。
+- 移除仓库内自带的 `mindagent` 副本，改为依赖已发布的 `mindagent==0.5.3`（精确固定）；wheel 顶层包因此只剩 `rotor`，不再有第二个可被 `pip` 覆盖的顶层导入名。
 - 新增 [MCP 客户端](src/rotor/mcp_toolset.py)：Rotor 自己持有 MCP Client（基于官方 MCP SDK），管理页聊天在安装 `rotor-gateway[mcp]` 后仍可加载 Rotor MCP 诊断工具，回归见 [test_mcp_toolset.py](tests/test_mcp_toolset.py)。
 - 同步 `uv.lock`：补入 `mindagent 0.5.3`，并把 `rotor-gateway` 版本从 `0.5.0` 修正为 `0.5.1`。
 
