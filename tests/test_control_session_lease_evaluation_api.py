@@ -217,6 +217,13 @@ def test_session_lease_evaluation_aggregates_model_facts() -> None:
                     reason="idle_timeout",
                     created_at=start + timedelta(hours=2),
                 ),
+                _lease_event(
+                    event_id=5,
+                    request_id="req-reassessment",
+                    event_type="renewed",
+                    reason="protocol_reassessment_deferred",
+                    created_at=start + timedelta(hours=2),
+                ),
             ])
             setup_db.add_all([
                 _usage(

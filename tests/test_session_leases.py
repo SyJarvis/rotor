@@ -124,22 +124,89 @@ def test_session_lease_assigns_renews_migrates_and_expires() -> None:
                     )
                 ).all()
             )
+            # Same-channel hits refresh the lease without a renewal event.
             assert [event.event_type for event in events] == [
                 "assigned",
-                "renewed",
                 "migrated",
                 "expired",
                 "assigned",
             ]
             assert [event.reason for event in events] == [
                 "first_success",
-                "lease_hit",
                 "fallback_success",
                 "idle_timeout",
                 "post_expiry_success",
             ]
 
         await engine.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_same_channel_success_persists_sliding_idle_expiry(tmp_path) -> None:
+    async def exercise() -> None:
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'renewal.db'}"
+        )
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        started_at = datetime(2026, 8, 19, 2, 0, tzinfo=timezone.utc)
+        renewed_at = started_at + timedelta(minutes=14)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+
+            async with sessions() as db:
+                await record_session_lease_success(
+                    db,
+                    request_id="req-assigned",
+                    token_id=7,
+                    session_id="session-active",
+                    logical_model="model-a",
+                    channel_id=11,
+                    idle_ttl_seconds=900,
+                    now=started_at,
+                )
+                await db.commit()
+
+            async with sessions() as db:
+                renewed = await record_session_lease_success(
+                    db,
+                    request_id="req-renewed",
+                    token_id=7,
+                    session_id="session-active",
+                    logical_model="model-a",
+                    channel_id=11,
+                    idle_ttl_seconds=900,
+                    now=renewed_at,
+                )
+                await db.commit()
+                assert renewed.event_types == ("renewed",)
+                assert renewed.previous_channel_id == renewed.channel_id == 11
+
+            async with sessions() as db:
+                assert await get_preferred_channel_id(
+                    db,
+                    token_id=7,
+                    session_id="session-active",
+                    logical_model="model-a",
+                    now=started_at + timedelta(minutes=16),
+                ) == 11
+                lease = (await db.scalars(select(SessionLease))).one()
+                assert lease.last_used_at.replace(tzinfo=timezone.utc) == renewed_at
+                assert lease.expires_at.replace(tzinfo=timezone.utc) == (
+                    renewed_at + timedelta(minutes=15)
+                )
+                assert await get_preferred_channel_id(
+                    db,
+                    token_id=7,
+                    session_id="session-active",
+                    logical_model="model-a",
+                    now=started_at + timedelta(minutes=30),
+                ) is None
+                events = (await db.scalars(select(SessionLeaseEvent))).all()
+                assert [event.event_type for event in events] == ["assigned"]
+        finally:
+            await engine.dispose()
 
     asyncio.run(exercise())
 
@@ -217,9 +284,10 @@ def test_concurrent_first_assignment_creates_one_authoritative_lease(
         await engine.dispose()
 
         assert lease_count == 1
+        # The loser of the first-assignment race renews the lease without
+        # persisting a second event row.
         assert [item.event_type for item in events] == [
             "assigned",
-            "renewed",
         ]
 
     asyncio.run(exercise())

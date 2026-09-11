@@ -2,18 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Iterable
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.models.channel import Channel
+from rotor.models.request_attempt import RequestAttempt
 from rotor.models.session_lease import SessionLease, SessionLeaseEvent
 
 
 MIN_IDLE_TTL_SECONDS = 60
 MAX_IDLE_TTL_SECONDS = 86_400
+REASSESSMENT_DEFERRED_REASON = "protocol_reassessment_deferred"
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +23,112 @@ class SessionLeaseMutation:
     event_types: tuple[str, ...]
     channel_id: int
     previous_channel_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionLeasePreference:
+    channel_id: int | None
+    reassessment_due: bool = False
+
+
+async def get_session_lease_preference(
+    db: AsyncSession,
+    *,
+    token_id: int,
+    session_id: str | None,
+    logical_model: str,
+    request_protocol: str,
+    channels: Iterable[Channel],
+    active_native_channel_ids: set[int],
+    reassess_seconds: int = 300,
+    now: datetime | None = None,
+) -> SessionLeasePreference:
+    """Read a lease and any due recovery from a proven cross-protocol fallback."""
+    if session_id is None:
+        return SessionLeasePreference(None)
+    current_time = _as_utc(now or _utcnow())
+    lease = await _get_lease(
+        db,
+        token_id=token_id,
+        session_id=session_id,
+        logical_model=logical_model,
+    )
+    if lease is None or _is_expired(lease, current_time):
+        return SessionLeasePreference(None)
+    preference = SessionLeasePreference(lease.channel_id)
+    if (
+        reassess_seconds <= 0
+        or not active_native_channel_ids
+        or lease.channel_id in active_native_channel_ids
+    ):
+        return preference
+
+    from rotor.gateway.routing import protocol_family
+
+    family = protocol_family(request_protocol)
+    channel = next((item for item in channels if item.id == lease.channel_id), None)
+    if channel is None or protocol_family(channel.protocol) == family:
+        return preference
+
+    # Select the newest ownership/checkpoint first. Joining attempts before
+    # LIMIT could skip a newer event with missing evidence and reuse stale data.
+    anchor = await db.scalar(
+        select(SessionLeaseEvent)
+        .where(
+            SessionLeaseEvent.lease_id == lease.id,
+            or_(
+                SessionLeaseEvent.event_type.in_(("assigned", "migrated", "expired")),
+                and_(
+                    SessionLeaseEvent.event_type == "renewed",
+                    SessionLeaseEvent.reason == REASSESSMENT_DEFERRED_REASON,
+                ),
+            ),
+        )
+        .order_by(SessionLeaseEvent.id.desc())
+        .limit(1)
+    )
+    if (
+        anchor is None
+        or anchor.channel_id != lease.channel_id
+        or anchor.event_type == "expired"
+        or _as_utc(anchor.created_at) + timedelta(seconds=reassess_seconds) > current_time
+    ):
+        return preference
+
+    attempt = await db.scalar(
+        select(RequestAttempt)
+        .where(
+            RequestAttempt.request_id == anchor.request_id,
+            RequestAttempt.channel_id == lease.channel_id,
+            RequestAttempt.requested_model == logical_model,
+            RequestAttempt.outcome == "success",
+        )
+        .order_by(RequestAttempt.attempt_index.desc())
+        .limit(1)
+    )
+    if (
+        attempt is None
+        or not attempt.provider_protocol
+        or protocol_family(attempt.request_protocol) != family
+        or protocol_family(attempt.provider_protocol) == family
+    ):
+        return preference
+    source_confirmed = (
+        attempt.attempt_index > 0
+        or (
+            anchor.event_type == "migrated"
+            and anchor.reason == "leased_channel_unavailable"
+            and anchor.previous_channel_id is not None
+            and anchor.previous_channel_id != lease.channel_id
+        )
+        or (
+            anchor.event_type == "renewed"
+            and anchor.reason == REASSESSMENT_DEFERRED_REASON
+        )
+    )
+    if not source_confirmed:
+        return preference
+    return SessionLeasePreference(lease.channel_id, reassessment_due=True)
 
 
 async def get_preferred_channel_id(
@@ -62,6 +170,9 @@ async def record_session_lease_success(
     The unique database key is the cross-worker source of truth. A nested
     transaction handles two workers concurrently creating the same lease
     without rolling back the caller's accounting transaction.
+
+    Ordinary same-channel hits refresh the idle expiry without a renewal
+    event. A deferred protocol reassessment also writes a fixed-time checkpoint.
     """
     current_time = _as_utc(now or _utcnow())
     ttl = _valid_ttl(idle_ttl_seconds)
@@ -73,6 +184,16 @@ async def record_session_lease_success(
         logical_model=logical_model,
         for_update=True,
     )
+
+    if migration_reason == REASSESSMENT_DEFERRED_REASON and (
+        lease is None or lease.channel_id != channel_id
+    ):
+        # A slow fallback must not reclaim ownership after another request
+        # already recovered or migrated this lease to a different channel.
+        return SessionLeaseMutation(
+            event_types=(),
+            channel_id=lease.channel_id if lease is not None else channel_id,
+        )
 
     if lease is None:
         lease = SessionLease(
@@ -146,27 +267,41 @@ async def record_session_lease_success(
             channel_id=channel_id,
         )
 
-    lease.channel_id = channel_id
+    if previous_channel_id != channel_id:
+        lease.channel_id = channel_id
+        lease.last_used_at = current_time
+        lease.expires_at = expires_at
+        _add_event(
+            db,
+            lease=lease,
+            request_id=request_id,
+            event_type="migrated",
+            previous_channel_id=previous_channel_id,
+            channel_id=channel_id,
+            reason=migration_reason,
+            created_at=current_time,
+        )
+        return SessionLeaseMutation(
+            event_types=("migrated",),
+            previous_channel_id=previous_channel_id,
+            channel_id=channel_id,
+        )
+
     lease.last_used_at = current_time
     lease.expires_at = expires_at
-    if previous_channel_id == channel_id:
-        event_type = "renewed"
-        reason = "lease_hit"
-    else:
-        event_type = "migrated"
-        reason = migration_reason
-    _add_event(
-        db,
-        lease=lease,
-        request_id=request_id,
-        event_type=event_type,
-        previous_channel_id=previous_channel_id,
-        channel_id=channel_id,
-        reason=reason,
-        created_at=current_time,
-    )
+    if migration_reason == REASSESSMENT_DEFERRED_REASON:
+        _add_event(
+            db,
+            lease=lease,
+            request_id=request_id,
+            event_type="renewed",
+            previous_channel_id=channel_id,
+            channel_id=channel_id,
+            reason=REASSESSMENT_DEFERRED_REASON,
+            created_at=current_time,
+        )
     return SessionLeaseMutation(
-        event_types=(event_type,),
+        event_types=("renewed",),
         previous_channel_id=previous_channel_id,
         channel_id=channel_id,
     )
@@ -205,7 +340,7 @@ async def _get_lease(
         SessionLease.logical_model == logical_model,
     )
     if for_update:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update().execution_options(populate_existing=True)
     return (await db.scalars(statement)).one_or_none()
 
 

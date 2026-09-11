@@ -9,6 +9,7 @@ from rotor.models.request_attempt import RequestAttempt
 from rotor.models.routing_decision import RoutingDecisionRecord
 from rotor.models.session_lease import SessionLeaseEvent
 from rotor.models.usage import UsageLedger
+from rotor.services.session_leases import REASSESSMENT_DEFERRED_REASON
 from rotor.schemas.control import (
     SessionLeaseEvaluationCohort,
     SessionLeaseEvaluationSummary,
@@ -86,6 +87,8 @@ async def evaluate_session_leases(
     }
     fallback_migration_count = 0
     for row in event_rows:
+        if row.event_type == "renewed" and row.reason == REASSESSMENT_DEFERRED_REASON:
+            continue
         event_counts[row.event_type] = (
             event_counts.get(row.event_type, 0) + int(row.event_count or 0)
         )
