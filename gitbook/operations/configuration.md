@@ -63,7 +63,7 @@ Session Lease 运行时字段为：
 | --- | --- | --- |
 | `routing.affinity_enabled` | `true` | 启用稳定 Session 识别与亲和；关闭时同时停用租约 |
 | `routing.session_lease_enabled` | `true` | 启用数据库持久化 Session Lease |
-| `routing.session_lease_idle_ttl_seconds` | `900` | 最后一次成功后的空闲 TTL，范围 60–86400 秒 |
+| `routing.session_lease_idle_ttl_seconds` | `1800` | 最后一次成功后的空闲 TTL，范围 60–86400 秒 |
 
 Channel 级和 logical model 级 TTL 覆盖见 [Channel 字段](../reference/channel-schema.md)。
 

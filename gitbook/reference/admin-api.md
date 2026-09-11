@@ -141,7 +141,7 @@ Channel 请求字段见 [Channel 字段](channel-schema.md)。
 
 更新设置需要提交完整 `ApplicationSettings` 对象，未知字段会被拒绝。
 `routing.session_lease_enabled` 控制持久化租约，默认开启；
-`routing.session_lease_idle_ttl_seconds` 默认为 900，允许 60–86400 秒。关闭
+`routing.session_lease_idle_ttl_seconds` 默认为 1800，允许 60–86400 秒。关闭
 `routing.affinity_enabled` 时租约不会读取或更新。
 
 ## 只读 Session Lease 评估

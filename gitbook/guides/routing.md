@@ -41,7 +41,7 @@ curl -X PUT -b "$ROTOR_ADMIN_COOKIE_JAR" \
       "strategy": "adaptive",
       "affinity_enabled": true,
       "session_lease_enabled": true,
-      "session_lease_idle_ttl_seconds": 900,
+      "session_lease_idle_ttl_seconds": 1800,
       "adaptive_success_weight": 0.55,
       "adaptive_latency_weight": 0.25,
       "adaptive_cost_weight": 0.10,
@@ -72,7 +72,7 @@ Session 可以来自显式 `X-Conversation-Id` / `X-Rotor-Session-Id`，也可�
 渠道仍健康且兼容时优先使用。只有成功的上游请求才 assigned/renewed 租约；fallback
 成功后迁移到实际成功渠道，因此旧渠道 cooldown 结束也不会立即抢回活跃 Session。
 
-默认 `session_lease_idle_ttl_seconds=900`，范围为 60–86400 秒。Channel `extra` 可用
+默认 `session_lease_idle_ttl_seconds=1800`，范围为 60–86400 秒。Channel `extra` 可用
 `session_lease_idle_ttl_seconds` 覆盖渠道值，或用
 `session_lease_idle_ttl_by_model` 对 logical model 和 `*` 配置。它是路由空闲 TTL，
 不是 provider cache TTL。
