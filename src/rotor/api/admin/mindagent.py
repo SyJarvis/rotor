@@ -279,11 +279,10 @@ async def _build_rotor_mcp_registry(run_id: str):
             "ROTOR_CONTROL_API_TOKEN 未配置，无法启动 Rotor MCP"
         )
     try:
-        from mindagent.tools import MCPToolSet
-    except ImportError as exc:
+        from rotor.mcp_toolset import MCPToolSet
+    except ImportError as exc:  # pragma: no cover - mindagent is a dependency
         raise RuntimeError(
-            "当前 MindAgent 版本不支持 Rotor MCP；请升级 MindAgent，"
-            "或清除 ROTOR_MINDAGENT_MCP_COMMAND 以禁用 MCP。"
+            "缺少 mindagent 依赖，无法启动 Rotor MCP"
         ) from exc
 
     tool_set = MCPToolSet.stdio(
