@@ -1,7 +1,8 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from sqlalchemy import case, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.core.resource_scopes import ResourceScopes, resolve_resource_scopes
@@ -11,6 +12,7 @@ from rotor.models.token import Token
 from rotor.models.usage import UsageLedger
 from rotor.models.routing_decision import RoutingDecisionRecord
 from rotor.gateway.pricing import UsageCost, calculate_usage_cost
+from rotor.gateway.routing import AttemptAdmission
 from rotor.services.session_leases import (
     record_session_lease_success,
     resolve_idle_ttl_seconds,
@@ -125,6 +127,7 @@ class AccountingService:
                         decision, "lease_channel_id", None
                     ),
                     "used": getattr(decision, "lease_used", False),
+                    "reassessment_attempted": getattr(decision, "lease_reassessment_attempted", False),
                 },
                 "candidate_resource_scopes": {
                     str(channel.id): resolve_resource_scopes(channel).as_dict()
@@ -147,6 +150,8 @@ class AccountingService:
         usage: UsageData,
         latency_ms: int,
         client_ip: str,
+        attempt_latency_ms: int | None = None,
+        admission: AttemptAdmission | None = None,
         capacity_snapshot: dict[str, str] | None = None,
         tariff_at: datetime | float | None = None,
         lease_session_id: str | None = None,
@@ -160,7 +165,7 @@ class AccountingService:
             usage=usage,
             at=tariff_at,
         )
-        self._update_token_counters(token, usage)
+        await self._update_token_counters(db, token, usage)
         self._add_request_log(
             db,
             token_id=token.id,
@@ -224,19 +229,20 @@ class AccountingService:
             lease_session_id=lease_session_id,
             lease_migration_reason=lease_migration_reason,
         )
-        # Keep online policy updates on the accounting boundary so every
-        # supported protocol feeds the same learning signal.
-        from rotor.gateway.routing import routing_engine
+        # Deferred usage retrieval has no active generation attempt to score.
+        if attempt_latency_ms is not None:
+            from rotor.gateway.routing import routing_engine
 
-        routing_engine.observe_result(
-            model,
-            channel,
-            success=True,
-            latency_ms=latency_ms,
-            # Phase 2 records pricing facts only. Cost-aware routing remains
-            # gated until observed data proves it improves Session Lease.
-            cost=None,
-        )
+            (admission.engine if admission is not None else routing_engine).observe_result(
+                model,
+                channel,
+                success=True,
+                latency_ms=attempt_latency_ms,
+                # Cost-aware routing remains gated until observed data proves
+                # it improves Session Lease.
+                cost=None,
+                admission=admission,
+            )
 
     async def record_lease_success(
         self,
@@ -288,9 +294,13 @@ class AccountingService:
         error_message: str,
         latency_ms: Optional[int],
         client_ip: str,
+        attempt_latency_ms: int | None = None,
+        admission: AttemptAdmission | None = None,
         provider_response: dict[str, Any] | None = None,
         capacity_snapshot: dict[str, str] | None = None,
+        usage: UsageData | None = None,
     ) -> None:
+        usage = usage if usage is not None else UsageData(usage_source="missing")
         resource_scopes = (
             resolve_resource_scopes(channel)
             if channel is not None
@@ -301,7 +311,7 @@ class AccountingService:
             token_id=token.id if token else None,
             channel_id=channel.id if channel else None,
             model=model,
-            usage=UsageData(usage_source="missing"),
+            usage=usage,
             success=False,
             latency_ms=latency_ms,
             client_ip=client_ip,
@@ -323,8 +333,19 @@ class AccountingService:
                 model=model,
                 request_protocol=request_protocol,
                 provider_protocol=channel.protocol if channel else None,
-                usage_source="missing",
-                usage_schema_version="2",
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+                uncached_input_tokens=usage.uncached_input_tokens,
+                cached_tokens=usage.cached_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                cache_write_5m_tokens=usage.cache_write_5m_tokens,
+                cache_write_1h_tokens=usage.cache_write_1h_tokens,
+                reasoning_tokens=usage.reasoning_tokens,
+                input_audio_tokens=usage.input_audio_tokens,
+                output_audio_tokens=usage.output_audio_tokens,
+                usage_source=usage.usage_source,
+                usage_schema_version=usage.usage_schema_version,
                 capacity_snapshot=capacity_snapshot,
                 cache_scope=(
                     resource_scopes.cache_scope if resource_scopes else None
@@ -342,14 +363,15 @@ class AccountingService:
                 latency_ms=latency_ms,
             )
         )
-        if channel is not None:
+        if channel is not None and attempt_latency_ms is not None:
             from rotor.gateway.routing import routing_engine
 
-            routing_engine.observe_result(
+            (admission.engine if admission is not None else routing_engine).observe_result(
                 model,
                 channel,
                 success=False,
-                latency_ms=latency_ms,
+                latency_ms=attempt_latency_ms,
+                admission=admission,
             )
 
     def extract_usage(self, response_data: dict) -> UsageData:
@@ -505,18 +527,43 @@ class AccountingService:
         except (TypeError, ValueError):
             return 0
 
-    def _update_token_counters(
+    async def _update_token_counters(
         self,
+        db: AsyncSession,
         token: Token,
         usage: UsageData,
     ) -> None:
-        token.request_count += 1
-        token.token_count += usage.total_tokens
-        token.used_quota += usage.total_tokens
-        token.last_used_at = datetime.now(timezone.utc)
-
-        if token.quota is not None and token.used_quota >= token.quota:
-            token.enabled = False
+        # Requests can hold stale Token objects while waiting for upstream.
+        # Increment the current database values in the accounting transaction.
+        now = datetime.now(timezone.utc)
+        await db.execute(
+            update(Token)
+            .where(Token.id == token.id)
+            .values(
+                request_count=Token.request_count + 1,
+                token_count=Token.token_count + usage.total_tokens,
+                used_quota=Token.used_quota + usage.total_tokens,
+                enabled=case(
+                    (
+                        Token.quota.is_not(None)
+                        & (Token.used_quota + usage.total_tokens >= Token.quota),
+                        False,
+                    ),
+                    else_=Token.enabled,
+                ),
+                last_used_at=case(
+                    (
+                        or_(
+                            Token.last_used_at.is_(None),
+                            Token.last_used_at <= now - timedelta(seconds=60),
+                        ),
+                        now,
+                    ),
+                    else_=Token.last_used_at,
+                ),
+            )
+            .execution_options(synchronize_session=False)
+        )
 
     def _add_request_log(
         self,

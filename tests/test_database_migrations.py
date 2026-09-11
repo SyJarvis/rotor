@@ -4,7 +4,7 @@ import subprocess
 import sys
 
 import pytest
-from sqlalchemy import MetaData, create_engine, inspect, text
+from sqlalchemy import MetaData, Text, create_engine, inspect, text
 
 from rotor.database import Base, _ensure_usage_fact_columns
 from rotor.migrations.runner import (
@@ -203,6 +203,74 @@ def test_startup_migrations_adopt_current_unversioned_database(
         ))
     engine.dispose()
     assert revision == HEAD_REVISION
+    _run_alembic(database_path, "check")
+
+
+def test_startup_migrations_adopt_text_usage_columns(
+    tmp_path: Path,
+) -> None:
+    """Adopt the unversioned schema emitted by the legacy usage helper."""
+    database_path = tmp_path / "text-usage.db"
+    legacy_metadata = MetaData()
+    for table in Base.metadata.sorted_tables:
+        table.to_metadata(legacy_metadata)
+    for table_name, column_name in (
+        ("request_logs", "usage_schema_version"),
+        ("request_logs", "cost_status"),
+        ("usage_ledger", "usage_schema_version"),
+        ("usage_ledger", "cost_status"),
+    ):
+        legacy_metadata.tables[table_name].c[column_name].type = Text()
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    legacy_metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            legacy_metadata.tables["usage_ledger"].insert().values(
+                request_id="text-legacy-request",
+                model="legacy-model",
+                request_protocol="openai_chat",
+                total_tokens=7,
+            )
+        )
+    engine.dispose()
+
+    backup_path = run_startup_migrations(_database_url(database_path))
+
+    assert backup_path is not None
+    assert backup_path.exists()
+    engine = create_engine(f"sqlite:///{database_path}")
+    with engine.connect() as connection:
+        revision = connection.scalar(text(
+            "SELECT version_num FROM alembic_version"
+        ))
+        preserved_tokens = connection.scalar(text(
+            "SELECT total_tokens FROM usage_ledger "
+            "WHERE request_id = 'text-legacy-request'"
+        ))
+        column_types = {
+            (table_name, column_name): column["type"]
+            for table_name, column_name in (
+                ("request_logs", "usage_schema_version"),
+                ("request_logs", "cost_status"),
+                ("usage_ledger", "usage_schema_version"),
+                ("usage_ledger", "cost_status"),
+            )
+            for column in inspect(connection).get_columns(table_name)
+            if column["name"] == column_name
+        }
+    engine.dispose()
+
+    assert revision == HEAD_REVISION
+    assert preserved_tokens == 7
+    assert {
+        key: column_type.length for key, column_type in column_types.items()
+    } == {
+        ("request_logs", "usage_schema_version"): 10,
+        ("request_logs", "cost_status"): 30,
+        ("usage_ledger", "usage_schema_version"): 10,
+        ("usage_ledger", "cost_status"): 30,
+    }
     _run_alembic(database_path, "check")
 
 

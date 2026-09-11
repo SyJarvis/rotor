@@ -174,6 +174,9 @@ def test_record_success_persists_usage_v2_cache_facts() -> None:
         def add(self, value) -> None:
             self.added.append(value)
 
+        async def execute(self, statement) -> None:
+            pass
+
     service = AccountingService()
     usage = service.extract_usage({
         "usage": {
@@ -259,4 +262,4 @@ def test_record_success_persists_usage_v2_cache_facts() -> None:
     assert ledger.billing_scope == "anthropic/account-a/billing"
     assert ledger.total_cost == pytest.approx(144 / 1_000_000)
     assert ledger.tariff_snapshot["unit"] == "per_million_tokens"
-    assert token.token_count == 105
+    assert ledger.total_tokens == 105

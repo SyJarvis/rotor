@@ -98,16 +98,7 @@ def _make_request(messages=None):
 
 
 async def _drain(store, timeout: float = 1.0):
-    """Wait until the worker has consumed everything currently in the queue."""
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        q = store._queue
-        if q is None or q.empty():
-            await asyncio.sleep(0.01)
-            if q is None or q.empty():
-                return
-        await asyncio.sleep(0.01)
+    await store.drain(timeout=timeout)
 
 
 def _read_lines(conv_dir):
@@ -162,7 +153,7 @@ def test_full_lifecycle_writes_one_line_and_db_row(modules):
             assert row["latency_ms"] == 123
             assert row["messages"] == [
                 {"role": "user", "content": "hello", "name": None,
-                 "tool_calls": None, "tool_call_id": None}
+                 "tool_calls": None, "tool_call_id": None, "reasoning_content": None}
             ]
             assert row["response"] == {"role": "assistant", "content": "hi"}
             assert row["usage"]["total_tokens"] == 8
@@ -184,7 +175,7 @@ def test_full_lifecycle_writes_one_line_and_db_row(modules):
     asyncio.run(scenario())
 
 
-def test_messages_preserve_tool_fields(modules):
+def test_messages_preserve_tool_and_reasoning_fields(modules):
     store_mod = modules["store_mod"]
     conv_dir = modules["conv_dir"]
 
@@ -199,6 +190,7 @@ def test_messages_preserve_tool_fields(modules):
                 ChatMessage(
                     role=Role.ASSISTANT,
                     content=None,
+                    reasoning_content="Check the weather before answering.",
                     tool_calls=[ToolCall(
                         id="call_1", type="function",
                         function=FunctionCall(name="get_weather", arguments='{"q":"sf"}'),
@@ -216,6 +208,7 @@ def test_messages_preserve_tool_fields(modules):
             row = _read_lines(conv_dir)[0]
             assert row["messages"][1]["tool_calls"][0]["function"]["name"] == "get_weather"
             assert row["messages"][1]["content"] is None
+            assert row["messages"][1]["reasoning_content"] == "Check the weather before answering."
             assert row["messages"][2]["role"] == "tool"
             assert row["messages"][2]["tool_call_id"] == "call_1"
         finally:
@@ -503,5 +496,222 @@ def test_status_reports_worker_and_drop_counters(modules):
             await store.shutdown(timeout=2)
 
         assert store.status()["worker_running"] is False
+
+    asyncio.run(scenario())
+
+
+def test_db_batches_are_bounded_and_file_commits_stay_separate(modules, monkeypatch):
+    store_mod = modules["store_mod"]
+    commits = []
+    real_commit = AsyncSession.commit
+
+    async def count_commit(db):
+        await real_commit(db)
+        commits.append(None)
+
+    monkeypatch.setattr(AsyncSession, "commit", count_commit)
+
+    async def scenario():
+        store = store_mod.ConversationStore()
+        store.attach()
+        for i in range(33):
+            handle = await store.start(
+                None, conversation_id="c", request_id=str(i),
+                token=_fake_token(), request=_make_request(), protocol="openai_chat",
+            )
+            await store.append_routing(handle, _fake_channel())
+        await store.finish(handle, "success", 1)
+        await store.drain()
+        assert len(commits) == 4  # 66 DB events / 32, plus one file event.
+        assert len(_read_lines(modules["conv_dir"])) == 1
+        await store.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_failed_batch_preserves_order_and_other_events_during_shutdown(modules, monkeypatch):
+    store_mod = modules["store_mod"]
+    real_process = store_mod.ConversationStore._process
+
+    async def fail_poison(self, db, ev):
+        if ev.record_key == ("c", "poison"):
+            raise ValueError("poison event")
+        await real_process(self, db, ev)
+
+    monkeypatch.setattr(store_mod.ConversationStore, "_process", fail_poison)
+
+    async def scenario():
+        store = store_mod.ConversationStore()
+        store.attach()
+        handle = await store.start(
+            None, conversation_id="c", request_id="good",
+            token=_fake_token(), request=_make_request(), protocol="openai_chat",
+        )
+        await store.start(
+            None, conversation_id="c", request_id="poison",
+            token=_fake_token(), request=_make_request(), protocol="openai_chat",
+        )
+        await store.append_routing(handle, _fake_channel())
+        await store.finish(handle, "success", 1)
+        await store.shutdown()
+        from rotor.models.conversation import ConversationRecord
+        async with modules["session_maker"]() as db:
+            row = (await db.execute(select(ConversationRecord))).scalar_one()
+            assert row.request_id == "good"
+            assert row.status == "success"
+            assert row.channel_id == 7
+        assert store.dropped_retry_exhausted == 1
+        assert len(_read_lines(modules["conv_dir"])) == 1
+
+    asyncio.run(scenario())
+
+
+def test_database_retry_does_not_append_file_twice(modules, monkeypatch):
+    real_commit = AsyncSession.commit
+    fail_next = False
+
+    async def fail_commit(db):
+        nonlocal fail_next
+        if fail_next:
+            fail_next = False
+            raise RuntimeError("database commit failed")
+        await real_commit(db)
+
+    monkeypatch.setattr(AsyncSession, "commit", fail_commit)
+
+    async def scenario():
+        nonlocal fail_next
+        store = modules["store_mod"].ConversationStore()
+        store.attach()
+        handle = await store.start(
+            None, conversation_id="c", request_id="r",
+            token=_fake_token(), request=_make_request(), protocol="openai_chat",
+        )
+        await store.drain()
+        fail_next = True
+        await store.finish(handle, "success", 1)
+        await store.shutdown()
+        assert len(_read_lines(modules["conv_dir"])) == 1
+        from rotor.models.conversation import ConversationRecord
+        async with modules["session_maker"]() as db:
+            row = (await db.execute(select(ConversationRecord))).scalar_one()
+            assert row.status == "success"
+        assert store.dropped_retry_exhausted == 0
+
+    asyncio.run(scenario())
+
+
+def test_drain_waits_for_inflight_commit_and_times_out(modules, monkeypatch):
+    real_commit = AsyncSession.commit
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_commit(db):
+            entered.set()
+            await release.wait()
+            await real_commit(db)
+
+        monkeypatch.setattr(AsyncSession, "commit", slow_commit)
+        store = modules["store_mod"].ConversationStore()
+        store.attach()
+        await store.start(
+            None, conversation_id="c", request_id="r",
+            token=_fake_token(), request=_make_request(), protocol="openai_chat",
+        )
+        await entered.wait()
+        assert store._queue.empty()
+        with pytest.raises(TimeoutError, match="drain timed out"):
+            await store.drain(timeout=0.01)
+        release.set()
+        await store.drain()
+        await store.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_drain_surfaces_worker_failure(modules, monkeypatch):
+    async def broken_worker(self):
+        raise RuntimeError("worker failed")
+
+    monkeypatch.setattr(modules["store_mod"].ConversationStore, "_worker", broken_worker)
+
+    async def scenario():
+        store = modules["store_mod"].ConversationStore()
+        store.attach()
+        with pytest.raises(RuntimeError, match="worker failed"):
+            await store.drain()
+        with pytest.raises(RuntimeError, match="worker failed"):
+            await store.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_batch_retry_keeps_later_routing_update_last(modules, monkeypatch):
+    store_mod = modules["store_mod"]
+    real_process = store_mod.ConversationStore._process
+    failed = False
+
+    async def fail_first_routing(self, db, ev):
+        nonlocal failed
+        if ev.record_op["fields"].get("channel_id") == 7 and not failed:
+            failed = True
+            raise RuntimeError("transient routing write failure")
+        await real_process(self, db, ev)
+
+    monkeypatch.setattr(store_mod.ConversationStore, "_process", fail_first_routing)
+
+    async def scenario():
+        store = store_mod.ConversationStore()
+        store.attach()
+        handle = await store.start(
+            None, conversation_id="c", request_id="r",
+            token=_fake_token(), request=_make_request(), protocol="openai_chat",
+        )
+        await store.append_routing(handle, _fake_channel())
+        await store.append_routing(handle, SimpleNamespace(id=8, type="openai"))
+        await store.shutdown()
+        from rotor.models.conversation import ConversationRecord
+        async with modules["session_maker"]() as db:
+            row = (await db.execute(select(ConversationRecord))).scalar_one()
+            assert row.channel_id == 8
+            assert row.provider == "openai"
+        assert store.dropped_retry_exhausted == 0
+
+    asyncio.run(scenario())
+
+
+def test_worker_observes_queue_batch_and_drain_without_extra_commits(modules, monkeypatch):
+    observations = []
+    commits = []
+    real_commit = AsyncSession.commit
+
+    async def count_commit(db):
+        await real_commit(db)
+        commits.append(None)
+
+    monkeypatch.setattr(AsyncSession, "commit", count_commit)
+    monkeypatch.setattr(modules["store_mod"], "performance_metrics", SimpleNamespace(
+        observe=lambda name, value: observations.append((name, value)),
+    ))
+
+    async def scenario():
+        store = modules["store_mod"].ConversationStore()
+        store.attach()
+        handle = await store.start(
+            None, conversation_id="c", request_id="r", token=_fake_token(),
+            request=_make_request(), protocol="openai_chat",
+        )
+        await store.append_routing(handle, _fake_channel())
+        await store.finish(handle, "success", 1)
+        await store.drain()
+        await store.shutdown()
+        assert len(commits) == 2
+        assert [value for name, value in observations if name == "store.batch_size"] == [2, 1]
+        for name, count in (("store.queue_wait_ms", 3), ("store.batch_ms", 2), ("store.drain_ms", 1)):
+            values = [value for metric, value in observations if metric == name]
+            assert len(values) == count
+            assert all(value >= 0 for value in values)
 
     asyncio.run(scenario())

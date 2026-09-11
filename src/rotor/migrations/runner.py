@@ -12,7 +12,7 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import TEXT, String, Text, create_engine, inspect
 from sqlalchemy.engine import Connection, make_url
 
 from rotor.database import Base
@@ -57,12 +57,21 @@ _REGISTERED_MODELS = (
 )
 
 _PRE_ADMIN_REVISION = "f6a7b8c9d0e1"
+_PRE_SCHEMA_PARITY_REVISION = "b8c9d0e1f2a3"
 _ADMIN_TABLES = frozenset(
     {
         "admin_auth_events",
         "admin_login_throttles",
         "admin_sessions",
         "admin_users",
+    }
+)
+_SCHEMA_PARITY_TYPE_CHANGES = frozenset(
+    {
+        ("request_logs", "usage_schema_version", 10),
+        ("request_logs", "cost_status", 30),
+        ("usage_ledger", "usage_schema_version", 10),
+        ("usage_ledger", "cost_status", 30),
     }
 )
 
@@ -105,6 +114,52 @@ def _is_admin_addition(difference: object) -> bool:
     return False
 
 
+def _normalize_difference(
+    difference: object,
+) -> tuple[object, ...] | None:
+    """Return one Alembic diff tuple from either supported diff shape.
+
+    ``compare_metadata`` emits table/index changes as tuples but groups column
+    changes in a one-item list.  Normalizing that representation lets the
+    legacy-schema classifier apply one strict allowlist to both forms.
+    """
+    if isinstance(difference, tuple):
+        return difference
+    if (
+        isinstance(difference, list)
+        and len(difference) == 1
+        and isinstance(difference[0], tuple)
+    ):
+        return difference[0]
+    return None
+
+
+def _schema_parity_signature(
+    difference: tuple[object, ...],
+) -> tuple[str, str, int] | None:
+    """Identify one of the explicitly supported legacy type differences."""
+    if len(difference) != 7 or difference[0] != "modify_type":
+        return None
+
+    _operation, schema, table_name, column_name, _details, old_type, new_type = (
+        difference
+    )
+    if schema is not None:
+        return None
+    if type(old_type) not in (Text, TEXT) or getattr(old_type, "length", None) is not None:
+        return None
+    if type(new_type) is not String or not isinstance(column_name, str):
+        return None
+    length = getattr(new_type, "length", None)
+    if not isinstance(table_name, str) or type(length) is not int:
+        return None
+
+    signature = (table_name, column_name, length)
+    if signature not in _SCHEMA_PARITY_TYPE_CHANGES:
+        return None
+    return signature
+
+
 def _legacy_revision(connection: Connection) -> str:
     context = MigrationContext.configure(
         connection,
@@ -113,8 +168,71 @@ def _legacy_revision(connection: Connection) -> str:
     differences = compare_metadata(context, Base.metadata)
     if not differences:
         return "head"
-    if all(_is_admin_addition(difference) for difference in differences):
+
+    normalized = [
+        _normalize_difference(difference) for difference in differences
+    ]
+    if any(difference is None for difference in normalized):
+        raise LegacyDatabaseError(
+            "cannot safely adopt unversioned SQLite database: "
+            "its schema does not match a known Rotor release"
+        )
+
+    # The cast above is guarded by the check immediately above.  Keeping the
+    # concrete list makes the allowlist checks below explicit and type-safe.
+    diff_tuples = [difference for difference in normalized if difference is not None]
+    parity_signatures: list[tuple[str, str, int]] = []
+    admin_additions = 0
+    for difference in diff_tuples:
+        signature = _schema_parity_signature(difference)
+        if signature is not None:
+            parity_signatures.append(signature)
+        elif _is_admin_addition(difference):
+            admin_additions += 1
+        else:
+            raise LegacyDatabaseError(
+                "cannot safely adopt unversioned SQLite database: "
+                "its schema does not match a known Rotor release"
+            )
+
+    if parity_signatures:
+        # Require the complete four-column set exactly once.  A partial set,
+        # duplicate operation, or any other type change must not be guessed.
+        if (
+            len(parity_signatures) != len(_SCHEMA_PARITY_TYPE_CHANGES)
+            or set(parity_signatures) != _SCHEMA_PARITY_TYPE_CHANGES
+        ):
+            raise LegacyDatabaseError(
+                "cannot safely adopt unversioned SQLite database: "
+                "its schema does not match a known Rotor release"
+            )
+
+        if admin_additions:
+            # f6a7 is the revision immediately before all administrator
+            # migrations.  Do not use it if any admin table already exists:
+            # the subsequent migrations would try to create that table again.
+            existing_admin_tables = _ADMIN_TABLES & set(
+                inspect(connection).get_table_names()
+            )
+            if existing_admin_tables:
+                raise LegacyDatabaseError(
+                    "cannot safely adopt unversioned SQLite database: "
+                    "its schema does not match a known Rotor release"
+                )
+            return _PRE_ADMIN_REVISION
+        return _PRE_SCHEMA_PARITY_REVISION
+
+    if admin_additions:
+        existing_admin_tables = _ADMIN_TABLES & set(
+            inspect(connection).get_table_names()
+        )
+        if existing_admin_tables:
+            raise LegacyDatabaseError(
+                "cannot safely adopt unversioned SQLite database: "
+                "its schema does not match a known Rotor release"
+            )
         return _PRE_ADMIN_REVISION
+
     raise LegacyDatabaseError(
         "cannot safely adopt unversioned SQLite database: "
         "its schema does not match a known Rotor release"
