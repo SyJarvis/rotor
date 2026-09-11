@@ -51,9 +51,15 @@
 - 版本提升至 `0.5.1`（[pyproject.toml](pyproject.toml)、[__init__.py](src/rotor/__init__.py)）；容器基础镜像改为 `python:3.12-slim`。
 - 递增入口缓存版本：`index.html` 的 `config.js?v=30`、`auth.js?v=11`；`app.js` 动态加载的 `monitoring.js?v=6`。
 
+### 打包与依赖
+
+- 移除仓库内自带的 `mindagent` 副本，改为依赖已发布的 `mindagent>=0.5.3`；wheel 顶层包因此只剩 `rotor`，不再有第二个可被 `pip` 覆盖的顶层导入名。仓库内副本已移出并改名，见本地 `agent` 项目。
+- 新增 [MCP 客户端](src/rotor/mcp_toolset.py)：Rotor 自己持有 MCP Client（基于官方 MCP SDK），管理页聊天在安装 `rotor-gateway[mcp]` 后仍可加载 Rotor MCP 诊断工具，回归见 [test_mcp_toolset.py](tests/test_mcp_toolset.py)。
+- 同步 `uv.lock`：补入 `mindagent 0.5.3`，并把 `rotor-gateway` 版本从 `0.5.0` 修正为 `0.5.1`。
+
 ### 验证
 
-- 全量测试：`pytest -q` 1498 passed、6 subtests passed、13 项既有弃用警告。
+- 全量测试：`pytest -q` 1509 passed、6 subtests passed、13 项既有弃用警告。
 - 前端测试：`node --experimental-vm-modules` 运行 4 个 `tests/*.mjs`，14 passed、0 fail。
 - `git diff --check` 通过。
 

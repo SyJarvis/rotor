@@ -248,10 +248,11 @@ database-backed `rck_` credential under **API Keys → MCP Control Keys**. The
 full value is shown only once, can be disabled or deleted independently, and
 does not accept ordinary `sk-` user tokens.
 
-The MindAgent chat in the admin UI can run independently. It loads Rotor MCP
-diagnostic tools only when an MCP command and Control token are configured.
-Its local conversation history can be created, exported as JSON, or deleted
-from the sidebar.
+The MindAgent chat in the admin UI is powered by the MindAgent library
+(`mindagent>=0.5.3`, installed with Rotor) and can run independently. Loading
+the Rotor MCP diagnostic tools additionally requires `rotor-gateway[mcp]`, an
+MCP command, and a Control token. Its local conversation history can be
+created, exported as JSON, or deleted from the sidebar.
 
 ## Important configuration
 

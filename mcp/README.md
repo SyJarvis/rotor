@@ -199,7 +199,8 @@ MindAgent 启动 MCP Server 时通过 `ROTOR_AGENT_RUN_ID` 绑定当前 Run。�
 Tool 参数暴露给模型，防止模型改写调用身份。Rotor Backend 负责最终鉴权，并会隐藏
 同一 Agent Run 自身产生的诊断请求，避免递归诊断。
 
-Rotor Backend 的 MindAgent MCP Client 是可选依赖，安装并指定独立 Server 命令：
+Rotor Backend 自带 MCP Client（`rotor.mcp_toolset`，基于官方 MCP SDK），它是可选依赖，
+安装 `mcp` extra 并指定独立 Server 命令：
 
 ```bash
 uv sync --extra mcp

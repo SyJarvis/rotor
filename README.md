@@ -225,8 +225,9 @@ usage:read
 创建数据库保存的 `rck_` 凭据。完整值只在创建时显示一次；可以单独停用或删除，且不
 接受普通的 `sk-` 用户 Token。
 
-管理页面中的 MindAgent 可以独立运行；只有配置 MCP 命令和 Control Token 后，才会
-加载 Rotor MCP 诊断工具。对话记录位于管理页侧边栏，可新建、导出 JSON 或删除。
+管理页面中的 MindAgent 对话由 MindAgent 库（`mindagent>=0.5.3`，随 Rotor 一起安装）
+驱动，可以独立运行；加载 Rotor MCP 诊断工具还需要安装 `rotor-gateway[mcp]`、配置 MCP
+命令和 Control Token。对话记录位于管理页侧边栏，可新建、导出 JSON 或删除。
 
 ## 重要配置
 
