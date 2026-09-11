@@ -14,6 +14,7 @@ from rotor.api.v1.chat import (
     _handle_streaming_request,
     accounting_service,
     conversation_store,
+    _observed_error_usage,
 )
 from rotor.adapters.factory import AdapterFactory
 from rotor.adapters.protocol.responses import (
@@ -21,12 +22,18 @@ from rotor.adapters.protocol.responses import (
     chat_response_to_responses,
     responses_required_capabilities,
     responses_request_to_chat,
+    unsupported_chat_reasoning_fields,
+    extract_responses_usage,
+    validate_responses_response,
 )
 from rotor.core.deps import get_available_channels, get_current_token
 from rotor.core.client_session import resolve_client_session
 from rotor.application_settings import application_settings
 from rotor.core.exceptions import (
     ChannelException,
+    ChannelsTemporarilyUnavailable,
+    UpstreamProtocolError,
+    UpstreamOverloaded,
     classify_error_status,
     format_error_message,
     normalize_upstream_error,
@@ -38,7 +45,7 @@ from rotor.gateway.provider_facts import (
     extract_capacity_snapshot_from_error,
 )
 from rotor.gateway.routing import routing_engine, session_lease_success_reason
-from rotor.services.session_leases import get_preferred_channel_id
+from rotor.services.session_leases import get_session_lease_preference
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.fallback import (
     retry_after_seconds,
@@ -73,6 +80,13 @@ class ResponsesStreamTransform:
         self.message_item_id: str | None = None
         self.message_output_index: int | None = None
         self.text_parts: list[str] = []
+        self.refusal_parts: list[str] = []
+        self.reasoning_parts: list[str] = []
+        self.reasoning_item_id: str | None = None
+        self.reasoning_output_index: int | None = None
+        self.content_indexes: dict[str, int] = {}
+        self.finish_reason: str | None = None
+        self.unsupported_reasoning = False
         self.tool_items: dict[int, dict[str, Any]] = {}
 
     def _event(self, event_type: str, **payload: Any) -> dict[str, Any]:
@@ -95,6 +109,7 @@ class ResponsesStreamTransform:
             "parallel_tool_calls": True,
             "tool_choice": "auto",
             "tools": [],
+            "usage": None,
         }
         if usage is not None:
             response["usage"] = {
@@ -119,9 +134,53 @@ class ResponsesStreamTransform:
     def feed(self, chunk: dict[str, Any]) -> list[dict[str, Any]]:
         choice = (chunk.get("choices") or [{}])[0]
         delta = choice.get("delta") or {}
+        if choice.get("finish_reason"):
+            self.finish_reason = choice["finish_reason"]
+        if unsupported_chat_reasoning_fields(delta):
+            self.unsupported_reasoning = True
+            raise ValueError(
+                "Upstream reasoning output requires a native Responses channel"
+            )
         events: list[dict[str, Any]] = []
-        text = delta.get("content")
-        if text:
+        reasoning = delta.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            if self.reasoning_item_id is None:
+                self.reasoning_item_id = f"rs_{uuid.uuid4().hex[:24]}"
+                self.reasoning_output_index = self.next_output_index
+                self.next_output_index += 1
+                events.append(self._event(
+                    "response.output_item.added",
+                    output_index=self.reasoning_output_index,
+                    item={
+                        "id": self.reasoning_item_id,
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": [],
+                        "status": "in_progress",
+                    },
+                ))
+                events.append(self._event(
+                    "response.content_part.added",
+                    item_id=self.reasoning_item_id,
+                    output_index=self.reasoning_output_index,
+                    content_index=0,
+                    part={"type": "reasoning_text", "text": ""},
+                ))
+            self.reasoning_parts.append(reasoning)
+            events.append(self._event(
+                "response.reasoning_text.delta",
+                item_id=self.reasoning_item_id,
+                output_index=self.reasoning_output_index,
+                content_index=0,
+                delta=reasoning,
+            ))
+        for part_type, field, parts in (
+            ("output_text", "content", self.text_parts),
+            ("refusal", "refusal", self.refusal_parts),
+        ):
+            text = delta.get(field)
+            if not text:
+                continue
             if self.message_item_id is None:
                 self.message_item_id = f"msg_{uuid.uuid4().hex[:24]}"
                 self.message_output_index = self.next_output_index
@@ -138,19 +197,26 @@ class ResponsesStreamTransform:
                     output_index=self.message_output_index,
                     item=item,
                 ))
+            if part_type not in self.content_indexes:
+                self.content_indexes[part_type] = len(self.content_indexes)
+                part = (
+                    {"type": "output_text", "text": "", "annotations": []}
+                    if part_type == "output_text"
+                    else {"type": "refusal", "refusal": ""}
+                )
                 events.append(self._event(
                     "response.content_part.added",
                     item_id=self.message_item_id,
                     output_index=self.message_output_index,
-                    content_index=0,
-                    part={"type": "output_text", "text": "", "annotations": []},
+                    content_index=self.content_indexes[part_type],
+                    part=part,
                 ))
-            self.text_parts.append(text)
+            parts.append(text)
             events.append(self._event(
-                "response.output_text.delta",
+                f"response.{part_type}.delta",
                 item_id=self.message_item_id,
                 output_index=self.message_output_index,
-                content_index=0,
+                content_index=self.content_indexes[part_type],
                 delta=text,
             ))
 
@@ -196,40 +262,87 @@ class ResponsesStreamTransform:
                 ))
         return events
 
-    def finish(self, usage: dict[str, int]) -> list[dict[str, Any]]:
+    def finish(self, usage: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if self.finish_reason not in {"stop", "length", "content_filter", "tool_calls", "function_call"}:
+            raise UpstreamProtocolError("Chat stream ended without a terminal choice")
         events: list[dict[str, Any]] = []
         indexed_output: list[tuple[int, dict[str, Any]]] = []
-        if self.message_item_id is not None:
-            text = "".join(self.text_parts)
-            part = {"type": "output_text", "text": text, "annotations": []}
+        incomplete_reason = {
+            "length": "max_output_tokens",
+            "content_filter": "content_filter",
+        }.get(self.finish_reason)
+        status = "incomplete" if incomplete_reason else "completed"
+        if self.reasoning_item_id is not None:
+            reasoning = "".join(self.reasoning_parts)
             item = {
-                "id": self.message_item_id,
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [part],
+                "id": self.reasoning_item_id,
+                "type": "reasoning",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": reasoning}],
+                "status": status,
             }
             events.extend([
                 self._event(
-                    "response.output_text.done",
-                    item_id=self.message_item_id,
-                    output_index=self.message_output_index,
+                    "response.reasoning_text.done",
+                    item_id=self.reasoning_item_id,
+                    output_index=self.reasoning_output_index,
                     content_index=0,
-                    text=text,
+                    text=reasoning,
                 ),
                 self._event(
                     "response.content_part.done",
-                    item_id=self.message_item_id,
-                    output_index=self.message_output_index,
+                    item_id=self.reasoning_item_id,
+                    output_index=self.reasoning_output_index,
                     content_index=0,
-                    part=part,
+                    part={"type": "reasoning_text", "text": reasoning},
                 ),
                 self._event(
                     "response.output_item.done",
-                    output_index=self.message_output_index,
+                    output_index=self.reasoning_output_index,
                     item=item,
                 ),
             ])
+            indexed_output.append((int(self.reasoning_output_index or 0), item))
+        if self.message_item_id is not None:
+            content = []
+            for part_type, content_index in self.content_indexes.items():
+                if part_type == "output_text":
+                    text = "".join(self.text_parts)
+                    part = {"type": "output_text", "text": text, "annotations": []}
+                    final_value = {"text": text}
+                else:
+                    refusal = "".join(self.refusal_parts)
+                    part = {"type": "refusal", "refusal": refusal}
+                    final_value = {"refusal": refusal}
+                content.append(part)
+                events.extend([
+                    self._event(
+                        f"response.{part_type}.done",
+                        item_id=self.message_item_id,
+                        output_index=self.message_output_index,
+                        content_index=content_index,
+                        **final_value,
+                    ),
+                    self._event(
+                        "response.content_part.done",
+                        item_id=self.message_item_id,
+                        output_index=self.message_output_index,
+                        content_index=content_index,
+                        part=part,
+                    ),
+                ])
+            item = {
+                "id": self.message_item_id,
+                "type": "message",
+                "status": status,
+                "role": "assistant",
+                "content": content,
+            }
+            events.append(self._event(
+                "response.output_item.done",
+                output_index=self.message_output_index,
+                item=item,
+            ))
             indexed_output.append((int(self.message_output_index or 0), item))
 
         for tool_index, state in self.tool_items.items():
@@ -237,7 +350,7 @@ class ResponsesStreamTransform:
             item = {
                 "id": state["id"],
                 "type": "function_call",
-                "status": "completed",
+                "status": status,
                 "call_id": state["call_id"],
                 "name": state["name"],
                 "arguments": arguments,
@@ -259,14 +372,19 @@ class ResponsesStreamTransform:
             indexed_output.append((state["output_index"], item))
 
         output = [item for _, item in sorted(indexed_output, key=lambda pair: pair[0])]
-        completed = self._response("completed", usage=usage)
+        completed = self._response(status, usage=usage)
         completed["output"] = output
-        events.append(self._event("response.completed", response=completed))
+        if incomplete_reason:
+            completed["incomplete_details"] = {"reason": incomplete_reason}
+        events.append(self._event(f"response.{status}", response=completed))
         return events
 
     def fail(self, message: str, code: str = "stream_error") -> list[dict[str, Any]]:
         failed = self._response("failed")
-        failed["error"] = {"code": code, "message": message}
+        failed["error"] = {
+            "code": "server_error",
+            "message": message,
+        }
         failed["incomplete_details"] = None
         return [self._event("response.failed", response=failed)]
 
@@ -335,11 +453,21 @@ async def create_response(
         # response; fallback to another provider would break the state chain.
         routing_candidates = channels
     else:
-        preferred_channel_id = await get_preferred_channel_id(
+        required_capabilities = responses_required_capabilities(request)
+        lease_preference = await get_session_lease_preference(
             db,
             token_id=token.id,
             session_id=lease_session_id,
             logical_model=chat_request.model,
+            request_protocol="openai_responses",
+            channels=channels,
+            active_native_channel_ids=routing_engine.available_native_channel_ids(
+                channels, chat_request.model, "openai_responses", required_capabilities
+            ),
+            reassess_seconds=(
+                routing_settings.session_lease_reassess_seconds
+                if routing_settings.affinity_enabled and routing_engine.protocol_affinity_enabled else 0
+            ),
         )
         affinity_key = (
             client_session.affinity_key(token.id)
@@ -347,7 +475,6 @@ async def create_response(
             else None
         )
         affinity_used = affinity_key is not None
-        required_capabilities = responses_required_capabilities(request)
         routing_decision = routing_engine.route(
             channels,
             model=chat_request.model,
@@ -355,17 +482,14 @@ async def create_response(
             request_protocol="openai_responses",
             required_capabilities=required_capabilities,
             affinity_key=affinity_key,
-            preferred_channel_id=preferred_channel_id,
+            preferred_channel_id=lease_preference.channel_id,
+            lease_reassessment_due=lease_preference.reassessment_due,
         )
         routing_candidates = routing_decision.candidates
-        # Prefer a lossless native Responses upstream, but retain converted
-        # Chat/Anthropic candidates for Codex requests containing optional
-        # hosted or namespace tools that those protocols cannot represent.
-        if not routing_decision.lease_used:
-            routing_candidates.sort(
-                key=lambda candidate: str(candidate.protocol or "").lower()
-                not in {"responses", "openai_responses"}
-            )
+        # Defer the routing-decision write: it shares the request
+        # transaction with usage accounting below (one commit on the hot
+        # path). Intentionally no flush here — the INSERT batches with the
+        # final accounting commit.
         accounting_service.record_routing_decision(
             db,
             request_id=request_id,
@@ -382,9 +506,10 @@ async def create_response(
                 **client_session.routing_features(),
             },
         )
-        await db.commit()
 
     if not routing_candidates:
+        if routing_decision is not None and routing_decision.temporarily_unavailable:
+            raise ChannelsTemporarilyUnavailable(chat_request.model, routing_decision.retry_after_seconds)
         required_capabilities = responses_required_capabilities(request)
         required = sorted(required_capabilities)
         channel_summary = routing_engine.diagnose(
@@ -418,14 +543,37 @@ async def create_response(
     )
     try:
         for attempt, channel in enumerate(routing_candidates):
+            admission = routing_engine.admit_attempt(chat_request.model, channel)
+            if admission is None:
+                continue
             attempt_context = AttemptContext.start(
                 attempt,
                 request_origin=request_origin,
                 agent_run_id=agent_run_id,
             )
+            attempt_context.admission = admission
             try:
-                routing_engine.begin_attempt(chat_request.model, channel)
                 adapter = AdapterFactory.create_adapter(channel, http_client)
+                if not getattr(adapter, "native_responses", False):
+                    omitted_tool_types = sorted({
+                        str(tool.get("type") or "unknown")
+                        for tool in request.tools or []
+                        if tool.get("type") != "function"
+                    })
+                    if omitted_tool_types:
+                        downgrade = {
+                            "event": "responses_protocol_downgrade",
+                            "request_id": request_id,
+                            "channel_id": channel.id,
+                            "target_protocol": channel.protocol,
+                            "omitted_tool_types": omitted_tool_types,
+                            "reason": "optional_tools_have_no_chat_representation",
+                        }
+                        logger.warning(
+                            "Responses protocol downgrade: %s",
+                            json.dumps(downgrade, sort_keys=True),
+                            extra=downgrade,
+                        )
                 await conversation_store.append_routing(conversation_handle, channel)
 
                 if chat_request.stream:
@@ -479,7 +627,7 @@ async def create_response(
                             "state_binding"
                             if previous_route is not None
                             else session_lease_success_reason(
-                                routing_decision, attempt
+                                routing_decision, attempt, channel=channel, request_protocol="openai_responses"
                             )
                         ),
                     )
@@ -502,13 +650,16 @@ async def create_response(
                     request_id,
                     conversation_handle,
                     request_protocol="openai_responses",
+                    response_transform=lambda data: (
+                        data if data.get("object") == "response" else chat_response_to_response(data)
+                    ),
                     attempt_context=attempt_context,
                     lease_session_id=lease_session_id,
                     lease_migration_reason=(
                         "state_binding"
                         if previous_route is not None
                         else session_lease_success_reason(
-                            routing_decision, attempt
+                            routing_decision, attempt, channel=channel, request_protocol="openai_responses"
                         )
                     ),
                 )
@@ -517,7 +668,7 @@ async def create_response(
                 )
                 if response_data.get("object") == "response":
                     response_id = response_data.get("id")
-                    if response_id:
+                    if response_id and getattr(adapter, "native_responses", False):
                         await save_response_route(
                             db,
                             response_id=response_id,
@@ -526,7 +677,10 @@ async def create_response(
                             conversation_id=conversation_id,
                             model=response_data.get("model") or chat_request.model,
                             status=response_data.get("status"),
-                            usage_accounted=response_data.get("usage") is not None,
+                            usage_accounted=(
+                                response_data.get("status") in {"completed", "incomplete"}
+                                and response_data.get("usage") is not None
+                            ),
                             request_started_at=attempt_context.started_at,
                         )
                         await db.commit()
@@ -535,7 +689,10 @@ async def create_response(
 
             except (HTTPStatusError, RequestError) as exc:
                 last_error = exc
+                if should_fallback(exc):
+                    routing_engine.mark_unavailable(chat_request.model, channel, retry_after_seconds(exc))
                 latency_ms = int((time.time() - start_time) * 1000)
+                attempt_latency_ms = attempt_context.elapsed_ms()
                 error_fact = normalize_upstream_error(exc)
                 await attempt_recorder.record(
                     context=attempt_context,
@@ -548,6 +705,7 @@ async def create_response(
                     request_protocol="openai_responses",
                     outcome="failed",
                     error=error_fact,
+                    db=db,
                 )
                 await accounting_service.record_failure(
                     db,
@@ -560,6 +718,8 @@ async def create_response(
                     error_code=type(exc).__name__,
                     error_message=format_error_message(exc),
                     latency_ms=latency_ms,
+                    attempt_latency_ms=attempt_latency_ms,
+                    admission=admission,
                     client_ip=client_ip,
                     provider_response=upstream_error_payload(exc),
                     capacity_snapshot=extract_capacity_snapshot_from_error(exc),
@@ -572,11 +732,6 @@ async def create_response(
                     )
                 await db.commit()
                 if should_fallback(exc):
-                    routing_engine.mark_unavailable(
-                        chat_request.model,
-                        channel,
-                        retry_after_seconds(exc),
-                    )
                     continue
                 if conversation_handle:
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)
@@ -584,7 +739,22 @@ async def create_response(
 
             except Exception as exc:
                 last_error = exc
+                if should_fallback(exc):
+                    routing_engine.mark_unavailable(chat_request.model, channel, retry_after_seconds(exc))
                 latency_ms = int((time.time() - start_time) * 1000)
+                attempt_latency_ms = attempt_context.elapsed_ms()
+                if isinstance(exc, (UpstreamProtocolError, UpstreamOverloaded)) and not attempt_context.recorded:
+                    await attempt_recorder.record(
+                        context=attempt_context,
+                        request_id=request_id,
+                        channel=channel,
+                        requested_model=chat_request.model,
+                        provider_model=(channel.model_mapping or {}).get(chat_request.model, chat_request.model),
+                        request_protocol="openai_responses",
+                        outcome="failed",
+                        error=normalize_upstream_error(exc),
+                        db=db,
+                    )
                 await accounting_service.record_failure(
                     db,
                     request_id=request_id,
@@ -596,8 +766,11 @@ async def create_response(
                     error_code=type(exc).__name__,
                     error_message=format_error_message(exc),
                     latency_ms=latency_ms,
+                    attempt_latency_ms=attempt_latency_ms,
+                    admission=admission,
                     client_ip=client_ip,
                     capacity_snapshot=extract_capacity_snapshot_from_error(exc),
+                    usage=_observed_error_usage(exc),
                 )
                 if conversation_handle:
                     await conversation_store.append_error(
@@ -606,9 +779,20 @@ async def create_response(
                         format_error_message(exc),
                     )
                 await db.commit()
+                if should_fallback(exc):
+                    continue
                 if conversation_handle:
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)
+                if isinstance(exc, (UpstreamProtocolError, UpstreamOverloaded)):
+                    raise ChannelException(
+                        "Upstream returned an invalid completion",
+                        status_code=classify_error_status(exc),
+                        original_error=format_error_message(exc),
+                    ) from exc
                 raise
+            finally:
+                if not streaming_response_returned:
+                    admission.engine.release_attempt(admission)
     finally:
         # Close the client unless a streaming response took ownership of it.
         if not streaming_response_returned:
@@ -617,6 +801,8 @@ async def create_response(
     await conversation_store.finish(
         conversation_handle, "failed", int((time.time() - start_time) * 1000)
     )
+    if last_error is None:
+        raise ChannelsTemporarilyUnavailable(chat_request.model, routing_engine.retry_after_seconds(chat_request.model, routing_candidates))
     raise ChannelException(
         f"All channels failed for model '{chat_request.model}'",
         status_code=classify_error_status(last_error),
@@ -670,7 +856,22 @@ async def _account_deferred_response_usage(
     capacity_snapshot: dict[str, str] | None = None,
 ) -> None:
     """Account background usage once, even when a response is polled repeatedly."""
-    usage = payload.get("usage")
+    status = payload.get("status")
+    if status not in {"completed", "incomplete", "failed", "cancelled"}:
+        return
+    if status in {"completed", "incomplete"}:
+        try:
+            validate_responses_response(payload)
+        except UpstreamProtocolError as exc:
+            raise ChannelException(
+                "Upstream returned an invalid response",
+                status_code=502,
+                original_error=format_error_message(exc),
+            ) from exc
+    try:
+        usage = extract_responses_usage(payload)
+    except UpstreamProtocolError:
+        return
     if usage is None or route.usage_accounted:
         return
     claimed = await db.execute(
@@ -685,6 +886,23 @@ async def _account_deferred_response_usage(
         return
     route.usage_accounted = True
     model = route.model or str(payload.get("model") or "unknown")
+    if status in {"failed", "cancelled"}:
+        await accounting_service.record_failure(
+            db,
+            request_id=f"req_{uuid.uuid4().hex}",
+            conversation_id=route.conversation_id,
+            request_protocol="openai_responses",
+            token=token,
+            channel=channel,
+            model=model,
+            usage=accounting_service.extract_usage({"usage": usage}),
+            error_code=f"response_{status}",
+            error_message=f"Upstream response {status}",
+            latency_ms=latency_ms,
+            client_ip=client_ip,
+            capacity_snapshot=capacity_snapshot,
+        )
+        return
     await accounting_service.record_success(
         db,
         request_id=f"req_{uuid.uuid4().hex}",
@@ -713,14 +931,17 @@ async def _native_collection_request(
     if not isinstance(model, str) or not model:
         raise HTTPException(status_code=422, detail="Field 'model' is required")
     channels = await get_available_channels(model, token, db)
-    candidates = routing_engine.route(
+    decision = routing_engine.route(
         channels,
         model=model,
         token=token,
         request_protocol="openai_responses",
         required_capabilities={"responses_native"},
-    ).candidates
+    )
+    candidates = decision.candidates
     if not candidates:
+        if decision.temporarily_unavailable:
+            raise ChannelsTemporarilyUnavailable(model, decision.retry_after_seconds)
         raise ChannelException(
             f"No native Responses channel available for model '{model}'",
             status_code=503,
@@ -729,22 +950,32 @@ async def _native_collection_request(
     last_error = None
     async with AsyncClient(timeout=120.0) as http_client:
         for channel in candidates:
-            adapter = AdapterFactory.create_adapter(channel, http_client)
-            if not isinstance(adapter, OpenAIResponsesAdapter):
+            admission = routing_engine.admit_attempt(model, channel)
+            if admission is None:
                 continue
             try:
+                adapter = AdapterFactory.create_adapter(channel, http_client)
+                if not isinstance(adapter, OpenAIResponsesAdapter):
+                    continue
                 if operation == "input_tokens":
                     upstream = await adapter.count_input_tokens(body)
                 else:
                     upstream = await adapter.compact_response(body)
-                return _upstream_response(upstream)
+                result = _upstream_response(upstream)
+                admission.provider_succeeded = True
+                return result
             except (HTTPStatusError, RequestError) as exc:
                 last_error = exc
                 if should_fallback(exc):
+                    routing_engine.mark_unavailable(model, channel, retry_after_seconds(exc))
                     continue
                 if isinstance(exc, HTTPStatusError):
                     return _upstream_error(exc)
                 raise
+            finally:
+                admission.engine.release_attempt(admission)
+    if last_error is None:
+        raise ChannelsTemporarilyUnavailable(model, routing_engine.retry_after_seconds(model, candidates))
     if isinstance(last_error, HTTPStatusError):
         return _upstream_error(last_error)
     raise ChannelException(
@@ -790,6 +1021,12 @@ async def retrieve_response(
     route, channel = await _resolve_response_channel(db, response_id, token)
     params = [(key, value) for key, value in http_request.query_params.multi_items()]
     stream = str(http_request.query_params.get("stream", "false")).lower() == "true"
+    if stream:
+        # The relay may outlive this request handler for an arbitrary amount
+        # of time. Route/channel have already been resolved, and all
+        # persistence is performed with a fresh session in relay(), so release
+        # the dependency session before waiting on the upstream stream.
+        await db.close()
     http_client = AsyncClient(timeout=120.0)
     adapter = AdapterFactory.create_adapter(channel, http_client)
     if not isinstance(adapter, OpenAIResponsesAdapter):

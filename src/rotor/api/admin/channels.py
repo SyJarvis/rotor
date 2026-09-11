@@ -46,6 +46,14 @@ class ProbeModelsRequest(BaseModel):
     extra: dict = Field(default_factory=dict)
 
 
+class SavedProbeModelsRequest(BaseModel):
+    """Only connection overrides are accepted; stored credentials stay private."""
+    base_url: str | None = Field(default=None, min_length=1)
+    type: str | None = Field(default=None, min_length=1)
+    protocol: str | None = Field(default=None, min_length=1)
+    extra: dict | None = None
+
+
 class ChannelTestResponse(BaseModel):
     ok: bool
     latency_ms: int
@@ -201,6 +209,7 @@ async def probe_models_unsaved(payload: ProbeModelsRequest):
 @router.post("/{channel_id}/probe-models", response_model=ProbeModelsResponse)
 async def probe_models(
     channel_id: int,
+    payload: SavedProbeModelsRequest | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Probe a saved channel's model list without exposing its credentials."""
@@ -212,26 +221,32 @@ async def probe_models(
             detail=f"Channel {channel_id} not found",
         )
 
+    overrides = payload.model_dump(exclude_none=True) if payload else {}
+    provider_type = overrides.get("type", channel.type)
+    protocol = overrides.get("protocol", channel.protocol)
+    extra = overrides.get("extra", channel.extra) or {}
+    # Probe-only values never mutate the ORM channel or replace its stored key.
+    extra = {name: extra[name] for name in ("models_path", "auth_type", "headers") if name in extra}
     start = time.perf_counter()
     try:
         models = await _fetch_model_list(
-            base_url=channel.base_url,
+            base_url=overrides.get("base_url", channel.base_url),
             key=channel.key,
-            provider_type=channel.type,
-            protocol=channel.protocol,
+            provider_type=provider_type,
+            protocol=protocol,
             models_path=channel_option(
-                provider=channel.type,
-                protocol=channel.protocol,
-                extra=channel.extra,
+                provider=provider_type,
+                protocol=protocol,
+                extra=extra,
                 name="models_path",
             ),
             auth_type=channel_option(
-                provider=channel.type,
-                protocol=channel.protocol,
-                extra=channel.extra,
+                provider=provider_type,
+                protocol=protocol,
+                extra=extra,
                 name="auth_type",
             ),
-            extra_headers=(channel.extra or {}).get("headers"),
+            extra_headers=extra.get("headers"),
         )
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
@@ -446,6 +461,10 @@ async def update_channel(
     return _with_stats(ChannelResponse, channel, stats.get(channel.id))
 
 
+_MODEL_CATALOG_MAX_PAGES = 100
+_MODEL_CATALOG_MAX_ITEMS = 10_000
+
+
 async def _fetch_model_list(
     *,
     base_url: str,
@@ -474,14 +493,36 @@ async def _fetch_model_list(
         auth_type=resolved_auth_type,
         extra_headers=extra_headers,
     )
-    url = join_api_url(base_url, resolved_models_path)
+    url = join_api_url(base_url, resolved_models_path, protocol=protocol)
 
+    models: set[str] = set()
+    seen_cursors: set[str] = set()
+    item_count = 0
     async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
-        payload = response.json()
-
-    return _extract_model_ids(payload)
+        for _ in range(_MODEL_CATALOG_MAX_PAGES):
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+            page = _extract_model_ids(payload)
+            item_count += len(page)
+            if item_count > _MODEL_CATALOG_MAX_ITEMS:
+                raise ValueError("Model catalog exceeds the item limit")
+            models.update(page)
+            more = False
+            if isinstance(payload, dict):
+                more = payload.get("has_more", payload.get("hasMore", False))
+                if not isinstance(more, bool):
+                    raise ValueError("Invalid model catalog pagination flag")
+                if "has_more" in payload and "hasMore" in payload and payload["has_more"] != payload["hasMore"]:
+                    raise ValueError("Conflicting model catalog pagination flags")
+            if not more:
+                return sorted(models)
+            cursor = payload.get("last_id", payload.get("lastId"))
+            if not page or not isinstance(cursor, str) or not cursor.strip() or cursor in seen_cursors:
+                raise ValueError("Invalid or repeated model catalog cursor")
+            seen_cursors.add(cursor)
+            url = httpx.URL(url).copy_set_param("after_id", cursor)
+    raise ValueError("Model catalog exceeds the page limit")
 
 
 async def _channel_stats(
@@ -532,42 +573,22 @@ def _with_stats(schema, channel: Channel, stats):
 
 def _extract_model_ids(payload) -> list[str]:
     if isinstance(payload, dict):
-        data = payload.get("data")
-        if isinstance(data, list):
-            ids = []
-            for item in data:
-                if isinstance(item, dict):
-                    model_id = item.get("id") or item.get("name")
-                    if model_id:
-                        ids.append(str(model_id))
-                elif isinstance(item, str):
-                    ids.append(item)
-            return sorted(set(ids))
-
-        models = payload.get("models")
-        if isinstance(models, list):
-            ids = []
-            for item in models:
-                if isinstance(item, dict):
-                    model_id = item.get("id") or item.get("name")
-                    if model_id:
-                        ids.append(str(model_id))
-                elif item:
-                    ids.append(str(item))
-            return sorted(set(ids))
-
-    if isinstance(payload, list):
-        ids = []
-        for item in payload:
-            if isinstance(item, dict):
-                model_id = item.get("id") or item.get("name")
-                if model_id:
-                    ids.append(str(model_id))
-            elif item:
-                ids.append(str(item))
-        return sorted(set(ids))
-
-    return []
+        if payload.get("error") or payload.get("type") == "error" or payload.get("success") is False:
+            raise ValueError("Provider returned a model catalog error")
+        if "code" in payload and payload["code"] not in (0, 200, "0", "200"):
+            raise ValueError("Provider returned a model catalog error")
+        data = payload.get("data", payload.get("models"))
+    else:
+        data = payload
+    if not isinstance(data, list):
+        raise ValueError("Provider returned an invalid model catalog")
+    ids = []
+    for item in data:
+        model_id = item.get("id") or item.get("name") if isinstance(item, dict) else item
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ValueError("Provider returned an invalid model catalog entry")
+        ids.append(model_id)
+    return ids
 
 
 @router.delete("/{channel_id}", status_code=status.HTTP_204_NO_CONTENT)

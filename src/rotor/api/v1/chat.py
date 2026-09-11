@@ -17,15 +17,19 @@ from rotor.schemas.request import (
 )
 from rotor.schemas.error import ErrorPhase
 from rotor.adapters.factory import AdapterFactory
+from rotor.adapters.protocol.openai_integrity import ChatStreamIntegrity, validate_chat_response
+from rotor.adapters.protocol.responses import validate_responses_response
 from rotor.gateway.accounting import AccountingService, StreamingUsageAccumulator
 from rotor.gateway.provider_facts import (
     extract_capacity_snapshot,
     extract_capacity_snapshot_from_error,
 )
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
+from rotor.gateway.capabilities import chat_required_capabilities
 from rotor.conversations.store import ConversationHandle, ConversationStore
 from rotor.gateway.routing import routing_engine, session_lease_success_reason
-from rotor.services.session_leases import get_preferred_channel_id
+from rotor.services.session_leases import get_session_lease_preference
+from rotor.gateway.streaming import AdmissionStreamingResponse
 from rotor.gateway.fallback import (
     retry_after_seconds,
     set_routing_headers,
@@ -34,10 +38,11 @@ from rotor.gateway.fallback import (
 from rotor.models.channel import Channel
 from rotor.core.exceptions import (
     ChannelException,
+    ChannelsTemporarilyUnavailable,
     UpstreamOverloaded,
+    UpstreamProtocolError,
     classify_error_status,
     format_error_message,
-    is_overload_error_signal,
     normalize_upstream_error,
     upstream_error_payload,
 )
@@ -48,6 +53,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 accounting_service = AccountingService()
 conversation_store = ConversationStore()
+
+
+class EmptyUpstreamResponse(UpstreamProtocolError):
+    """The provider closed a stream without producing a completion."""
+
+
+def _observed_error_usage(error):
+    usage = getattr(error, "provider_usage", None)
+    return accounting_service.extract_usage({"usage": usage}) if usage is not None else None
 
 
 @router.post("/chat/completions", response_model=None)
@@ -88,11 +102,21 @@ async def chat_completions(
         and routing_settings.session_lease_enabled
         else None
     )
-    preferred_channel_id = await get_preferred_channel_id(
+    required_capabilities = chat_required_capabilities(request)
+    lease_preference = await get_session_lease_preference(
         db,
         token_id=token.id,
         session_id=lease_session_id,
         logical_model=request.model,
+        request_protocol="openai_chat",
+        channels=channels,
+        active_native_channel_ids=routing_engine.available_native_channel_ids(
+            channels, request.model, "openai_chat", required_capabilities
+        ),
+        reassess_seconds=(
+            routing_settings.session_lease_reassess_seconds
+            if routing_settings.affinity_enabled and routing_engine.protocol_affinity_enabled else 0
+        ),
     )
     affinity_key = (
         client_session.affinity_key(token.id)
@@ -100,7 +124,6 @@ async def chat_completions(
         else None
     )
     affinity_used = affinity_key is not None
-    required_capabilities = {"stream"} if request.stream else set()
     routing_decision = routing_engine.route(
         channels,
         model=request.model,
@@ -108,9 +131,23 @@ async def chat_completions(
         request_protocol="openai_chat",
         required_capabilities=required_capabilities,
         affinity_key=affinity_key,
-        preferred_channel_id=preferred_channel_id,
+        preferred_channel_id=lease_preference.channel_id,
+        lease_reassessment_due=lease_preference.reassessment_due,
     )
     candidates = routing_decision.candidates
+    if not candidates:
+        if routing_decision.temporarily_unavailable:
+            raise ChannelsTemporarilyUnavailable(request.model, routing_decision.retry_after_seconds)
+        raise ChannelException(
+            f"No compatible channel available for Chat model '{request.model}'. "
+            f"Required capabilities: {sorted(required_capabilities)}",
+            status_code=503,
+        )
+    # Defer the routing-decision write: it shares the request transaction
+    # with usage accounting below, so the hot path performs one commit
+    # instead of one before the upstream call plus one after it.
+    # NOTE: intentionally no flush here — the INSERT is batched with the
+    # final accounting commit.
     accounting_service.record_routing_decision(
         db,
         request_id=request_id,
@@ -127,7 +164,6 @@ async def chat_completions(
             **client_session.routing_features(),
         },
     )
-    await db.commit()
 
     # Record start time
     start_time = time.time()
@@ -147,13 +183,16 @@ async def chat_completions(
     )
     try:
         for attempt, channel in enumerate(candidates):
+            admission = routing_engine.admit_attempt(request.model, channel)
+            if admission is None:
+                continue
             attempt_context = AttemptContext.start(
                 attempt,
                 request_origin=request_origin,
                 agent_run_id=agent_run_id,
             )
+            attempt_context.admission = admission
             try:
-                routing_engine.begin_attempt(request.model, channel)
                 # Create adapter
                 adapter = AdapterFactory.create_adapter(channel, http_client)
                 await conversation_store.append_routing(conversation_handle, channel)
@@ -168,7 +207,7 @@ async def chat_completions(
                         attempt_context=attempt_context,
                         lease_session_id=lease_session_id,
                         lease_migration_reason=session_lease_success_reason(
-                            routing_decision, attempt
+                            routing_decision, attempt, channel=channel, request_protocol="openai_chat"
                         ),
                     )
                     set_routing_headers(result, channel, request.model, attempt > 0)
@@ -186,14 +225,17 @@ async def chat_completions(
                         attempt_context=attempt_context,
                         lease_session_id=lease_session_id,
                         lease_migration_reason=session_lease_success_reason(
-                            routing_decision, attempt
+                            routing_decision, attempt, channel=channel, request_protocol="openai_chat"
                         ),
                     )
 
             except (HTTPStatusError, RequestError) as e:
                 last_error = e
+                if should_fallback(e):
+                    routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(e))
                 logger.warning(f"Channel {channel.name} failed: {format_error_message(e)}")
                 latency_ms = int((time.time() - start_time) * 1000)
+                attempt_latency_ms = attempt_context.elapsed_ms()
                 error_fact = normalize_upstream_error(e)
                 await attempt_recorder.record(
                     context=attempt_context,
@@ -206,6 +248,7 @@ async def chat_completions(
                     request_protocol="openai_chat",
                     outcome="failed",
                     error=error_fact,
+                    db=db,
                 )
                 await accounting_service.record_failure(
                     db,
@@ -218,6 +261,8 @@ async def chat_completions(
                     error_code=type(e).__name__,
                     error_message=format_error_message(e),
                     latency_ms=latency_ms,
+                    attempt_latency_ms=attempt_latency_ms,
+                    admission=admission,
                     client_ip=client_ip,
                     provider_response=upstream_error_payload(e),
                     capacity_snapshot=extract_capacity_snapshot_from_error(e),
@@ -230,11 +275,6 @@ async def chat_completions(
                     )
                 await db.commit()
                 if should_fallback(e):
-                    routing_engine.mark_unavailable(
-                        request.model,
-                        channel,
-                        retry_after_seconds(e),
-                    )
                     continue
                 if conversation_handle:
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)
@@ -242,8 +282,23 @@ async def chat_completions(
 
             except Exception as e:
                 last_error = e
+                if should_fallback(e):
+                    routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(e))
                 logger.error(f"Unexpected error with channel {channel.name}: {format_error_message(e)}")
                 latency_ms = int((time.time() - start_time) * 1000)
+                attempt_latency_ms = attempt_context.elapsed_ms()
+                if isinstance(e, (UpstreamProtocolError, UpstreamOverloaded)) and not attempt_context.recorded:
+                    await attempt_recorder.record(
+                        context=attempt_context,
+                        request_id=request_id,
+                        channel=channel,
+                        requested_model=request.model,
+                        provider_model=(channel.model_mapping or {}).get(request.model, request.model),
+                        request_protocol="openai_chat",
+                        outcome="failed",
+                        error=normalize_upstream_error(e),
+                        db=db,
+                    )
                 await accounting_service.record_failure(
                     db,
                     request_id=request_id,
@@ -255,8 +310,11 @@ async def chat_completions(
                     error_code=type(e).__name__,
                     error_message=format_error_message(e),
                     latency_ms=latency_ms,
+                    attempt_latency_ms=attempt_latency_ms,
+                    admission=admission,
                     client_ip=client_ip,
                     capacity_snapshot=extract_capacity_snapshot_from_error(e),
+                    usage=_observed_error_usage(e),
                 )
                 if conversation_handle:
                     await conversation_store.append_error(
@@ -265,9 +323,20 @@ async def chat_completions(
                         format_error_message(e),
                     )
                 await db.commit()
+                if should_fallback(e):
+                    continue
                 if conversation_handle:
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)
+                if isinstance(e, (UpstreamProtocolError, UpstreamOverloaded)):
+                    raise ChannelException(
+                        "Upstream returned an invalid completion",
+                        status_code=classify_error_status(e),
+                        original_error=format_error_message(e),
+                    ) from e
                 raise
+            finally:
+                if not streaming_response_returned:
+                    admission.engine.release_attempt(admission)
     finally:
         # Close the client unless a streaming response took ownership of it.
         # This covers non-streaming requests and streaming requests whose
@@ -280,6 +349,8 @@ async def chat_completions(
     await conversation_store.finish(
         conversation_handle, "failed", int((time.time() - start_time) * 1000)
     )
+    if last_error is None:
+        raise ChannelsTemporarilyUnavailable(request.model, routing_engine.retry_after_seconds(request.model, candidates))
     raise ChannelException(
         f"All channels failed for model '{request.model}'",
         status_code=classify_error_status(last_error),
@@ -301,15 +372,36 @@ async def _handle_non_streaming_request(
     attempt_context: AttemptContext | None = None,
     lease_session_id: str | None = None,
     lease_migration_reason: str = "request_success",
+    response_transform=None,
 ) -> dict:
     """Handle non-streaming chat completion request."""
+    admission = attempt_context.admission if attempt_context is not None else None
     # Make the request
     response = await adapter.make_request(request)
 
     # Convert response
-    response_data = await adapter.convert_response(response, request)
+    try:
+        response_data = await adapter.convert_response(response, request)
+        if isinstance(response_data, dict) and response_data.get("object") == "response":
+            validate_responses_response(response_data, allow_background=request_protocol == "openai_responses")
+        else:
+            validate_chat_response(
+                response_data, upstream_status=response.status_code,
+                secret=getattr(channel, "key", None), expected_choices=request.n,
+            )
+        client_response = response_transform(response_data) if response_transform else response_data
+        if response_transform:
+            validate_responses_response(client_response, allow_background=True)
+    except (UpstreamProtocolError, UpstreamOverloaded) as exc:
+        exc.upstream_status = response.status_code
+        raise
+    if admission is not None:
+        admission.provider_succeeded = True
 
     latency_ms = int((time.time() - start_time) * 1000)
+    attempt_latency_ms = (
+        attempt_context.elapsed_ms() if attempt_context is not None else None
+    )
     usage = accounting_service.extract_usage(response_data)
     provider_model = adapter.map_model_name(request.model)
     client_ip = http_request.client.host if http_request.client else "unknown"
@@ -318,9 +410,10 @@ async def _handle_non_streaming_request(
         request_protocol == "openai_responses"
         and response_data.get("object") == "response"
         and response_data.get("status") in {"queued", "in_progress"}
-        and response_data.get("usage") is None
     )
     if attempt_context is not None:
+        # Join the request transaction: one commit covers the routing
+        # decision, this attempt, and usage accounting below.
         await attempt_recorder.record(
             context=attempt_context,
             request_id=request_id,
@@ -329,6 +422,7 @@ async def _handle_non_streaming_request(
             provider_model=provider_model,
             request_protocol=request_protocol,
             outcome="success",
+            db=db,
         )
     if not deferred_background_usage:
         await accounting_service.record_success(
@@ -342,6 +436,8 @@ async def _handle_non_streaming_request(
             provider_model=provider_model,
             usage=usage,
             latency_ms=latency_ms,
+            attempt_latency_ms=attempt_latency_ms,
+            admission=admission,
             client_ip=client_ip,
             capacity_snapshot=extract_capacity_snapshot(
                 getattr(response, "headers", {})
@@ -355,8 +451,8 @@ async def _handle_non_streaming_request(
             lease_migration_reason=lease_migration_reason,
         )
     else:
-        # A queued native Responses object has successfully established
-        # upstream ownership even though its token usage arrives on polling.
+        # A nonterminal native Responses object establishes ownership, but
+        # any intermediate usage must wait for a terminal polling result.
         await accounting_service.record_lease_success(
             db,
             request_id=request_id,
@@ -366,13 +462,21 @@ async def _handle_non_streaming_request(
             lease_session_id=lease_session_id,
             lease_migration_reason=lease_migration_reason,
         )
+        if attempt_latency_ms is not None:
+            (admission.engine if admission is not None else routing_engine).observe_result(
+                request.model,
+                channel,
+                success=True,
+                latency_ms=attempt_latency_ms,
+                admission=admission,
+            )
     await conversation_store.append_response(conversation_handle, response_data)
     await conversation_store.append_usage(conversation_handle, response_data.get("usage") or {})
     await conversation_store.finish(conversation_handle, "success", latency_ms)
 
     await db.commit()
 
-    return response_data
+    return client_response
 
 
 async def _handle_streaming_request(
@@ -395,12 +499,24 @@ async def _handle_streaming_request(
     lease_session_id: str | None = None,
     lease_migration_reason: str = "request_success",
 ) -> StreamingResponse:
-    """Handle streaming chat completion request."""
+    """Handle streaming chat completion request.
+
+    The routing-decision row was staged on ``db`` before the upstream call.
+    Commit it now: streaming accounting runs on a fresh session after the
+    body completes, and the request session is about to be closed (which
+    would otherwise roll the staged row back). The decision is immutable
+    audit data, so committing it early does not affect the single-commit
+    accounting of attempt + usage rows below. Test doubles may not
+    implement ``commit``; skip it then (there is nothing real to persist).
+    """
 
     # FastAPI keeps yield-based dependencies alive until a StreamingResponse
     # finishes.  Release the request session now so a slow client/provider does
     # not occupy a pool connection for the lifetime of the stream.  Accounting
     # below uses a short-lived session once streaming has completed.
+    admission = attempt_context.admission if attempt_context is not None else None
+    if hasattr(db, "commit"):
+        await db.commit()
     await db.close()
 
     async def stream_generator():
@@ -410,35 +526,167 @@ async def _handle_streaming_request(
             stream_usage = StreamingUsageAccumulator()
             collected_text: list[str] = []
             collected_tool_calls: dict[int, dict] = {}
+            saw_meaningful_output = False
             last_finish_reason: str | None = None
             completed_native_response: dict | None = None
+            latest_native_response: dict | None = None
+            last_native_sequence = -1
+            chat_integrity = ChatStreamIntegrity(
+                upstream_status=getattr(response, "status_code", None),
+                secret=getattr(channel, "key", None), expected_choices=request.n,
+            )
             deferred_native_terminal: dict | None = None
             accounting_recorded = False
+            accounting_response = response
+
+            async def close_upstream_response(stream_response) -> None:
+                """Close one upstream response without masking stream errors."""
+                close = getattr(stream_response, "aclose", None)
+                if not callable(close):
+                    return
+                try:
+                    await close()
+                except Exception:
+                    logger.warning(
+                        "Closing upstream stream failed for request_id=%s",
+                        request_id,
+                        exc_info=True,
+                    )
+
+            def has_nonempty_payload(value) -> bool:
+                """Return whether a protocol payload contains any value."""
+                return bool(value)
+
+            def has_meaningful_output(chunk: dict) -> bool:
+                """Return whether a chat chunk contains output worth replaying.
+
+                Providers use a few extensions for valid non-text output.  Do
+                not treat role/finish metadata alone as output, but recognize
+                refusal, audio, legacy function calls, and reasoning deltas so
+                those streams are not replayed or rejected as empty.
+                """
+                if not isinstance(chunk, dict):
+                    return False
+                # A non-empty usage snapshot is evidence that the provider
+                # completed work even when the generated text is empty.
+                if has_nonempty_payload(chunk.get("usage")):
+                    return True
+                output_fields = (
+                    "content",
+                    "tool_calls",
+                    "function_call",
+                    "refusal",
+                    "audio",
+                    "reasoning_content",
+                    "reasoning",
+                    "reasoning_details",
+                    "thinking",
+                    "thinking_content",
+                    "output_text",
+                    "output",
+                )
+
+                def payload_has_output(payload) -> bool:
+                    if not isinstance(payload, dict):
+                        return False
+                    return any(
+                        has_nonempty_payload(payload.get(field))
+                        for field in output_fields
+                    )
+
+                choices = chunk.get("choices") or []
+                for choice in choices:
+                    if not isinstance(choice, dict):
+                        continue
+                    if payload_has_output(choice):
+                        return True
+                    if payload_has_output(choice.get("delta")):
+                        return True
+                    if payload_has_output(choice.get("message")):
+                        return True
+                return payload_has_output(chunk)
+
+            def is_nonempty_stream_event(chunk: dict) -> bool:
+                """Stop retrying on output or an explicit provider error."""
+                return (
+                    isinstance(chunk, dict)
+                    and chunk.get("error") is not None
+                ) or has_meaningful_output(chunk)
+
+            async def stream_with_empty_retry(initial_response):
+                """Retry one empty non-native stream before failing the request.
+
+                Prelude/finish-only chunks are held until the stream proves it
+                contains output. This makes the retry invisible to clients and
+                prevents replaying any text or tool-call delta.
+                """
+                nonlocal accounting_response
+                allow_retry = not native_responses_stream
+                if not allow_retry:
+                    try:
+                        async for stream_chunk in adapter.stream_convert_response(
+                            initial_response,
+                            request,
+                        ):
+                            yield stream_chunk
+                    finally:
+                        await close_upstream_response(initial_response)
+                    return
+
+                current_response = initial_response
+                for stream_index in range(2):
+                    pending_chunks: list[dict] = []
+                    meaningful = False
+                    try:
+                        async for stream_chunk in adapter.stream_convert_response(
+                            current_response,
+                            request,
+                        ):
+                            if meaningful:
+                                yield stream_chunk
+                                continue
+                            if is_nonempty_stream_event(stream_chunk):
+                                meaningful = True
+                                for pending_chunk in pending_chunks:
+                                    yield pending_chunk
+                                pending_chunks.clear()
+                                yield stream_chunk
+                            else:
+                                pending_chunks.append(stream_chunk)
+                    finally:
+                        await close_upstream_response(current_response)
+
+                    if meaningful:
+                        return
+                    if stream_index == 1:
+                        raise EmptyUpstreamResponse(
+                            "Upstream returned an empty stream"
+                        )
+
+                    make_request = getattr(adapter, "make_request", None)
+                    if not callable(make_request):
+                        raise EmptyUpstreamResponse(
+                            "Upstream returned an empty stream"
+                        )
+                    logger.warning(
+                        "Upstream returned an empty stream; retrying once "
+                        "request_id=%s channel_id=%s",
+                        request_id,
+                        getattr(channel, "id", None),
+                    )
+                    current_response = await make_request(request)
+                    accounting_response = current_response
 
             if stream_transform:
                 for event in stream_transform.start():
                     yield f"data: {_json_dumps(event)}\n\n"
 
-            async for chunk in adapter.stream_convert_response(response, request):
-                native_event_type = chunk.get("type") if native_responses_stream else None
+            async for chunk in stream_with_empty_retry(response):
                 if not native_responses_stream:
-                    # OpenAI-compatible upstreams can emit error objects
-                    # mid-stream (e.g. 529-style overload). Surface overload /
-                    # rate-limit signals to the routing layer; other error
-                    # chunks keep flowing to the client unchanged.
-                    error_payload = chunk.get("error")
-                    if isinstance(error_payload, (dict, str)):
-                        if isinstance(error_payload, dict):
-                            error_type = (
-                                error_payload.get("type") or error_payload.get("code")
-                            )
-                            message = error_payload.get("message")
-                        else:
-                            error_type = None
-                            message = error_payload
-                        message = message or "Upstream stream error"
-                        if is_overload_error_signal(error_type, message):
-                            raise UpstreamOverloaded(message, error_type=error_type)
+                    chat_integrity.feed(chunk)
+                if has_meaningful_output(chunk):
+                    saw_meaningful_output = True
+                native_event_type = chunk.get("type") if native_responses_stream else None
                 if native_event_type in {
                     "response.completed",
                     "response.failed",
@@ -459,6 +707,9 @@ async def _handle_streaming_request(
 
                 if native_responses_stream:
                     event_type = native_event_type
+                    sequence = chunk.get("sequence_number")
+                    if isinstance(sequence, int):
+                        last_native_sequence = max(last_native_sequence, sequence)
                     if event_type in {
                         "response.created",
                         "response.in_progress",
@@ -468,9 +719,10 @@ async def _handle_streaming_request(
                         "response.incomplete",
                     }:
                         native_response = chunk.get("response") or {}
+                        latest_native_response = native_response
                         if native_response_callback and native_response.get("id"):
                             await native_response_callback(native_response, False)
-                        if event_type == "response.completed":
+                        if event_type in {"response.completed", "response.incomplete"}:
                             completed_native_response = native_response
 
                 # Accumulate content/tool_calls/finish_reason for archiving.
@@ -512,6 +764,31 @@ async def _handle_streaming_request(
                         {"usage": usage}
                     ))
 
+            # A provider that closes a chat stream without any content, tool
+            # call, or usage has not produced a completion.  A finish marker
+            # alone is not enough: the incident that motivated this guard
+            # emitted an empty response with a stop marker.  Route this
+            # through the existing failure path so it cannot be recorded as a
+            # successful zero-token request.  Tool-call-only responses and
+            # explicit provider usage snapshots remain valid.
+            if (
+                not saw_meaningful_output
+                and not collected_text
+                and not collected_tool_calls
+                and not (
+                    completed_native_response
+                    and completed_native_response.get("output")
+                )
+                and not stream_usage.has_provider_usage
+            ):
+                raise EmptyUpstreamResponse("Upstream returned an empty stream")
+
+            if native_responses_stream:
+                if completed_native_response is None:
+                    raise UpstreamProtocolError("Responses stream ended without a valid terminal response")
+            else:
+                chat_integrity.finish()
+
             prompt_tokens = stream_usage.prompt_tokens
             completion_tokens = stream_usage.completion_tokens
             cached_tokens = stream_usage.cached_tokens
@@ -538,23 +815,27 @@ async def _handle_streaming_request(
                     },
                     "output_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens,
-                }):
+                } if stream_usage.has_provider_usage else None):
                     terminal_events.append(f"data: {_json_dumps(event)}\n\n")
             else:
                 terminal_events.append("data: [DONE]\n\n")
 
             # Update stats (estimated for streaming)
+            if admission is not None:
+                admission.provider_succeeded = True
             total_tokens = prompt_tokens + completion_tokens
             usage_data = stream_usage.to_usage_data(accounting_service)
             latency_ms = int((time.time() - start_time) * 1000)
+            attempt_latency_ms = (
+                attempt_context.elapsed_ms() if attempt_context is not None else None
+            )
             client_ip = http_request.client.host if http_request.client else "unknown"
             # Accounting writes to SQLite; a lock collision here must never
             # mutate the response already sent to the client. Log and move on.
             try:
+                # The attempt joins the accounting transaction: one commit
+                # covers the attempt, usage ledger, and token counters.
                 async with async_session_maker() as stream_db:
-                    stream_token = await stream_db.get(type(token), token.id)
-                    if stream_token is None:
-                        raise RuntimeError(f"Token {token.id} no longer exists")
                     if attempt_context is not None:
                         await attempt_recorder.record(
                             context=attempt_context,
@@ -564,7 +845,11 @@ async def _handle_streaming_request(
                             provider_model=adapter.map_model_name(request.model),
                             request_protocol=request_protocol,
                             outcome="success",
+                            db=stream_db,
                         )
+                    stream_token = await stream_db.get(type(token), token.id)
+                    if stream_token is None:
+                        raise RuntimeError(f"Token {token.id} no longer exists")
                     await accounting_service.record_success(
                         stream_db,
                         request_id=request_id,
@@ -576,9 +861,11 @@ async def _handle_streaming_request(
                         provider_model=adapter.map_model_name(request.model),
                         usage=usage_data,
                         latency_ms=latency_ms,
+                        attempt_latency_ms=attempt_latency_ms,
+                        admission=admission,
                         client_ip=client_ip,
                         capacity_snapshot=extract_capacity_snapshot(
-                            getattr(response, "headers", {})
+                            getattr(accounting_response, "headers", {})
                         ),
                         tariff_at=(
                             attempt_context.started_at
@@ -679,35 +966,39 @@ async def _handle_streaming_request(
             raise
 
         except Exception as e:
+            if isinstance(e, (UpstreamProtocolError, UpstreamOverloaded)):
+                e.upstream_status = getattr(accounting_response, "status_code", None)
+            error_usage = _observed_error_usage(e)
+            if error_usage is not None:
+                stream_usage.observe(error_usage)
             logger.error(f"Streaming error: {format_error_message(e)}")
-            if should_fallback(e):
-                routing_engine.mark_unavailable(request.model, channel)
+            if isinstance(e, EmptyUpstreamResponse) or should_fallback(e):
+                routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(e))
             latency_ms = int((time.time() - start_time) * 1000)
+            attempt_latency_ms = (
+                attempt_context.elapsed_ms() if attempt_context is not None else None
+            )
             client_ip = http_request.client.host if http_request.client else "unknown"
-            try:
-                if attempt_context is not None:
-                    await attempt_recorder.record(
-                        context=attempt_context,
-                        request_id=request_id,
-                        channel=channel,
-                        requested_model=request.model,
-                        provider_model=adapter.map_model_name(request.model),
-                        request_protocol=request_protocol,
-                        outcome="failed",
-                        error=normalize_upstream_error(
-                            e,
-                            phase=ErrorPhase.PROVIDER_STREAM,
-                        ),
-                    )
-            except Exception:
-                logger.exception(
-                    "Recording failed attempt failed for request_id=%s",
-                    request_id,
-                )
             # Defensive try/except: accounting failure must not swallow the
-            # error chunk we send to the client below.
+            # error chunk we send to the client below. The failed attempt
+            # joins the same accounting transaction (single commit).
             try:
                 async with async_session_maker() as stream_db:
+                    if attempt_context is not None and not attempt_context.recorded:
+                        await attempt_recorder.record(
+                            context=attempt_context,
+                            request_id=request_id,
+                            channel=channel,
+                            requested_model=request.model,
+                            provider_model=adapter.map_model_name(request.model),
+                            request_protocol=request_protocol,
+                            outcome="failed",
+                            error=normalize_upstream_error(
+                                e,
+                                phase=ErrorPhase.PROVIDER_STREAM,
+                            ),
+                            db=stream_db,
+                        )
                     await accounting_service.record_failure(
                         stream_db,
                         request_id=request_id,
@@ -719,8 +1010,11 @@ async def _handle_streaming_request(
                         error_code=type(e).__name__,
                         error_message=format_error_message(e),
                         latency_ms=latency_ms,
+                        attempt_latency_ms=attempt_latency_ms,
+                        admission=admission,
                         client_ip=client_ip,
                         capacity_snapshot=extract_capacity_snapshot_from_error(e),
+                        usage=(stream_usage.to_usage_data(accounting_service) if stream_usage.has_provider_usage else None),
                     )
                     await stream_db.commit()
             except Exception:
@@ -739,16 +1033,16 @@ async def _handle_streaming_request(
             elif request_protocol == "openai_responses":
                 error_event = {
                     "type": "response.failed",
-                    "sequence_number": 0,
+                    "sequence_number": last_native_sequence + 1,
                     "response": {
-                        "id": f"resp_{uuid.uuid4().hex[:24]}",
+                        "id": (latest_native_response or {}).get("id") or f"resp_{uuid.uuid4().hex[:24]}",
                         "object": "response",
                         "created_at": int(time.time()),
                         "status": "failed",
                         "model": request.model,
                         "output": [],
                         "error": {
-                            "code": type(e).__name__,
+                            "code": "server_error",
                             "message": error_message,
                         },
                     },
@@ -764,11 +1058,17 @@ async def _handle_streaming_request(
                 yield f"data: {_json_dumps(error_chunk)}\n\n"
 
         finally:
+            if admission is not None:
+                admission.engine.release_attempt(admission)
+            if accounting_response is not None:
+                await accounting_response.aclose()
             # Close the HTTP client after streaming completes
             await http_client.aclose()
 
-    return StreamingResponse(
+    return AdmissionStreamingResponse(
         stream_generator(),
+        admission=admission,
+        close_callbacks=(http_client.aclose,) + ((response.aclose,) if response is not None else ()),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

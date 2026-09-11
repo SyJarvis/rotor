@@ -21,6 +21,7 @@ from rotor.core.client_session import resolve_client_session
 from rotor.core.deps import get_available_channels, get_current_token
 from rotor.core.exceptions import (
     ChannelException,
+    ChannelsTemporarilyUnavailable,
     classify_error_status,
     format_error_message,
     normalize_upstream_error,
@@ -39,7 +40,8 @@ from rotor.gateway.fallback import (
     should_fallback,
 )
 from rotor.gateway.routing import routing_engine, session_lease_success_reason
-from rotor.services.session_leases import get_preferred_channel_id
+from rotor.services.session_leases import get_session_lease_preference
+from rotor.gateway.streaming import AdmissionStreamingResponse
 from rotor.schemas.error import ErrorPhase
 
 
@@ -107,11 +109,17 @@ async def _record_success(
     start_time: float,
     client_ip: str,
     attempt_context: AttemptContext | None = None,
+    attempt_latency_ms: int | None = None,
     capacity_snapshot: dict[str, str] | None = None,
     lease_session_id: str | None = None,
     lease_migration_reason: str = "request_success",
+    record_attempt: bool = True,
 ) -> None:
-    if attempt_context is not None:
+    if attempt_latency_ms is None and attempt_context is not None:
+        attempt_latency_ms = attempt_context.elapsed_ms()
+    if record_attempt and attempt_context is not None:
+        # Join the request transaction: one commit covers the routing
+        # decision, this attempt, and usage accounting below.
         await attempt_recorder.record(
             context=attempt_context,
             request_id=request_id,
@@ -122,6 +130,7 @@ async def _record_success(
             ),
             request_protocol="openai_images",
             outcome="success",
+            db=db,
         )
     await accounting_service.record_success(
         db,
@@ -134,6 +143,8 @@ async def _record_success(
         provider_model=(channel.model_mapping or {}).get(request.model, request.model),
         usage=accounting_service.extract_usage(response_data),
         latency_ms=int((time.time() - start_time) * 1000),
+        attempt_latency_ms=attempt_latency_ms,
+        admission=attempt_context.admission if attempt_context is not None else None,
         client_ip=client_ip,
         capacity_snapshot=capacity_snapshot,
         tariff_at=(
@@ -159,8 +170,11 @@ async def _record_failure(
     start_time: float,
     client_ip: str,
     attempt_context: AttemptContext | None = None,
+    attempt_latency_ms: int | None = None,
     phase: ErrorPhase = ErrorPhase.PROVIDER_REQUEST,
 ) -> None:
+    if attempt_latency_ms is None and attempt_context is not None:
+        attempt_latency_ms = attempt_context.elapsed_ms()
     if (
         attempt_context is not None
         and isinstance(error, (HTTPStatusError, RequestError))
@@ -174,6 +188,7 @@ async def _record_failure(
             request_protocol="openai_images",
             outcome="failed",
             error=normalize_upstream_error(error, phase=phase),
+            db=db,
         )
     await accounting_service.record_failure(
         db,
@@ -186,6 +201,8 @@ async def _record_failure(
         error_code=type(error).__name__,
         error_message=format_error_message(error),
         latency_ms=int((time.time() - start_time) * 1000),
+        attempt_latency_ms=attempt_latency_ms,
+        admission=attempt_context.admission if attempt_context is not None else None,
         client_ip=client_ip,
         provider_response=upstream_error_payload(error),
         capacity_snapshot=extract_capacity_snapshot_from_error(error),
@@ -223,6 +240,7 @@ async def _stream_image_response(
     lease_session_id: str | None = None,
     lease_migration_reason: str = "request_success",
 ) -> AsyncIterator[str]:
+    admission = attempt_context.admission if attempt_context is not None else None
     terminal_blocks: list[str] = []
     response_data: dict[str, Any] = {}
     buffer: list[str] = []
@@ -244,10 +262,31 @@ async def _stream_image_response(
         if buffer:
             yield "\n".join(buffer) + "\n"
 
+        if admission is not None:
+            admission.provider_succeeded = bool(terminal_blocks)
+        attempt_latency_ms = (
+            attempt_context.elapsed_ms() if attempt_context is not None else None
+        )
+        # AttemptRecorder joins the accounting session used to update token
+        # counters, so one commit covers the attempt plus usage rows.
+        # record_attempt=False because the attempt was already staged above.
         async with async_session_maker() as stream_db:
             stream_token = await stream_db.get(type(token), token.id)
             if stream_token is None:
                 raise RuntimeError(f"Token {token.id} no longer exists")
+            if attempt_context is not None:
+                await attempt_recorder.record(
+                    context=attempt_context,
+                    request_id=request_id,
+                    channel=channel,
+                    requested_model=request.model,
+                    provider_model=(channel.model_mapping or {}).get(
+                        request.model, request.model
+                    ),
+                    request_protocol="openai_images",
+                    outcome="success",
+                    db=stream_db,
+                )
             await _record_success(
                 stream_db,
                 token=stream_token,
@@ -259,14 +298,21 @@ async def _stream_image_response(
                 start_time=start_time,
                 client_ip=client_ip,
                 attempt_context=attempt_context,
+                attempt_latency_ms=attempt_latency_ms,
                 capacity_snapshot=extract_capacity_snapshot(upstream.headers),
                 lease_session_id=lease_session_id,
                 lease_migration_reason=lease_migration_reason,
+                record_attempt=False,
             )
         for block in terminal_blocks:
             yield block
     except Exception as exc:
+        if should_fallback(exc):
+            routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(exc))
         logger.exception("Image generation stream failed for request_id=%s", request_id)
+        attempt_latency_ms = (
+            attempt_context.elapsed_ms() if attempt_context is not None else None
+        )
         try:
             async with async_session_maker() as stream_db:
                 stream_token = await stream_db.get(type(token), token.id)
@@ -281,6 +327,7 @@ async def _stream_image_response(
                     start_time=start_time,
                     client_ip=client_ip,
                     attempt_context=attempt_context,
+                    attempt_latency_ms=attempt_latency_ms,
                     phase=ErrorPhase.PROVIDER_STREAM,
                 )
         except Exception:
@@ -291,6 +338,8 @@ async def _stream_image_response(
         }
         yield f"event: error\ndata: {json.dumps(error_event)}\n\n"
     finally:
+        if admission is not None:
+            admission.engine.release_attempt(admission)
         await upstream.aclose()
         await http_client.aclose()
 
@@ -324,11 +373,20 @@ async def generate_image(
         and routing_settings.session_lease_enabled
         else None
     )
-    preferred_channel_id = await get_preferred_channel_id(
+    lease_preference = await get_session_lease_preference(
         db,
         token_id=token.id,
         session_id=lease_session_id,
         logical_model=image_request.model,
+        request_protocol="openai_images",
+        channels=channels,
+        active_native_channel_ids=routing_engine.available_native_channel_ids(
+            channels, image_request.model, "openai_images", required
+        ),
+        reassess_seconds=(
+            routing_settings.session_lease_reassess_seconds
+            if routing_settings.affinity_enabled and routing_engine.protocol_affinity_enabled else 0
+        ),
     )
     affinity_key = (
         client_session.affinity_key(token.id)
@@ -343,9 +401,14 @@ async def generate_image(
         request_protocol="openai_images",
         required_capabilities=required,
         affinity_key=affinity_key,
-        preferred_channel_id=preferred_channel_id,
+        preferred_channel_id=lease_preference.channel_id,
+        lease_reassessment_due=lease_preference.reassessment_due,
     )
     candidates = routing_decision.candidates
+    # Defer the routing-decision write: it shares the request transaction
+    # with usage accounting below (one commit on the hot path).
+    # NOTE: intentionally no flush here — the INSERT batches with the
+    # final accounting commit.
     accounting_service.record_routing_decision(
         db,
         request_id=request_id,
@@ -361,8 +424,9 @@ async def generate_image(
             **client_session.routing_features(),
         },
     )
-    await db.commit()
     if not candidates:
+        if routing_decision.temporarily_unavailable:
+            raise ChannelsTemporarilyUnavailable(image_request.model, routing_decision.retry_after_seconds)
         raise ChannelException(
             f"No compatible image generation channel for model "
             f"'{image_request.model}'",
@@ -375,13 +439,16 @@ async def generate_image(
     last_error: Exception | None = None
     try:
         for attempt, channel in enumerate(candidates):
+            admission = routing_engine.admit_attempt(image_request.model, channel)
+            if admission is None:
+                continue
             attempt_context = AttemptContext.start(
                 attempt,
                 request_origin=request_origin,
                 agent_run_id=agent_run_id,
             )
+            attempt_context.admission = admission
             try:
-                routing_engine.begin_attempt(image_request.model, channel)
                 provider_model = (channel.model_mapping or {}).get(
                     image_request.model, image_request.model
                 )
@@ -404,8 +471,13 @@ async def generate_image(
                     raise
 
                 if image_request.stream:
+                    # Commit the staged routing-decision row before releasing
+                    # the session: streaming accounting runs on a fresh
+                    # session after the body completes, and close() would
+                    # otherwise roll the staged row back.
+                    await db.commit()
                     await db.close()
-                    response = StreamingResponse(
+                    response = AdmissionStreamingResponse(
                         _stream_image_response(
                             upstream=upstream,
                             http_client=http_client,
@@ -419,9 +491,11 @@ async def generate_image(
                             attempt_context=attempt_context,
                             lease_session_id=lease_session_id,
                             lease_migration_reason=session_lease_success_reason(
-                                routing_decision, attempt
+                                routing_decision, attempt, channel=channel, request_protocol="openai_images"
                             ),
                         ),
+                        admission=admission,
+                        close_callbacks=(upstream.aclose, http_client.aclose),
                         media_type="text/event-stream",
                     )
                     set_routing_headers(response, channel, image_request.model, attempt > 0)
@@ -431,6 +505,7 @@ async def generate_image(
                     return response
 
                 response_data = upstream.json()
+                admission.provider_succeeded = response_data.get("error") is None
                 await upstream.aclose()
                 await _record_success(
                     db,
@@ -446,13 +521,15 @@ async def generate_image(
                     capacity_snapshot=extract_capacity_snapshot(upstream.headers),
                     lease_session_id=lease_session_id,
                     lease_migration_reason=session_lease_success_reason(
-                        routing_decision, attempt
+                        routing_decision, attempt, channel=channel, request_protocol="openai_images"
                     ),
                 )
                 set_routing_headers(api_response, channel, image_request.model, attempt > 0)
                 return response_data
             except (HTTPStatusError, RequestError) as exc:
                 last_error = exc
+                if should_fallback(exc):
+                    routing_engine.mark_unavailable(image_request.model, channel, retry_after_seconds(exc))
                 await _record_failure(
                     db,
                     token=token,
@@ -466,18 +543,18 @@ async def generate_image(
                     attempt_context=attempt_context,
                 )
                 if should_fallback(exc):
-                    routing_engine.mark_unavailable(
-                        image_request.model,
-                        channel,
-                        retry_after_seconds(exc),
-                    )
                     continue
                 raise ChannelException(
                     f"Image generation failed for model '{image_request.model}'",
                     status_code=classify_error_status(exc),
                     original_error=format_error_message(exc),
                 ) from exc
+            finally:
+                if not streaming_response_returned:
+                    admission.engine.release_attempt(admission)
 
+        if last_error is None:
+            raise ChannelsTemporarilyUnavailable(image_request.model, routing_engine.retry_after_seconds(image_request.model, candidates))
         raise ChannelException(
             f"All image generation channels failed for model '{image_request.model}'",
             status_code=classify_error_status(last_error),

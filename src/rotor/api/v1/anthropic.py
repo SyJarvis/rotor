@@ -30,14 +30,20 @@ from rotor.schemas.request import (
     ToolCall,
 )
 from rotor.adapters.factory import AdapterFactory
+from rotor.adapters.protocol.anthropic_integrity import (
+    ChatStreamIntegrity, NativeMessageStream, validate_chat_response, validate_native_message,
+)
+from rotor.core.anthropic_errors import anthropic_error_payload
 from rotor.gateway.accounting import AccountingService, StreamingUsageAccumulator
 from rotor.gateway.provider_facts import (
     extract_capacity_snapshot,
     extract_capacity_snapshot_from_error,
 )
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
+from rotor.gateway.capabilities import anthropic_required_capabilities
 from rotor.gateway.routing import routing_engine, session_lease_success_reason
-from rotor.services.session_leases import get_preferred_channel_id
+from rotor.services.session_leases import get_session_lease_preference
+from rotor.gateway.streaming import AdmissionStreamingResponse
 from rotor.gateway.fallback import (
     retry_after_seconds,
     set_routing_headers,
@@ -48,6 +54,9 @@ from rotor.api.v1.chat import conversation_store
 from rotor.models.channel import Channel
 from rotor.core.exceptions import (
     ChannelException,
+    ChannelsTemporarilyUnavailable,
+    UpstreamProtocolError,
+    UpstreamOverloaded,
     classify_error_status,
     format_error_message,
     normalize_upstream_error,
@@ -412,12 +421,16 @@ def _openai_usage_to_anthropic(usage: dict) -> dict:
 
 def openai_to_anthropic_response(openai_response: dict, model: str) -> dict:
     """Convert OpenAI format response to Anthropic format."""
+    if openai_response.get("error") is not None or openai_response.get("success") is False:
+        raise UpstreamProtocolError("Upstream returned an error instead of a Chat completion")
     # Extract content and tool calls
     choices = openai_response.get("choices") or [{}]
     choice = choices[0] or {}
     message = choice.get("message") or {}
     content = message.get("content", "")
     tool_calls = message.get("tool_calls") or []
+    if message.get("reasoning_content") or message.get("refusal"):
+        raise UpstreamProtocolError("Chat reasoning/refusal cannot be represented faithfully as Anthropic content")
 
     # Build content blocks
     content_blocks = []
@@ -438,8 +451,9 @@ def openai_to_anthropic_response(openai_response: dict, model: str) -> dict:
                 else json.loads(arguments or "{}")
             )
         except (json.JSONDecodeError, TypeError):
-            logger.warning("Invalid tool arguments from upstream: %r", arguments)
-            tool_input = {}
+            raise UpstreamProtocolError("Upstream returned invalid tool arguments") from None
+        if not isinstance(tool_input, dict):
+            raise UpstreamProtocolError("Upstream tool arguments must be a JSON object")
         content_blocks.append({
             "type": "tool_use",
             "id": tool_call.get("id", ""),
@@ -452,9 +466,11 @@ def openai_to_anthropic_response(openai_response: dict, model: str) -> dict:
         "stop": "end_turn",
         "length": "max_tokens",
         "tool_calls": "tool_use",
-        "content_filter": "stop_sequence",
     }
-    stop_reason = finish_reason_map.get(choice.get("finish_reason", "stop"), "end_turn")
+    finish_reason = choice.get("finish_reason")
+    if finish_reason not in finish_reason_map:
+        raise UpstreamProtocolError("Chat finish reason cannot be represented faithfully as an Anthropic stop reason")
+    stop_reason = finish_reason_map[finish_reason]
 
     # Convert usage
     anthropic_usage = _openai_usage_to_anthropic(
@@ -482,31 +498,89 @@ async def count_message_tokens(
 ):
     """Count Anthropic input tokens, proxying native channels when possible."""
     channels = await get_available_channels(request.model, token, db)
-    native_channels = [
-        channel
-        for channel in channels
-        if str(channel.protocol or "").lower() in {"anthropic", "anthropic_messages"}
-    ]
-    if native_channels:
-        async with AsyncClient(timeout=120.0) as http_client:
-            adapter = AdapterFactory.create_adapter(native_channels[0], http_client)
-            if getattr(adapter, "native_anthropic", False):
-                upstream = await adapter.count_tokens(
-                    request.provider_payload(),
-                    _forwarded_anthropic_headers(http_request),
-                )
-                return Response(
-                    content=upstream.content,
-                    status_code=upstream.status_code,
-                    media_type="application/json",
-                )
+    async with AsyncClient(timeout=120.0) as http_client:
+        adapters = {}
+        native_channels = []
+        selection_failed = False
+        for channel in channels:
+            try:
+                adapter = AdapterFactory.create_adapter(channel, http_client)
+            except Exception:
+                selection_failed = True
+                logger.warning("Cannot initialize token-count adapter for channel %s", channel.id)
+                continue
+            if callable(getattr(adapter, "count_tokens", None)):
+                adapters[channel.id] = adapter
+                native_channels.append(channel)
+        if native_channels:
+            decision = routing_engine.route(
+                native_channels, model=request.model, token=token,
+                request_protocol="anthropic_messages",
+            )
+            if not decision.candidates:
+                raise ChannelsTemporarilyUnavailable(request.model, decision.retry_after_seconds)
+            last_error = None
+            for attempt, channel in enumerate(decision.candidates):
+                admission = routing_engine.admit_attempt(request.model, channel)
+                if admission is None:
+                    continue
+                try:
+                    adapter = adapters[channel.id]
+                    upstream = await adapter.count_tokens(
+                        request.provider_payload(),
+                        _forwarded_anthropic_headers(http_request),
+                    )
+                    upstream.raise_for_status()
+                    try:
+                        payload = upstream.json()
+                    except ValueError:
+                        raise UpstreamProtocolError("Native token counting returned invalid JSON") from None
+                    count = payload.get("input_tokens") if isinstance(payload, dict) else None
+                    if (
+                        not isinstance(payload, dict)
+                        or payload.get("error") is not None
+                        or payload.get("type") == "error"
+                        or payload.get("success") is False
+                        or isinstance(count, bool)
+                        or not isinstance(count, int)
+                        or count < 0
+                    ):
+                        raise UpstreamProtocolError("Native token counting returned an invalid input_tokens result")
+                    result = Response(
+                        content=json.dumps({"input_tokens": count}),
+                        media_type="application/json",
+                        headers={"X-Rotor-Token-Count-Source": "provider"},
+                    )
+                    set_routing_headers(result, channel, request.model, attempt > 0)
+                    return result
+                except Exception as exc:
+                    last_error = exc
+                    if should_fallback(exc):
+                        routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(exc))
+                        continue
+                    raise
+                finally:
+                    # Counting is not evidence that generation has recovered.
+                    # Release without observing a result or completing a lease.
+                    admission.engine.release_attempt(admission)
+            if last_error is not None:
+                raise last_error
+            raise ChannelsTemporarilyUnavailable(
+                request.model, routing_engine.retry_after_seconds(request.model, native_channels)
+            )
+        if selection_failed:
+            raise UpstreamProtocolError("No usable native token-count adapter could be selected")
 
     # Cross-protocol providers do not expose Anthropic's tokenizer. Return a
     # deterministic conservative estimate so Claude Code can manage context.
     serialized = json.dumps(
         request.provider_payload(), ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
-    return {"input_tokens": max(1, (len(serialized) + 3) // 4)}
+    return Response(
+        content=json.dumps({"input_tokens": max(1, (len(serialized) + 3) // 4)}),
+        media_type="application/json",
+        headers={"X-Rotor-Token-Count-Source": "estimated"},
+    )
 
 
 class OpenAIToAnthropicStreamConverter:
@@ -518,9 +592,13 @@ class OpenAIToAnthropicStreamConverter:
         self.tool_blocks = {}
         self.open_blocks = set()
         self.finished = False
+        self.failed = False
         self.pending_finish_reason = None
 
     def feed(self, openai_chunk: dict) -> list[dict]:
+        if openai_chunk.get("error") is not None or openai_chunk.get("success") is False:
+            self.failed = True
+            raise UpstreamProtocolError("Upstream returned an error instead of a Chat stream chunk")
         choices = openai_chunk.get("choices", [])
         if not choices or self.finished:
             return []
@@ -528,6 +606,9 @@ class OpenAIToAnthropicStreamConverter:
         events = []
         choice = choices[0]
         delta = choice.get("delta") or {}
+        if delta.get("reasoning_content") or delta.get("refusal"):
+            self.failed = True
+            raise UpstreamProtocolError("Chat reasoning/refusal cannot be represented faithfully as Anthropic content")
 
         content = delta.get("content")
         if content:
@@ -580,25 +661,28 @@ class OpenAIToAnthropicStreamConverter:
         return events
 
     def finish(self, finish_reason: Optional[str] = None, usage: Optional[dict] = None) -> list[dict]:
+        if self.failed:
+            raise UpstreamProtocolError("Cannot complete a failed Chat-to-Anthropic stream")
         if self.finished:
             return []
+        finish_reason = finish_reason or self.pending_finish_reason
+        stop_reason_map = {
+            "stop": "end_turn",
+            "length": "max_tokens",
+            "tool_calls": "tool_use",
+        }
+        if finish_reason not in stop_reason_map:
+            raise UpstreamProtocolError("Chat stream has no representable terminal finish reason")
         self.finished = True
         events = [
             {"type": "content_block_stop", "index": index}
             for index in sorted(self.open_blocks)
         ]
-        finish_reason = finish_reason or self.pending_finish_reason or "stop"
-        stop_reason_map = {
-            "stop": "end_turn",
-            "length": "max_tokens",
-            "tool_calls": "tool_use",
-            "content_filter": "stop_sequence",
-        }
         anthropic_usage = _openai_usage_to_anthropic(usage or {})
         events.append({
             "type": "message_delta",
             "delta": {
-                "stop_reason": stop_reason_map.get(finish_reason, "end_turn"),
+                "stop_reason": stop_reason_map[finish_reason],
                 "stop_sequence": None,
             },
             "usage": anthropic_usage,
@@ -640,6 +724,7 @@ async def messages(
     # Record start time
     start_time = time.time()
     request_id = http_request.headers.get("X-Request-Id") or f"req_{uuid.uuid4().hex}"
+    http_request.state.request_id = request_id
     client_session = resolve_client_session(
         http_request.headers,
         metadata=request.metadata,
@@ -660,11 +745,21 @@ async def messages(
         and routing_settings.session_lease_enabled
         else None
     )
-    preferred_channel_id = await get_preferred_channel_id(
+    required_capabilities = anthropic_required_capabilities(request)
+    lease_preference = await get_session_lease_preference(
         db,
         token_id=token.id,
         session_id=lease_session_id,
         logical_model=request.model,
+        request_protocol="anthropic_messages",
+        channels=channels,
+        active_native_channel_ids=routing_engine.available_native_channel_ids(
+            channels, request.model, "anthropic_messages", required_capabilities
+        ),
+        reassess_seconds=(
+            routing_settings.session_lease_reassess_seconds
+            if routing_settings.affinity_enabled and routing_engine.protocol_affinity_enabled else 0
+        ),
     )
     affinity_key = (
         client_session.affinity_key(token.id)
@@ -672,7 +767,6 @@ async def messages(
         else None
     )
     affinity_used = affinity_key is not None
-    required_capabilities = {"stream"} if request.stream else set()
     routing_decision = routing_engine.route(
         channels,
         model=request.model,
@@ -680,8 +774,21 @@ async def messages(
         request_protocol="anthropic_messages",
         required_capabilities=required_capabilities,
         affinity_key=affinity_key,
-        preferred_channel_id=preferred_channel_id,
+        preferred_channel_id=lease_preference.channel_id,
+        lease_reassessment_due=lease_preference.reassessment_due,
     )
+    if not routing_decision.candidates:
+        if routing_decision.temporarily_unavailable:
+            raise ChannelsTemporarilyUnavailable(request.model, routing_decision.retry_after_seconds)
+        raise ChannelException(
+            f"No compatible channel available for Anthropic model '{request.model}'. "
+            f"Required capabilities: {sorted(required_capabilities)}",
+            status_code=503,
+        )
+    # Defer the routing-decision write: it shares the request transaction
+    # with usage accounting below (one commit on the hot path).
+    # NOTE: intentionally no flush here — the INSERT is batched with the
+    # final accounting commit.
     accounting_service.record_routing_decision(
         db,
         request_id=request_id,
@@ -698,7 +805,6 @@ async def messages(
             **client_session.routing_features(),
         },
     )
-    await db.commit()
 
     # Try to get a response from available channels
     http_client = AsyncClient(timeout=120.0)
@@ -715,13 +821,16 @@ async def messages(
     )
     try:
         for attempt, channel in enumerate(routing_decision.candidates):
+            admission = routing_engine.admit_attempt(request.model, channel)
+            if admission is None:
+                continue
             attempt_context = AttemptContext.start(
                 attempt,
                 request_origin=request_origin,
                 agent_run_id=agent_run_id,
             )
+            attempt_context.admission = admission
             try:
-                routing_engine.begin_attempt(request.model, channel)
                 # Create adapter
                 adapter = AdapterFactory.create_adapter(channel, http_client)
                 await conversation_store.append_routing(conversation_handle, channel)
@@ -741,7 +850,7 @@ async def messages(
                         attempt_context=attempt_context,
                         lease_session_id=lease_session_id,
                         lease_migration_reason=session_lease_success_reason(
-                            routing_decision, attempt
+                            routing_decision, attempt, channel=channel, request_protocol="anthropic_messages"
                         ),
                     )
                     set_routing_headers(result, channel, request.model, attempt > 0)
@@ -759,14 +868,17 @@ async def messages(
                         attempt_context=attempt_context,
                         lease_session_id=lease_session_id,
                         lease_migration_reason=session_lease_success_reason(
-                            routing_decision, attempt
+                            routing_decision, attempt, channel=channel, request_protocol="anthropic_messages"
                         ),
                     )
 
             except (HTTPStatusError, RequestError) as e:
                 last_error = e
+                if should_fallback(e):
+                    routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(e))
                 logger.warning(f"Channel {channel.name} failed: {format_error_message(e)}")
                 latency_ms = int((time.time() - start_time) * 1000)
+                attempt_latency_ms = attempt_context.elapsed_ms()
                 error_fact = normalize_upstream_error(e)
                 await attempt_recorder.record(
                     context=attempt_context,
@@ -779,6 +891,7 @@ async def messages(
                     request_protocol="anthropic_messages",
                     outcome="failed",
                     error=error_fact,
+                    db=db,
                 )
                 await accounting_service.record_failure(
                     db,
@@ -791,6 +904,8 @@ async def messages(
                     error_code=type(e).__name__,
                     error_message=format_error_message(e),
                     latency_ms=latency_ms,
+                    attempt_latency_ms=attempt_latency_ms,
+                    admission=admission,
                     client_ip=client_ip,
                     provider_response=upstream_error_payload(e),
                     capacity_snapshot=extract_capacity_snapshot_from_error(e),
@@ -801,11 +916,6 @@ async def messages(
                     )
                 await db.commit()
                 if should_fallback(e):
-                    routing_engine.mark_unavailable(
-                        request.model,
-                        channel,
-                        retry_after_seconds(e),
-                    )
                     continue
                 if conversation_handle:
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)
@@ -815,6 +925,15 @@ async def messages(
                 last_error = e
                 logger.error(f"Unexpected error with channel {channel.name}: {format_error_message(e)}")
                 latency_ms = int((time.time() - start_time) * 1000)
+                attempt_latency_ms = attempt_context.elapsed_ms()
+                if not attempt_context.recorded:
+                    await attempt_recorder.record(
+                        context=attempt_context, request_id=request_id, channel=channel,
+                        requested_model=request.model,
+                        provider_model=(channel.model_mapping or {}).get(request.model, request.model),
+                        request_protocol="anthropic_messages", outcome="failed",
+                        error=normalize_upstream_error(e), db=db,
+                    )
                 await accounting_service.record_failure(
                     db,
                     request_id=request_id,
@@ -826,6 +945,8 @@ async def messages(
                     error_code=type(e).__name__,
                     error_message=format_error_message(e),
                     latency_ms=latency_ms,
+                    attempt_latency_ms=attempt_latency_ms,
+                    admission=admission,
                     client_ip=client_ip,
                     capacity_snapshot=extract_capacity_snapshot_from_error(e),
                 )
@@ -837,6 +958,9 @@ async def messages(
                 if conversation_handle:
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)
                 raise
+            finally:
+                if not streaming_response_returned:
+                    admission.engine.release_attempt(admission)
     finally:
         # Close the client unless a streaming response took ownership of it.
         # This covers non-streaming requests and streaming requests whose
@@ -849,11 +973,15 @@ async def messages(
     await conversation_store.finish(
         conversation_handle, "failed", int((time.time() - start_time) * 1000)
     )
-    raise ChannelException(
+    if last_error is None:
+        raise ChannelsTemporarilyUnavailable(request.model, routing_engine.retry_after_seconds(request.model, routing_decision.candidates))
+    error = ChannelException(
         f"All channels failed for model '{request.model}'",
         status_code=classify_error_status(last_error),
-        original_error=format_error_message(last_error),
     )
+    if isinstance(last_error, HTTPStatusError) and last_error.response.headers.get("retry-after"):
+        error.headers = {"Retry-After": last_error.response.headers["retry-after"]}
+    raise error
 
 
 async def _handle_non_streaming_request(
@@ -873,23 +1001,39 @@ async def _handle_non_streaming_request(
     lease_migration_reason: str = "request_success",
 ) -> dict:
     """Handle non-streaming Anthropic message request."""
+    admission = attempt_context.admission if attempt_context is not None else None
     # Make the request
     response = await adapter.make_request(internal_request)
 
     # Convert response to OpenAI format first
-    response_data = await adapter.convert_response(response, internal_request)
+    try:
+        response_data = await adapter.convert_response(response, internal_request)
+        if isinstance(response_data, dict) and response_data.get("type") == "message":
+            validate_native_message(response_data, secret=channel.key)
+            anthropic_response = response_data
+        else:
+            validate_chat_response(response_data, secret=channel.key)
+            anthropic_response = openai_to_anthropic_response(response_data, anthropic_request.model)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        exc = UpstreamProtocolError("Upstream returned invalid completion JSON")
+        exc.upstream_status = response.status_code
+        raise exc from None
+    except (UpstreamOverloaded, UpstreamProtocolError) as exc:
+        exc.upstream_status = response.status_code
+        raise
 
-    # A native Anthropic channel already returned the exact client protocol.
-    anthropic_response = (
-        response_data
-        if response_data.get("type") == "message"
-        else openai_to_anthropic_response(response_data, anthropic_request.model)
-    )
+    if admission is not None:
+        admission.provider_succeeded = response_data.get("error") is None
 
     latency_ms = int((time.time() - start_time) * 1000)
+    attempt_latency_ms = (
+        attempt_context.elapsed_ms() if attempt_context is not None else None
+    )
     usage = accounting_service.extract_usage(response_data)
     client_ip = http_request.client.host if http_request.client else "unknown"
     if attempt_context is not None:
+        # Join the request transaction: one commit covers the routing
+        # decision, this attempt, and usage accounting below.
         await attempt_recorder.record(
             context=attempt_context,
             request_id=request_id,
@@ -898,6 +1042,7 @@ async def _handle_non_streaming_request(
             provider_model=adapter.map_model_name(anthropic_request.model),
             request_protocol="anthropic_messages",
             outcome="success",
+            db=db,
         )
     await accounting_service.record_success(
         db,
@@ -910,6 +1055,8 @@ async def _handle_non_streaming_request(
         provider_model=adapter.map_model_name(anthropic_request.model),
         usage=usage,
         latency_ms=latency_ms,
+        attempt_latency_ms=attempt_latency_ms,
+        admission=admission,
         client_ip=client_ip,
         capacity_snapshot=extract_capacity_snapshot(
             getattr(response, "headers", {})
@@ -952,12 +1099,24 @@ async def _handle_streaming_request(
     lease_session_id: str | None = None,
     lease_migration_reason: str = "request_success",
 ) -> StreamingResponse:
-    """Handle streaming Anthropic message request."""
+    """Handle streaming Anthropic message request.
+
+    The routing-decision row was staged on ``db`` before the upstream call.
+    Commit it now: streaming accounting runs on a fresh session after the
+    body completes, and the request session is about to be closed (which
+    would otherwise roll the staged row back). The decision is immutable
+    audit data, so committing it early does not affect the single-commit
+    accounting of attempt + usage rows below. Test doubles may not
+    implement ``commit``; skip it then (there is nothing real to persist).
+    """
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    admission = attempt_context.admission if attempt_context is not None else None
 
     # A StreamingResponse outlives the endpoint call, so FastAPI would retain
     # this request-scoped session (and its checked-out connection) for the
     # whole stream.  Final accounting uses a fresh, short-lived session below.
+    if hasattr(db, "commit"):
+        await db.commit()
     await db.close()
 
     async def stream_generator():
@@ -968,6 +1127,9 @@ async def _handle_streaming_request(
             collected_text: list[str] = []
             collected_tool_calls: list[dict] = []
             last_finish_reason: str | None = None
+            terminal_event: dict | None = None
+            native_tracker = NativeMessageStream(secret=channel.key)
+            converted_tracker = ChatStreamIntegrity(secret=channel.key)
 
             # Converted providers need a synthetic Anthropic stream envelope;
             # native channels already provide the full event sequence.
@@ -1002,7 +1164,11 @@ async def _handle_streaming_request(
             native_message: dict | None = None
             async for openai_chunk in adapter.stream_convert_response(response, internal_request):
                 if native_anthropic_stream:
+                    native_tracker.feed(openai_chunk)
                     event_type = openai_chunk.get("type") or "message"
+                    if event_type == "message_stop":
+                        terminal_event = openai_chunk
+                        continue
                     yield f"event: {event_type}\ndata: {_json_dumps(openai_chunk)}\n\n"
                     if event_type == "message_start":
                         native_message = openai_chunk.get("message") or native_message
@@ -1014,6 +1180,8 @@ async def _handle_streaming_request(
                         if openai_chunk.get("delta", {}).get("stop_reason"):
                             last_finish_reason = openai_chunk["delta"]["stop_reason"]
                     continue
+
+                converted_tracker.feed(openai_chunk)
 
                 # Accumulate content for archiving.
                 choices = openai_chunk.get("choices") or []
@@ -1034,7 +1202,16 @@ async def _handle_streaming_request(
 
                 for event in stream_converter.feed(openai_chunk):
                     event_type = event["type"]
+                    if event_type == "message_stop":
+                        terminal_event = event
+                        continue
                     yield f"event: {event_type}\ndata: {_json_dumps(event)}\n\n"
+
+            if native_anthropic_stream:
+                native_message = native_tracker.finish()
+                last_finish_reason = native_message["stop_reason"]
+            else:
+                converted_tracker.finish()
 
             input_tokens = stream_usage.prompt_tokens
             output_tokens = stream_usage.completion_tokens
@@ -1059,16 +1236,23 @@ async def _handle_streaming_request(
                     },
                 ):
                     event_type = event["type"]
+                    if event_type == "message_stop":
+                        terminal_event = event
+                        continue
                     yield f"event: {event_type}\ndata: {_json_dumps(event)}\n\n"
 
+            if admission is not None:
+                admission.provider_succeeded = True
             total_tokens = input_tokens + output_tokens
             usage = stream_usage.to_usage_data(accounting_service)
             latency_ms = int((time.time() - start_time) * 1000)
+            attempt_latency_ms = (
+                attempt_context.elapsed_ms() if attempt_context is not None else None
+            )
             client_ip = http_request.client.host if http_request.client else "unknown"
+            # The attempt joins the accounting transaction: one commit covers
+            # the attempt, usage ledger, and token counters.
             async with async_session_maker() as stream_db:
-                stream_token = await stream_db.get(type(token), token.id)
-                if stream_token is None:
-                    raise RuntimeError(f"Token {token.id} no longer exists")
                 if attempt_context is not None:
                     await attempt_recorder.record(
                         context=attempt_context,
@@ -1080,7 +1264,11 @@ async def _handle_streaming_request(
                         ),
                         request_protocol="anthropic_messages",
                         outcome="success",
+                        db=stream_db,
                     )
+                stream_token = await stream_db.get(type(token), token.id)
+                if stream_token is None:
+                    raise RuntimeError(f"Token {token.id} no longer exists")
                 await accounting_service.record_success(
                     stream_db,
                     request_id=request_id,
@@ -1092,6 +1280,8 @@ async def _handle_streaming_request(
                     provider_model=adapter.map_model_name(anthropic_request.model),
                     usage=usage,
                     latency_ms=latency_ms,
+                    attempt_latency_ms=attempt_latency_ms,
+                    admission=admission,
                     client_ip=client_ip,
                     capacity_snapshot=extract_capacity_snapshot(
                         getattr(response, "headers", {})
@@ -1106,13 +1296,7 @@ async def _handle_streaming_request(
                 )
                 await stream_db.commit()
             if native_anthropic_stream:
-                await conversation_store.append_response(conversation_handle, {
-                    "id": (native_message or {}).get("id", msg_id),
-                    "type": "message",
-                    "role": "assistant",
-                    "content": (native_message or {}).get("content") or [],
-                    "stop_reason": last_finish_reason,
-                })
+                await conversation_store.append_response(conversation_handle, native_message)
             else:
                 await conversation_store.append_response(conversation_handle, {
                     "choices": [{
@@ -1149,6 +1333,10 @@ async def _handle_streaming_request(
                 },
             })
             await conversation_store.finish(conversation_handle, "success", latency_ms)
+            # Clients may disconnect immediately after message_stop. Commit
+            # accounting and enqueue the archive before declaring completion.
+            if terminal_event is not None:
+                yield f"event: message_stop\ndata: {_json_dumps(terminal_event)}\n\n"
 
         except asyncio.CancelledError:
             latency_ms = int((time.time() - start_time) * 1000)
@@ -1178,35 +1366,38 @@ async def _handle_streaming_request(
             raise
 
         except Exception as e:
+            if isinstance(e, (UpstreamOverloaded, UpstreamProtocolError)) and e.upstream_status is None:
+                e.upstream_status = response.status_code
             logger.error(f"Streaming error: {format_error_message(e)}")
             if should_fallback(e):
-                routing_engine.mark_unavailable(anthropic_request.model, channel)
+                routing_engine.mark_unavailable(anthropic_request.model, channel, retry_after_seconds(e))
             latency_ms = int((time.time() - start_time) * 1000)
+            attempt_latency_ms = (
+                attempt_context.elapsed_ms() if attempt_context is not None else None
+            )
             client_ip = http_request.client.host if http_request.client else "unknown"
-            try:
-                if attempt_context is not None:
-                    await attempt_recorder.record(
-                        context=attempt_context,
-                        request_id=request_id,
-                        channel=channel,
-                        requested_model=anthropic_request.model,
-                        provider_model=adapter.map_model_name(
-                            anthropic_request.model
-                        ),
-                        request_protocol="anthropic_messages",
-                        outcome="failed",
-                        error=normalize_upstream_error(
-                            e,
-                            phase=ErrorPhase.PROVIDER_STREAM,
-                        ),
-                    )
-            except Exception:
-                logger.exception(
-                    "Recording failed attempt failed for request_id=%s",
-                    request_id,
-                )
+            # Defensive try/except: accounting failure must not swallow the
+            # error event we send to the client below. The failed attempt
+            # joins the same accounting transaction (single commit).
             try:
                 async with async_session_maker() as stream_db:
+                    if attempt_context is not None and not attempt_context.recorded:
+                        await attempt_recorder.record(
+                            context=attempt_context,
+                            request_id=request_id,
+                            channel=channel,
+                            requested_model=anthropic_request.model,
+                            provider_model=adapter.map_model_name(
+                                anthropic_request.model
+                            ),
+                            request_protocol="anthropic_messages",
+                            outcome="failed",
+                            error=normalize_upstream_error(
+                                e,
+                                phase=ErrorPhase.PROVIDER_STREAM,
+                            ),
+                            db=stream_db,
+                        )
                     await accounting_service.record_failure(
                         stream_db,
                         request_id=request_id,
@@ -1218,6 +1409,8 @@ async def _handle_streaming_request(
                         error_code=type(e).__name__,
                         error_message=format_error_message(e),
                         latency_ms=latency_ms,
+                        attempt_latency_ms=attempt_latency_ms,
+                        admission=admission,
                         client_ip=client_ip,
                         capacity_snapshot=(
                             extract_capacity_snapshot_from_error(e)
@@ -1235,21 +1428,20 @@ async def _handle_streaming_request(
             )
             await conversation_store.finish(conversation_handle, "failed", latency_ms)
             # Send error in Anthropic error format
-            error_event = {
-                "type": "error",
-                "error": {
-                    "type": "stream_error",
-                    "message": format_error_message(e)
-                }
-            }
+            error_event = anthropic_error_payload(e, request_id=request_id, secret=channel.key)
             yield f"event: error\ndata: {_json_dumps(error_event)}\n\n"
 
         finally:
+            if admission is not None:
+                admission.engine.release_attempt(admission)
+            await response.aclose()
             # Close the HTTP client after streaming completes
             await http_client.aclose()
 
-    return StreamingResponse(
+    return AdmissionStreamingResponse(
         stream_generator(),
+        admission=admission,
+        close_callbacks=(response.aclose, http_client.aclose),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

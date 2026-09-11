@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 
@@ -7,9 +8,12 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 import rotor.api.v1.chat as chat_endpoint
+from rotor.api.v1.responses import ResponsesStreamTransform
 from rotor.core.exceptions import ChannelException, UpstreamOverloaded
 from rotor.gateway.accounting import AccountingService, UsageData
 from rotor.gateway.attempts import AttemptContext
+from rotor.gateway.routing import RoutingDecision, RoutingEngine
+from rotor.services.session_leases import SessionLeasePreference
 from rotor.schemas.request import ChatCompletionRequest
 
 
@@ -95,22 +99,24 @@ class FailingSuccessAccounting(RecordingAccounting):
         raise RuntimeError("usage accounting failed")
 
 
-class FakeRoutingEngine:
+class FakeRoutingEngine(RoutingEngine):
     def __init__(self, channels) -> None:
+        super().__init__("fallback_order")
         self.channels = channels
+        for channel in channels:
+            for name, value in {"enabled": True, "extra": {}, "priority": 1, "weight": 1}.items():
+                if not hasattr(channel, name):
+                    setattr(channel, name, value)
         self.unavailable = []
         self.route_kwargs = None
 
     def route(self, channels, **kwargs):
         self.route_kwargs = kwargs
-        return SimpleNamespace(
+        return RoutingDecision(
             candidates=self.channels,
             strategy="fallback_order",
             scores=None,
         )
-
-    def begin_attempt(self, model, channel) -> None:
-        return None
 
     def mark_unavailable(self, model, channel, cooldown_seconds=None) -> None:
         self.unavailable.append(channel.id)
@@ -136,7 +142,7 @@ class FailingAdapter:
 
 class SuccessfulAdapter:
     async def make_request(self, request):
-        return object()
+        return httpx.Response(200)
 
     async def convert_response(self, response, request):
         return {
@@ -174,6 +180,92 @@ class SuccessfulStreamingAdapter:
                 "prompt_tokens": 1,
                 "completion_tokens": 1,
             },
+        }
+
+    def map_model_name(self, model):
+        return f"provider-{model}"
+
+
+class EmptyStreamingAdapter:
+    async def stream_convert_response(self, response, request):
+        # A stop marker without content is the shape that previously became
+        # a successful zero-token request in the live database.
+        yield {
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+        }
+
+    def map_model_name(self, model):
+        return f"provider-{model}"
+
+
+class TrackingStreamResponse:
+    def __init__(self, mode: str, content: str = "ok", headers=None) -> None:
+        self.mode = mode
+        self.content = content
+        self.headers = headers or {}
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class SequencedStreamingAdapter:
+    def __init__(self, responses) -> None:
+        self.responses = list(responses)
+        self.make_calls = 0
+        self.stream_calls = []
+
+    async def make_request(self, request):
+        self.make_calls += 1
+        return self.responses.pop(0)
+
+    async def stream_convert_response(self, response, request):
+        self.stream_calls.append(response)
+        if response.mode == "empty":
+            yield {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+            }
+            return
+        yield {
+            "choices": [{
+                "delta": {"content": response.content},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+
+    def map_model_name(self, model):
+        return f"provider-{model}"
+
+
+class PayloadStreamingAdapter:
+    def __init__(self, payload) -> None:
+        self.payload = payload
+        self.make_calls = 0
+
+    async def make_request(self, request):
+        self.make_calls += 1
+        return TrackingStreamResponse("payload")
+
+    async def stream_convert_response(self, response, request):
+        yield self.payload
+
+    def map_model_name(self, model):
+        return f"provider-{model}"
+
+
+class RetryRaisingStreamingAdapter:
+    def __init__(self, error) -> None:
+        self.error = error
+        self.make_calls = 0
+
+    async def make_request(self, request):
+        self.make_calls += 1
+        raise self.error
+
+    async def stream_convert_response(self, response, request):
+        yield {
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
         }
 
     def map_model_name(self, model):
@@ -316,7 +408,7 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "AdapterFactory": chat_endpoint.AdapterFactory,
             "get_available_channels": chat_endpoint.get_available_channels,
             "async_session_maker": chat_endpoint.async_session_maker,
-            "get_preferred_channel_id": chat_endpoint.get_preferred_channel_id,
+            "get_session_lease_preference": chat_endpoint.get_session_lease_preference,
         }
 
     async def asyncTearDown(self) -> None:
@@ -413,8 +505,12 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "token_id": 9,
                 "session_id": "session-a",
                 "logical_model": "model-a",
+                "request_protocol": "openai_chat",
+                "channels": [channel],
+                "active_native_channel_ids": {channel.id},
+                "reassess_seconds": 300,
             }
-            return 2
+            return SessionLeasePreference(2)
 
         chat_endpoint.accounting_service = accounting
         chat_endpoint.attempt_recorder = accounting
@@ -422,7 +518,7 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
         chat_endpoint.routing_engine = routing
         chat_endpoint.AdapterFactory = FakeAdapterFactory
         chat_endpoint.get_available_channels = available_channels
-        chat_endpoint.get_preferred_channel_id = preferred_channel
+        chat_endpoint.get_session_lease_preference = preferred_channel
 
         request = ChatCompletionRequest.model_validate({
             "model": "model-a",
@@ -578,7 +674,7 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
             http_client,
             "req-1",
             SimpleNamespace(conversation_id="conv-1"),
-            response=object(),
+            response=TrackingStreamResponse("unused"),
             attempt_context=AttemptContext.start(0),
         )
         chunks = [chunk async for chunk in response.body_iterator]
@@ -586,6 +682,449 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
         assert chunks[-1] == "data: [DONE]\n\n"
         assert accounting.attempts[0]["outcome"] == "success"
         assert request_db.closed is True
+        assert http_client.closed is True
+
+    async def test_empty_stream_records_failure_instead_of_zero_token_success(
+        self,
+    ) -> None:
+        accounting = RecordingAccounting()
+        conversation_store = FakeConversationStore()
+        token = SimpleNamespace(id=1)
+        request_db = FakeDatabase()
+        http_client = FakeHttpClient()
+        routing = FakeRoutingEngine([])
+
+        chat_endpoint.accounting_service = accounting
+        chat_endpoint.attempt_recorder = accounting
+        chat_endpoint.conversation_store = conversation_store
+        chat_endpoint.async_session_maker = FakeSessionMaker(token)
+        chat_endpoint.routing_engine = routing
+
+        request = ChatCompletionRequest.model_validate({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        })
+        http_request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1),
+        })
+
+        response = await chat_endpoint._handle_streaming_request(
+            request,
+            EmptyStreamingAdapter(),
+            SimpleNamespace(id=2, protocol="openai"),
+            token,
+            request_db,
+            0.0,
+            http_request,
+            http_client,
+            "req-empty-stream",
+            SimpleNamespace(conversation_id="conv-1"),
+            response=TrackingStreamResponse("unused"),
+            attempt_context=AttemptContext.start(0),
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+
+        assert '"type": "stream_error"' in chunks[-1]
+        assert accounting.successes == []
+        assert accounting.attempts[0]["outcome"] == "failed"
+        assert conversation_store.finishes[-1][0] == "failed"
+        assert routing.unavailable == [2]
+        assert http_client.closed is True
+
+    async def test_chat_completions_retries_empty_stream_for_mindagent(self) -> None:
+        channel = SimpleNamespace(
+            id=2,
+            name="only",
+            protocol="openai",
+            model_mapping={},
+        )
+        first = TrackingStreamResponse("empty")
+        second = TrackingStreamResponse("text", "recovered")
+        adapter = SequencedStreamingAdapter([first, second])
+        accounting = RecordingAccounting()
+        conversation_store = FakeConversationStore()
+        routing = FakeRoutingEngine([channel])
+        token = SimpleNamespace(id=1)
+        request_db = FakeDatabase()
+        http_client = FakeHttpClient()
+
+        async def available_channels(model, token, db):
+            return [channel]
+
+        async def preferred_channel(db, **kwargs):
+            return SessionLeasePreference(None)
+
+        original_async_client = chat_endpoint.AsyncClient
+        chat_endpoint.AsyncClient = lambda *args, **kwargs: http_client
+        try:
+            chat_endpoint.accounting_service = accounting
+            chat_endpoint.attempt_recorder = accounting
+            chat_endpoint.conversation_store = conversation_store
+            chat_endpoint.routing_engine = routing
+            chat_endpoint.AdapterFactory = FakeAdapterFactory
+            chat_endpoint.get_available_channels = available_channels
+            chat_endpoint.get_session_lease_preference = preferred_channel
+            FakeAdapterFactory.adapters = {channel.id: adapter}
+            chat_endpoint.async_session_maker = FakeSessionMaker(token)
+
+            request = ChatCompletionRequest.model_validate({
+                "model": "model-a",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            })
+            http_request = Request({
+                "type": "http",
+                "method": "POST",
+                "path": "/api/admin/mindagent/chat",
+                "headers": [],
+                "client": ("127.0.0.1", 1),
+            })
+
+            response = await chat_endpoint.chat_completions(
+                request,
+                http_request,
+                Response(),
+                request_db,
+                token,
+            )
+            chunks = [chunk async for chunk in response.body_iterator]
+        finally:
+            chat_endpoint.AsyncClient = original_async_client
+
+        assert any("recovered" in chunk for chunk in chunks)
+        assert not any("stream_error" in chunk for chunk in chunks)
+        assert adapter.make_calls == 2
+        assert first.closed is True
+        assert second.closed is True
+        assert accounting.successes
+        assert accounting.attempts[-1]["outcome"] == "success"
+        assert routing.unavailable == []
+        assert http_client.closed is True
+
+    async def test_two_empty_streams_still_fail_without_success_accounting(
+        self,
+    ) -> None:
+        first = TrackingStreamResponse("empty")
+        second = TrackingStreamResponse("empty")
+        adapter = SequencedStreamingAdapter([first, second])
+        accounting = RecordingAccounting()
+        conversation_store = FakeConversationStore()
+        token = SimpleNamespace(id=1)
+        request_db = FakeDatabase()
+        http_client = FakeHttpClient()
+        routing = FakeRoutingEngine([])
+
+        chat_endpoint.accounting_service = accounting
+        chat_endpoint.attempt_recorder = accounting
+        chat_endpoint.conversation_store = conversation_store
+        chat_endpoint.async_session_maker = FakeSessionMaker(token)
+        chat_endpoint.routing_engine = routing
+
+        request = ChatCompletionRequest.model_validate({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        })
+        http_request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1),
+        })
+
+        response = await chat_endpoint._handle_streaming_request(
+            request,
+            adapter,
+            SimpleNamespace(id=2, protocol="openai"),
+            token,
+            request_db,
+            0.0,
+            http_request,
+            http_client,
+            "req-two-empty-streams",
+            SimpleNamespace(conversation_id="conv-1"),
+            response=await adapter.make_request(request),
+            attempt_context=AttemptContext.start(0),
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+
+        assert '"type": "stream_error"' in chunks[-1]
+        assert adapter.make_calls == 2
+        assert first.closed is True
+        assert second.closed is True
+        assert accounting.successes == []
+        assert accounting.attempts[0]["outcome"] == "failed"
+        assert conversation_store.finishes[-1][0] == "failed"
+        assert routing.unavailable == [2]
+        assert http_client.closed is True
+
+    async def test_stream_with_output_is_not_replayed(self) -> None:
+        response_obj = TrackingStreamResponse("text", "already-started")
+        adapter = SequencedStreamingAdapter([response_obj])
+        accounting = RecordingAccounting()
+        token = SimpleNamespace(id=1)
+        request_db = FakeDatabase()
+        http_client = FakeHttpClient()
+
+        chat_endpoint.accounting_service = accounting
+        chat_endpoint.attempt_recorder = accounting
+        chat_endpoint.conversation_store = FakeConversationStore()
+        chat_endpoint.async_session_maker = FakeSessionMaker(token)
+
+        request = ChatCompletionRequest.model_validate({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        })
+        http_request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1),
+        })
+
+        response = await chat_endpoint._handle_streaming_request(
+            request,
+            adapter,
+            SimpleNamespace(id=2, protocol="openai"),
+            token,
+            request_db,
+            0.0,
+            http_request,
+            http_client,
+            "req-no-replay",
+            SimpleNamespace(conversation_id="conv-1"),
+            response=await adapter.make_request(request),
+            attempt_context=AttemptContext.start(0),
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+
+        assert any("already-started" in chunk for chunk in chunks)
+        assert adapter.make_calls == 1
+        assert response_obj.closed is True
+        assert accounting.successes
+        assert http_client.closed is True
+
+    async def test_responses_transform_retries_empty_chat_stream_once(self) -> None:
+        """Responses->Chat fallback retries without duplicating SSE prelude."""
+        first = TrackingStreamResponse("empty")
+        second = TrackingStreamResponse(
+            "text",
+            "converted",
+            headers={"x-ratelimit-remaining-tokens": "42"},
+        )
+        adapter = SequencedStreamingAdapter([first, second])
+        accounting = UsageRecordingAccounting()
+        conversation_store = FakeConversationStore()
+        token = SimpleNamespace(id=1)
+        request_db = FakeDatabase()
+        http_client = FakeHttpClient()
+        transform = ResponsesStreamTransform("model-a")
+
+        chat_endpoint.accounting_service = accounting
+        chat_endpoint.attempt_recorder = accounting
+        chat_endpoint.conversation_store = conversation_store
+        chat_endpoint.async_session_maker = FakeSessionMaker(token)
+
+        request = ChatCompletionRequest.model_validate({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        })
+        http_request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [],
+            "client": ("127.0.0.1", 1),
+        })
+        conversation_handle = SimpleNamespace(conversation_id="conv-1")
+
+        response = await chat_endpoint._handle_streaming_request(
+            request,
+            adapter,
+            SimpleNamespace(id=2, protocol="openai"),
+            token,
+            request_db,
+            0.0,
+            http_request,
+            http_client,
+            "req-responses-empty-retry",
+            conversation_handle,
+            request_protocol="openai_responses",
+            stream_transform=transform,
+            native_responses_stream=False,
+            response=await adapter.make_request(request),
+            attempt_context=AttemptContext.start(0),
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        events = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+        ]
+        event_types = [event["type"] for event in events]
+
+        assert event_types.count("response.created") == 1
+        assert event_types.count("response.in_progress") == 1
+        assert event_types.count("response.output_text.delta") == 1
+        assert event_types[-1] == "response.completed"
+        assert events[-1]["response"]["output"][0]["content"][0]["text"] == (
+            "converted"
+        )
+        assert events[-1]["response"]["usage"]["input_tokens"] == 1
+        assert events[-1]["response"]["usage"]["output_tokens"] == 1
+        assert adapter.make_calls == 2
+        assert first.closed is True
+        assert second.closed is True
+        assert accounting.successes
+        assert accounting.successes[0]["capacity_snapshot"] == {
+            "x-ratelimit-remaining-tokens": "42",
+        }
+        assert accounting.attempts[-1]["request_protocol"] == "openai_responses"
+        assert accounting.attempts[-1]["outcome"] == "success"
+        assert conversation_handle.conversation_id == "conv-1"
+        assert http_client.closed is True
+
+    async def test_nontext_chat_output_is_not_retried_as_empty(self) -> None:
+        payloads = {
+            "refusal": {
+                "choices": [{"delta": {"refusal": "not allowed"}}],
+            },
+            "audio": {
+                "choices": [{"delta": {"audio": {"data": "AQ=="}}}],
+            },
+            "function_call": {
+                "choices": [{
+                    "delta": {
+                        "function_call": {
+                            "name": "lookup",
+                            "arguments": "{}",
+                        },
+                    },
+                }],
+            },
+            "reasoning_content": {
+                "choices": [{"delta": {"reasoning_content": "thinking"}}],
+            },
+        }
+
+        for field, payload in payloads.items():
+            with self.subTest(field=field):
+                payload["choices"][0]["finish_reason"] = "function_call" if field == "function_call" else "stop"
+                response_obj = TrackingStreamResponse("payload")
+                adapter = PayloadStreamingAdapter(payload)
+                accounting = RecordingAccounting()
+                http_client = FakeHttpClient()
+                chat_endpoint.accounting_service = accounting
+                chat_endpoint.attempt_recorder = accounting
+                chat_endpoint.conversation_store = FakeConversationStore()
+                chat_endpoint.async_session_maker = FakeSessionMaker(
+                    SimpleNamespace(id=1)
+                )
+
+                request = ChatCompletionRequest.model_validate({
+                    "model": "model-a",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                })
+                http_request = Request({
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/v1/chat/completions",
+                    "headers": [],
+                    "client": ("127.0.0.1", 1),
+                })
+                response = await chat_endpoint._handle_streaming_request(
+                    request,
+                    adapter,
+                    SimpleNamespace(id=2, protocol="openai"),
+                    SimpleNamespace(id=1),
+                    FakeDatabase(),
+                    0.0,
+                    http_request,
+                    http_client,
+                    f"req-nontext-{field}",
+                    SimpleNamespace(conversation_id="conv-1"),
+                    response=response_obj,
+                    attempt_context=AttemptContext.start(0),
+                )
+                chunks = [chunk async for chunk in response.body_iterator]
+
+                assert not any("stream_error" in chunk for chunk in chunks)
+                assert adapter.make_calls == 0
+                assert response_obj.closed is True
+                assert accounting.successes
+                assert http_client.closed is True
+
+    async def test_retry_make_request_failure_records_failed_attempt(self) -> None:
+        upstream_request = httpx.Request(
+            "POST",
+            "https://provider.example/v1/chat",
+        )
+        retry_error = httpx.ReadTimeout(
+            "retry timed out",
+            request=upstream_request,
+        )
+        first = TrackingStreamResponse("empty")
+        adapter = RetryRaisingStreamingAdapter(retry_error)
+        accounting = RecordingAccounting()
+        conversation_store = FakeConversationStore()
+        routing = FakeRoutingEngine([])
+        http_client = FakeHttpClient()
+
+        chat_endpoint.accounting_service = accounting
+        chat_endpoint.attempt_recorder = accounting
+        chat_endpoint.conversation_store = conversation_store
+        chat_endpoint.async_session_maker = FakeSessionMaker(
+            SimpleNamespace(id=1)
+        )
+        chat_endpoint.routing_engine = routing
+
+        request = ChatCompletionRequest.model_validate({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        })
+        http_request = Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1),
+        })
+        conversation_handle = SimpleNamespace(conversation_id="conv-1")
+        response = await chat_endpoint._handle_streaming_request(
+            request,
+            adapter,
+            SimpleNamespace(id=2, protocol="openai"),
+            SimpleNamespace(id=1),
+            FakeDatabase(),
+            0.0,
+            http_request,
+            http_client,
+            "req-retry-make-error",
+            conversation_handle,
+            response=first,
+            attempt_context=AttemptContext.start(0),
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+
+        assert '"type": "stream_error"' in chunks[-1]
+        assert adapter.make_calls == 1
+        assert first.closed is True
+        assert accounting.successes == []
+        assert accounting.attempts[0]["outcome"] == "failed"
+        assert accounting.attempts[0]["error"].code == "upstream_timeout"
+        assert conversation_handle.conversation_id == "conv-1"
+        assert conversation_store.finishes[-1][0] == "failed"
+        assert routing.unavailable == [2]
         assert http_client.closed is True
 
     async def test_stream_uses_latest_coherent_input_usage_snapshot(self) -> None:
@@ -623,7 +1162,7 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
             http_client,
             "req-cache-snapshot",
             SimpleNamespace(conversation_id="conv-1"),
-            response=object(),
+            response=TrackingStreamResponse("unused"),
             attempt_context=AttemptContext.start(0),
         )
         [chunk async for chunk in response.body_iterator]
@@ -675,7 +1214,7 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
             http_client,
             "req-1",
             SimpleNamespace(conversation_id="conv-1"),
-            response=object(),
+            response=TrackingStreamResponse("unused"),
             attempt_context=AttemptContext.start(0),
         )
         chunks = [chunk async for chunk in response.body_iterator]
@@ -725,7 +1264,7 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
             http_client,
             "req-generic-failure",
             SimpleNamespace(conversation_id="conv-1"),
-            response=object(),
+            response=TrackingStreamResponse("unused"),
             attempt_context=AttemptContext.start(0),
             lease_session_id="session-a",
         )
@@ -776,7 +1315,7 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
             http_client,
             "req-cancelled",
             SimpleNamespace(conversation_id="conv-1"),
-            response=object(),
+            response=TrackingStreamResponse("unused"),
             attempt_context=AttemptContext.start(0),
             lease_session_id="session-a",
         )
@@ -831,7 +1370,7 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
             http_client,
             "req-1",
             SimpleNamespace(conversation_id="conv-1"),
-            response=object(),
+            response=TrackingStreamResponse("unused"),
             attempt_context=AttemptContext.start(0),
         )
         chunks = [chunk async for chunk in response.body_iterator]
@@ -888,7 +1427,7 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
             http_client,
             "req-1",
             SimpleNamespace(conversation_id="conv-1"),
-            response=object(),
+            response=TrackingStreamResponse("unused"),
             attempt_context=AttemptContext.start(0),
         )
         chunks = [chunk async for chunk in response.body_iterator]
