@@ -17,6 +17,7 @@
 
 - [系统架构](concepts/architecture.md)
 - [协议兼容与转换](concepts/protocols.md)
+- [三种协议格式与转换手册](concepts/protocol-formats.md)
 - [路由与故障转移](concepts/routing-and-fallback.md)
 - [记账、会话与状态](concepts/accounting-and-state.md)
 

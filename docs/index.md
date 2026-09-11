@@ -51,13 +51,15 @@ Rotor 是一个轻量级 LLM 网关,把多家上游 provider(智谱 / Moonshot /
 
     ---
 
-    一等公民支持 SSE 流式响应,异步记账不阻塞响应。
+    一等公民支持 SSE 流式响应;流期间释放入口 Session,流结束同步记账,
+    消息类入口的 ConversationStore 异步归档（Images 入口当前不接入）。
 
 - :material-database:{ .lg .middle } **轻量存储**
 
     ---
 
-    默认 SQLite,可切 PostgreSQL;会话内容写文件系统。
+    默认使用文件 SQLite; PostgreSQL 配置存在但当前启动迁移路径不兼容、尚未达成验证闭环,
+    会话内容写文件系统。
 
 </div>
 
@@ -85,6 +87,9 @@ http://localhost:8000
 ```
 
 继续阅读 → [安装与运行](./getting-started.md)
+
+当前实现的组件边界、协议双层关系和限制 →
+[Rotor 当前实现设计（权威快照）](./rotor-design.md)
 
 ---
 

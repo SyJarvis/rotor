@@ -121,6 +121,9 @@ venv.bak/
 *.swo
 *~
 
+# Benchmark run output (local measurements, not published)
+/benchmarks/results/
+
 # Database
 *.db
 *.db-shm
