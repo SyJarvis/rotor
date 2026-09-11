@@ -23,14 +23,9 @@ session_lease_events
 
 ## 数据库驱动
 
-应用运行时使用：
-
-- SQLite：`sqlite+aiosqlite`
-- PostgreSQL：`postgresql+asyncpg`
-
-Alembic 会把异步 URL 转换为同步驱动 URL。SQLite 使用 `sqlite`；PostgreSQL
-使用 `postgresql+psycopg`，因此执行 PostgreSQL 迁移的环境需要安装对应的同步
-驱动。
+应用运行时使用 `sqlite+aiosqlite`。当前版本的启动迁移路径只支持**文件型 SQLite**：
+`DATABASE_URL` 使用其他驱动时，Rotor 会在启动阶段报错退出，而不会在缺少迁移的情况
+下继续运行。Alembic 会把异步 URL 转换为同步驱动 URL（`sqlite`）。
 
 ## 查看迁移
 
@@ -59,7 +54,7 @@ alembic revision --autogenerate -m "describe change"
 
 - 新列的默认值和可空性；
 - 唯一约束和外键删除行为；
-- SQLite 与 PostgreSQL 的差异；
+- SQLite 的 ALTER TABLE 能力限制与批量迁移写法；
 - 大表变更的锁和回滚成本；
 - response route 与 usage 数据是否需要回填。
 

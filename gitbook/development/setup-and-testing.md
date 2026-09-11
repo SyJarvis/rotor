@@ -4,11 +4,17 @@
 
 ## 安装开发依赖
 
-`requirements.txt` 包含 pytest、pytest-asyncio、OpenAI SDK 和 Anthropic SDK：
+测试需要 pytest、pytest-asyncio 以及两个官方 SDK。运行时依赖由包本身声明：
 
 ```bash
-python -m pip install -r requirements.txt
 python -m pip install -e .
+python -m pip install pytest pytest-asyncio openai anthropic
+```
+
+前端测试另外需要 Node：
+
+```bash
+node --experimental-vm-modules --test tests/test_*.mjs
 ```
 
 ## 运行测试

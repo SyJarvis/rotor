@@ -17,12 +17,12 @@ Rotor 同时提供浏览器管理页面、管理 API、面向机器调用的只�
 - **跨协议转换**：在 OpenAI Chat、Responses 和 Anthropic Messages 之间转换基础
   消息、流式事件、工具调用和用量信息。
 - **多渠道路由**：按模型、协议、优先级、权重和运行状态选择 Channel，支持 fallback、
-  会话亲和与自适应评分。
+  会话亲和与自适应评分；同协议渠道优先（可关闭），需要原生语义的请求不会被静默降级。
 - **可观测性**：记录请求日志、每次渠道尝试、归一化错误、延迟、Token 用量和缓存
-  Token，并在管理页面展示统计。
+  Token；管理页的「监控」页展示进程内性能样本、客户端来源与增量对账。
 - **管理与诊断**：通过管理页面维护 Channel 和用户 Token；通过独立鉴权的 Control
   API 向 MCP、CLI 和自动化任务提供只读诊断数据。
-- **本地优先存储**：默认使用 SQLite，也支持 PostgreSQL；会话和运行数据保存在本地。
+- **本地优先存储**：使用文件型 SQLite；会话和运行数据保存在本地。
 
 ## 工作方式
 
@@ -49,7 +49,7 @@ rotor-mcp ── Control API ──> Rotor 诊断与用量事实
 ### 环境要求
 
 - Python 3.11 或更高版本
-- SQLite（默认）或 PostgreSQL
+- SQLite（当前版本仅支持文件型 SQLite）
 
 ### 安装并启动
 
@@ -109,17 +109,16 @@ docker run --rm \
 运行日志分别写入 `/data/conversations/` 和 `/data/logs/`。上面的单一挂载会
 持久化这些运行数据，对应宿主机目录为 `~/.cache/rotor/`。
 
-使用 Docker Compose 启动 Rotor 和 PostgreSQL：
+使用 Docker Compose 启动 Rotor 并把运行数据写入 `./data`：
 
 ```bash
 docker compose up --build -d
 docker compose logs -f rotor
 ```
 
-仓库 Compose 使用开发用数据库凭据并暴露 PostgreSQL 端口，上线前必须修改。当前
-Compose 使用 PostgreSQL volume 持久化主数据库，并把 Conversation store 和运行日志
-挂载到宿主机的 `./data/`。当前 Docker 配置只运行 Rotor；`rotor-mcp` 后续
-应使用独立镜像运行。
+仓库 Compose 使用 SQLite，只把端口绑定到 `127.0.0.1`，并把数据库、Conversation store
+和运行日志统一挂载到宿主机的 `./data/`。当前 Docker 配置只运行 Rotor；`rotor-mcp`
+后续应使用独立镜像运行。
 
 ## 完成第一次请求
 
@@ -175,9 +174,10 @@ Codex、Claude Code 和 OpenCode 的配置方式见
 | OpenAI Chat | `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` 及 Response 资源端点 |
 | OpenAI Images | `POST /v1/images/generations` |
-| Anthropic | `POST /anthropic/v1/messages`、`POST /anthropic/v1/messages/count_tokens` |
+| Anthropic | `POST /anthropic/v1/messages`、`POST /anthropic/v1/messages/count_tokens`、`GET /anthropic/v1/models` |
 | 模型 | `GET /v1/models` |
 | 管理 API | `/api/admin/channels`、`/api/admin/tokens`、`/api/admin/logs`、`/api/admin/settings` |
+| 监控 | `/api/admin/monitoring/sources`、`/api/admin/monitoring/performance`、`/api/admin/monitoring/reconciliation` |
 | Control API | `/api/control/v1/channels`、请求 trace、近期失败、模型用量和 Session Lease 评估 |
 
 Responses API 支持创建、查询、取消、删除、输入项查询、输入 Token 计数和 compact。
@@ -192,8 +192,12 @@ Rotor 当前提供：
 - `weighted`：在兼容 Channel 之间按权重选择。
 - `adaptive`：在同一优先级内结合成功率、延迟和当前负载动态评分。
 
-运行时设置可通过 `GET/PUT /api/admin/settings` 查看和更新。自适应统计保存在进程
-内，重启后重新学习；请求结果和路由决策会持久化。
+候选生成后还有两层软/硬约束：能力过滤（硬）会剔除无法表达该请求语义的渠道，
+`routing.protocol_affinity_enabled`（默认开启）则把同协议族渠道排在需要协议转换的
+渠道之前。需要原生 Responses 或 Anthropic 语义的请求不会被静默降级。
+
+运行时设置可通过 `GET/PUT /api/admin/settings` 查看和更新。自适应统计与渠道冷却
+保存在进程内，重启后重新学习；请求结果和路由决策会持久化。
 
 ## Control API、MCP 与 MindAgent
 
@@ -261,9 +265,15 @@ usage:read
 ## 开发与测试
 
 ```bash
-python -m pip install -r requirements.txt
 python -m pip install -e .
+python -m pip install pytest pytest-asyncio openai anthropic
 pytest -q
+```
+
+前端测试使用 Node：
+
+```bash
+node --experimental-vm-modules --test tests/test_*.mjs
 ```
 
 MCP 测试：

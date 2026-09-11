@@ -94,6 +94,20 @@ Channel 请求字段见 [Channel 字段](channel-schema.md)。
 | `POST` | `/api/admin/tokens/{id}/disable` | 禁用 |
 | `POST` | `/api/admin/tokens/{id}/reset-quota` | 清零已用配额 |
 
+这两个创建端点接收参数的方式不同：
+
+- `POST /api/admin/tokens` 使用 JSON 请求体，需要显式提供 `key`（至少 10 字符）；
+  同一个 `key` 已存在时返回 `400`。
+- `POST /api/admin/tokens/generate` 使用 **query 参数**（`name`、`quota`、`group`、
+  `allowed_channels`、`expire_time`），由服务端生成 `sk-` Key。
+
+管理页面使用前者；`generate` 保留给直接调用 HTTP 的脚本：
+
+```bash
+curl -X POST -b "$ROTOR_ADMIN_COOKIE_JAR" -H "X-CSRF-Token: $ROTOR_ADMIN_CSRF" \
+  "http://127.0.0.1:8000/api/admin/tokens/generate?name=quickstart&quota=1000000"
+```
+
 ## MCP Control Keys
 
 | 方法 | 路径 | 说明 |
@@ -131,6 +145,17 @@ Channel 请求字段见 [Channel 字段](channel-schema.md)。
 `capacity_snapshot`、`cost_status` 和 tariff 快照。`stats` 与 `models` 使用
 `cost_totals_by_currency` 返回费用；只有单币种结果的 `total_cost` 才是数值，混合
 币种时为 `null`，调用方不能自行把不同币种直接相加。
+
+## 监控
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/admin/monitoring/sources` | 按客户端来源汇总会话 |
+| `GET` | `/api/admin/monitoring/performance` | 进程内性能快照（含 PID 与启动时间） |
+| `GET` | `/api/admin/monitoring/reconciliation` | 账本与 Token 累计的增量对账 |
+| `POST` | `/api/admin/monitoring/reconciliation/reset` | 重建对账基线；不修账 |
+
+性能计数的窗口、样本上限与单进程边界见[日志、用量与数据存储](../operations/observability.md#监控页性能与会话来源)。
 
 ## Settings
 

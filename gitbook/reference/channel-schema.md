@@ -31,8 +31,8 @@ Channel 是路由和上游适配的主要配置对象。
 | `images_path` | 覆盖 Images 生成路径 |
 | `auth_type` | 选择 `bearer`、`x-api-key` 或 `api-key` |
 | `headers` | 添加上游请求头 |
-| `capabilities` | 显式声明渠道能力集合 |
-| `fallback_cooldown_seconds` | 可重试失败后的冷却时间 |
+| `capabilities` | 显式声明渠道能力集合，见下文 |
+| `fallback_cooldown_seconds` | 可重试失败后的冷却时间，默认 30 秒 |
 | `cache_scope` | 可能共享 provider cache 的资源范围 ID |
 | `capacity_scope` | 共享 RPM、TPM、并发或账号额度的范围 ID |
 | `billing_scope` | 共享余额、套餐或账单的范围 ID |
@@ -41,6 +41,27 @@ Channel 是路由和上游适配的主要配置对象。
 | `session_lease_idle_ttl_by_model` | 按 logical model 或 `*` 覆盖 Session Lease 空闲 TTL |
 
 未配置路径和认证方式时，Rotor 使用 provider preset 和 `protocol` 推导默认值。
+
+### capabilities 可用值
+
+`extra.capabilities` 是**允许表**：未配置视为不限；一旦配置，只有列出的能力会被视为
+支持。可用值：
+
+| 能力 | 含义 |
+| --- | --- |
+| `stream` | 支持 SSE 流式响应 |
+| `function_call` | 支持工具调用 |
+| `vision` | 支持图像输入 |
+| `responses_native` | 必须由原生 Responses 渠道承接 |
+| `openai_chat_native` | 必须由 Chat 上行承接 |
+| `anthropic_native` | 必须由原生 Messages 上行承接 |
+| `reasoning_effort` | 可承接 `reasoning_effort`（Chat 原样发送或映射到 `reasoning.effort`） |
+| `stop_sequences` | 可保留 Anthropic 的 `stop_sequences` |
+
+后四项是**协议约束**，不是普通能力开关：它们由请求中已识别的语义推导出来，不能靠
+在 `extra.capabilities` 里声明同名条目绕过。例如携带状态链或原生 `reasoning` 的
+Responses 请求会要求 `responses_native`，只有 `protocol=openai_responses` 的渠道能
+通过过滤。
 
 ## Provider 类型
 
