@@ -354,9 +354,21 @@ function initIcons() {
   }
 }
 
+async function loadServerVersion() {
+  const pill = document.getElementById("versionPill");
+  if (!pill) return;
+  try {
+    const info = await api("/api");
+    if (info?.version) pill.textContent = `v${info.version}`;
+  } catch (error) {
+    // Keep the pill empty when the server cannot be reached.
+  }
+}
+
 initIcons();
 applyLocale();
 mindagent.renderHistory();
+loadServerVersion();
 loadChannelPresets().catch((error) => toast(error.message, "error"));
 refreshActive();
 initialized = true;
