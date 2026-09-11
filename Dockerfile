@@ -2,20 +2,15 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    postgresql-client \
+# Keep gcc so the database driver can still be built when no wheel matches.
+RUN apt-get update && apt-get install -y --no-install-recommends gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
+# Install the package itself so runtime dependencies come from pyproject.toml.
+# Source checkout entry points for development are not copied into the image.
+COPY pyproject.toml README.md alembic.ini ./
 COPY ./src ./src
-COPY ./alembic ./alembic
-COPY ./alembic.ini ./alembic.ini
+RUN pip install --no-cache-dir .
 
 ENV PYTHONPATH=/app/src \
     DATABASE_URL=sqlite+aiosqlite:////data/rotor.db \
