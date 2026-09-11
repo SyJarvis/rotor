@@ -1,5 +1,9 @@
 import json
 import logging
+import math
+from datetime import timezone
+from email.utils import parsedate_to_datetime
+from time import time
 from typing import Any, Optional
 from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -16,6 +20,7 @@ _SENSITIVE_KEYS = {
     "key",
     "set-cookie",
     "token",
+    "x-api-key",
 }
 
 
@@ -104,6 +109,17 @@ class UpstreamOverloaded(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.error_type = error_type
+        self.upstream_status: int | None = None
+
+
+class UpstreamProtocolError(RuntimeError):
+    """An upstream response cannot represent a valid, complete result."""
+
+    def __init__(self, message: str, status_code: int = 502, error_type: str = "api_error"):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_type = error_type
+        self.upstream_status: int | None = None
 
 
 def _indicates_missing_model(body: Any) -> bool:
@@ -121,6 +137,24 @@ def _indicates_missing_model(body: Any) -> bool:
         marker in evidence
         for marker in ("not found", "not_found", "does not exist", "unknown")
     )
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse an upstream delay or HTTP date without accepting invalid cooldowns."""
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            deadline = parsedate_to_datetime(value)
+            # The obsolete HTTP asctime format has no explicit timezone.
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            seconds = max(0.0, deadline.timestamp() - time())
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 def normalize_upstream_error(
@@ -182,12 +216,8 @@ def normalize_upstream_error(
             status_code in {408, 409, 425, 429}
             or status_code >= 500
         )
-        if status_code == 429:
-            value = exc.response.headers.get("retry-after")
-            try:
-                retry_after = float(value) if value is not None else None
-            except ValueError:
-                retry_after = None
+        if fallback_allowed:
+            retry_after = _parse_retry_after(exc.response.headers.get("retry-after"))
         message = f"Upstream returned HTTP {status_code}"
     elif isinstance(exc, httpx.RequestError):
         code = "upstream_connection_failed"
@@ -195,7 +225,15 @@ def normalize_upstream_error(
         retry_same_channel = True
         fallback_allowed = True
         message = "Upstream connection failed"
+    elif isinstance(exc, UpstreamProtocolError):
+        upstream_status = exc.upstream_status
+        code = "upstream_invalid_response"
+        category = ErrorCategory.PROTOCOL_OR_PARAMETER_ERROR
+        retry_same_channel = False
+        fallback_allowed = False
+        message = str(exc)
     elif isinstance(exc, UpstreamOverloaded):
+        upstream_status = exc.upstream_status
         code = "upstream_overloaded"
         category = ErrorCategory.UPSTREAM_AVAILABILITY
         retry_same_channel = False
@@ -258,6 +296,8 @@ def classify_error_status(exc: Exception) -> int:
         return upstream if 400 <= upstream < 500 else 502
     if isinstance(exc, httpx.RequestError):
         return 502
+    if isinstance(exc, UpstreamProtocolError):
+        return exc.status_code
     return 500
 
 
@@ -390,20 +430,42 @@ class RateLimitException(APIRouterException):
         )
 
 
+class ChannelsTemporarilyUnavailable(APIRouterException):
+    """Compatible channels are cooling down or running a recovery probe."""
+
+    def __init__(self, model: str, retry_after_seconds: int) -> None:
+        super().__init__(
+            status_code=503,
+            detail={"error": {
+                "message": f"Channels for model '{model}' are temporarily unavailable",
+                "type": "channel_error",
+                "code": "channels_temporarily_unavailable",
+            }},
+            headers={"Retry-After": str(max(1, retry_after_seconds))},
+        )
+
+
 # Exception handlers
 
 
 async def api_router_exception_handler(request: Request, exc: APIRouterException) -> JSONResponse:
     """Handle API router exceptions."""
+    from rotor.core.anthropic_errors import is_anthropic_request, anthropic_error_response
+    if is_anthropic_request(request):
+        return anthropic_error_response(request, exc)
     return JSONResponse(
         status_code=exc.status_code,
-        content=exc.detail
+        content=exc.detail,
+        headers=exc.headers,
     )
 
 
 async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Handle general exceptions."""
     logger.exception("Unhandled error for %s %s", request.method, request.url.path, exc_info=exc)
+    from rotor.core.anthropic_errors import is_anthropic_request, anthropic_error_response
+    if is_anthropic_request(request):
+        return anthropic_error_response(request, exc)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={

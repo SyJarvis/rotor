@@ -1,4 +1,5 @@
 from typing import Any, List, Union, Dict, Mapping, Optional
+from rotor.core.exceptions import UpstreamProtocolError
 from rotor.schemas.request import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -235,7 +236,7 @@ class ProtocolConverter:
             else:
                 anthropic_request["stop_sequences"] = request.stop
 
-        if request.tools:
+        if request.tools and request.tool_choice != "none":
             anthropic_request["tools"] = ProtocolConverter.openai_tools_to_anthropic(request.tools)
 
         # Map tool_choice
@@ -245,7 +246,7 @@ class ProtocolConverter:
             elif request.tool_choice == "required":
                 anthropic_request["tool_choice"] = {"type": "any"}
             elif request.tool_choice == "none":
-                # No tool_choice parameter needed for "none" in Anthropic
+                # Withhold tools for this turn; historical tool messages remain.
                 pass
             elif isinstance(request.tool_choice, dict):
                 function = request.tool_choice.get("function") or {}
@@ -279,6 +280,8 @@ class ProtocolConverter:
         tool_calls = []
 
         for block in content:
+            if block.get("type") == "redacted_thinking":
+                raise UpstreamProtocolError("Redacted Anthropic thinking cannot be represented faithfully as Chat content")
             if block.get("type") == "text":
                 text_parts.append(block.get("text", ""))
             elif block.get("type") == "tool_use":
@@ -337,6 +340,14 @@ class ProtocolConverter:
         if tool_calls:
             choice["message"]["tool_calls"] = [tc.model_dump() for tc in tool_calls]
 
+        thinking = [
+            block.get("thinking", "")
+            for block in anthropic_response.content
+            if block.get("type") == "thinking"
+        ]
+        if thinking:
+            choice["message"]["reasoning_content"] = "\n".join(thinking)
+
         usage = ProtocolConverter.anthropic_to_openai_usage(anthropic_response.usage)
 
         return {
@@ -389,6 +400,8 @@ class ProtocolConverter:
         # Handle content_block_start (tool_use start)
         if event_type == "content_block_start":
             block = stream_event.get("content_block", {})
+            if block.get("type") == "redacted_thinking":
+                raise UpstreamProtocolError("Redacted Anthropic thinking cannot be represented faithfully as Chat content")
             if block.get("type") == "tool_use":
                 import json
                 return {
@@ -431,7 +444,7 @@ class ProtocolConverter:
                     }]
                 }
 
-            # Handle thinking_delta (GLM-specific thinking process)
+            # Keep reasoning separate from the user-facing answer.
             if delta_type == "thinking_delta":
                 thinking = delta.get("thinking", "")
                 if thinking:
@@ -442,7 +455,7 @@ class ProtocolConverter:
                         "model": request_model,
                         "choices": [{
                             "index": 0,
-                            "delta": {"content": thinking},
+                            "delta": {"reasoning_content": thinking},
                             "finish_reason": None,
                         }]
                     }

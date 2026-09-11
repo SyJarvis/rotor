@@ -23,7 +23,7 @@ from rotor.api.v1.anthropic import (
     anthropic_to_openai_request,
     openai_to_anthropic_response,
 )
-from rotor.schemas.request import AnthropicMessageRequest
+from rotor.schemas.request import AnthropicMessageRequest, ChatCompletionRequest
 
 
 def test_anthropic_request_moves_system_messages_to_top_level() -> None:
@@ -405,63 +405,68 @@ def test_empty_openai_response_converts_to_empty_anthropic_text_block() -> None:
 
 
 def test_anthropic_usage_updates_quota_and_creates_request_log() -> None:
-    token = SimpleNamespace(
-        id=3,
-        request_count=0,
-        token_count=0,
-        used_quota=90,
-        quota=100,
-        enabled=True,
-        last_used_at=None,
-        user_id="user-1",
-    )
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from rotor.database import Base
+    from rotor.models.log import RequestLog
+    from rotor.models.token import Token
+    from rotor.models.usage import UsageLedger
+
     channel = SimpleNamespace(
         id=7,
         type="openai",
         protocol="openai",
     )
-
-    class FakeDb:
-        def __init__(self):
-            self.added = []
-
-        def add(self, value):
-            self.added.append(value)
-
-    db = FakeDb()
     request = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
 
     async def record():
-        await accounting_service.record_success(
-            db,
-            request_id="req-test",
-            conversation_id=None,
-            request_protocol="anthropic_messages",
-            token=token,
-            channel=channel,
-            model="claude-test",
-            provider_model="provider-model",
-            usage=accounting_service.extract_usage({
-                "usage": {
-                    "prompt_tokens": 8,
-                    "completion_tokens": 4,
-                    "total_tokens": 12,
-                }
-            }),
-            latency_ms=250,
-            client_ip=request.client.host,
-        )
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with sessions() as db:
+                token = Token(
+                    key="anthropic-test", name="test", used_quota=90,
+                    quota=100, user_id="user-1",
+                )
+                db.add(token)
+                await db.commit()
+                await accounting_service.record_success(
+                    db,
+                    request_id="req-test",
+                    conversation_id=None,
+                    request_protocol="anthropic_messages",
+                    token=token,
+                    channel=channel,
+                    model="claude-test",
+                    provider_model="provider-model",
+                    usage=accounting_service.extract_usage({
+                        "usage": {
+                            "prompt_tokens": 8,
+                            "completion_tokens": 4,
+                            "total_tokens": 12,
+                        }
+                    }),
+                    latency_ms=250,
+                    client_ip=request.client.host,
+                )
+                await db.commit()
+                await db.refresh(token)
+                assert token.request_count == 1
+                assert token.token_count == 12
+                assert token.used_quota == 102
+                assert token.enabled is False
+                log = (await db.scalars(select(RequestLog))).one()
+                ledger = (await db.scalars(select(UsageLedger))).one()
+                assert log.total_tokens == 12
+                assert ledger.request_protocol == "anthropic_messages"
+                assert ledger.total_tokens == 12
+        finally:
+            await engine.dispose()
 
     asyncio.run(record())
-
-    assert token.request_count == 1
-    assert token.token_count == 12
-    assert token.used_quota == 102
-    assert token.enabled is False
-    assert len(db.added) == 2
-    assert db.added[0].total_tokens == 12
-    assert db.added[1].request_protocol == "anthropic_messages"
-    assert db.added[1].total_tokens == 12
 
 
 def test_streaming_usage_missing_when_provider_sends_no_usage() -> None:
@@ -894,12 +899,20 @@ def test_native_anthropic_response_and_sse_events_are_not_downgraded() -> None:
     class NativeStream(AsyncByteStream):
         async def __aiter__(self):
             events = [
-                {"type": "message_start", "message": {"id": "msg_1", "type": "message"}},
+                {"type": "message_start", "message": {"id": "msg_1", "type": "message",
+                    "role": "assistant", "model": "claude-test", "content": [], "stop_reason": None,
+                    "usage": {"input_tokens": 2, "output_tokens": 0}}},
+                {"type": "content_block_start", "index": 0,
+                 "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
                 {
                     "type": "content_block_delta",
                     "index": 0,
                     "delta": {"type": "thinking_delta", "thinking": "reason"},
                 },
+                {"type": "content_block_delta", "index": 0,
+                 "delta": {"type": "signature_delta", "signature": "sig"}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}},
                 {"type": "message_stop"},
             ]
             yield "".join(
@@ -913,7 +926,7 @@ def test_native_anthropic_response_and_sse_events_are_not_downgraded() -> None:
         "messages": [{"role": "user", "content": "hello"}],
     })
     internal = anthropic_to_openai_request(request)
-    adapter = AnthropicAdapter(SimpleNamespace(model_mapping={}, extra={}), None)
+    adapter = AnthropicAdapter(SimpleNamespace(model_mapping={}, extra={}, key="unused"), None)
     native = {
         "id": "msg_1",
         "type": "message",
@@ -940,14 +953,16 @@ def test_native_anthropic_response_and_sse_events_are_not_downgraded() -> None:
     events = asyncio.run(collect())
 
     assert converted == native
-    assert events[1]["delta"]["type"] == "thinking_delta"
+    assert events[2]["delta"]["type"] == "thinking_delta"
 
 
 def test_anthropic_stream_overload_error_raises_upstream_overloaded() -> None:
     class OverloadedStream(AsyncByteStream):
         async def __aiter__(self):
             events = [
-                {"type": "message_start", "message": {"id": "msg_1", "type": "message"}},
+                {"type": "message_start", "message": {"id": "msg_1", "type": "message",
+                    "role": "assistant", "model": "claude-test", "content": [], "stop_reason": None,
+                    "usage": {"input_tokens": 2, "output_tokens": 0}}},
                 {
                     "type": "error",
                     "error": {
@@ -967,7 +982,7 @@ def test_anthropic_stream_overload_error_raises_upstream_overloaded() -> None:
         "messages": [{"role": "user", "content": "hello"}],
     })
     internal = anthropic_to_openai_request(request)
-    adapter = AnthropicAdapter(SimpleNamespace(model_mapping={}, extra={}), None)
+    adapter = AnthropicAdapter(SimpleNamespace(model_mapping={}, extra={}, key="unused"), None)
     response = Response(
         200,
         stream=OverloadedStream(),
@@ -1004,7 +1019,7 @@ def test_anthropic_stream_overload_by_wording_raises_upstream_overloaded() -> No
         "messages": [{"role": "user", "content": "hello"}],
     })
     internal = anthropic_to_openai_request(request)
-    adapter = AnthropicAdapter(SimpleNamespace(model_mapping={}, extra={}), None)
+    adapter = AnthropicAdapter(SimpleNamespace(model_mapping={}, extra={}, key="unused"), None)
     response = Response(
         200,
         stream=OverloadedStream(),
@@ -1042,7 +1057,7 @@ def test_anthropic_stream_parameter_error_still_raises_runtime_error() -> None:
         "messages": [{"role": "user", "content": "hello"}],
     })
     internal = anthropic_to_openai_request(request)
-    adapter = AnthropicAdapter(SimpleNamespace(model_mapping={}, extra={}), None)
+    adapter = AnthropicAdapter(SimpleNamespace(model_mapping={}, extra={}, key="unused"), None)
     response = Response(
         200,
         stream=InvalidRequestStream(),
@@ -1113,7 +1128,7 @@ def test_provider_adapters_forward_tools() -> None:
     async def convert(adapter_class):
         return await adapter_class(channel, None).convert_request(request)
 
-    for adapter_class in (ZhipuAdapter, MiniMaxAdapter, KimiAdapter):
+    for adapter_class in (MiniMaxAdapter, KimiAdapter):
         body = asyncio.run(convert(adapter_class))
         assert body["tools"][0]["function"]["name"] == "Bash"
         assert body["tool_choice"]["function"]["name"] == "Bash"
@@ -1132,7 +1147,6 @@ def test_openai_streaming_request_explicitly_requests_usage() -> None:
 
     for adapter_class in (
         OpenAIAdapter,
-        ZhipuAdapter,
         MiniMaxAdapter,
         KimiAdapter,
         MoonshotAdapter,
@@ -1141,6 +1155,197 @@ def test_openai_streaming_request_explicitly_requests_usage() -> None:
         body = asyncio.run(adapter.convert_request(internal_request))
         prepared = adapter.prepare_request_body(internal_request, body)
         assert prepared["stream_options"] == {"include_usage": True}
+
+
+def test_zhipu_anthropic_request_uses_native_endpoint_and_payload() -> None:
+    seen: list[Request] = []
+    native_response = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "OK"}],
+        "model": "glm-5.3",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 3, "output_tokens": 1},
+    }
+
+    async def handler(request: Request) -> Response:
+        seen.append(request)
+        return Response(200, json=native_response)
+
+    request = AnthropicMessageRequest.model_validate({
+        "model": "claude-code-model",
+        "max_tokens": 128,
+        "thinking": {"type": "adaptive"},
+        "context_management": {"edits": []},
+        "output_config": {"effort": "high"},
+        "system": [{
+            "type": "text",
+            "text": "Be concise.",
+            "cache_control": {"type": "ephemeral"},
+        }],
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{
+            "name": "Bash",
+            "description": "Run a command",
+            "input_schema": {"type": "object"},
+            "cache_control": {"type": "ephemeral"},
+        }],
+    })
+    internal = anthropic_to_openai_request(request)
+    original_payload = json.loads(json.dumps(internal.anthropic_payload))
+    internal.anthropic_headers = {
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "context-management-2025-06-27",
+    }
+    channel = SimpleNamespace(
+        type="zhipu",
+        protocol="openai",
+        base_url="https://open.bigmodel.cn/api/coding/paas/v4",
+        key="provider-key",
+        model_mapping={"claude-code-model": "glm-5.3"},
+        extra={},
+    )
+
+    async def exercise() -> tuple[dict, bool]:
+        async with AsyncClient(transport=MockTransport(handler)) as client:
+            adapter = ZhipuAdapter(channel, client)
+            response = await adapter.make_request(internal)
+            converted = await adapter.convert_response(response, internal)
+            return converted, adapter.native_anthropic
+
+    converted, native_anthropic = asyncio.run(exercise())
+
+    body = json.loads(seen[0].content)
+    assert str(seen[0].url) == "https://open.bigmodel.cn/api/anthropic/v1/messages"
+    assert seen[0].headers["authorization"] == "Bearer provider-key"
+    assert seen[0].headers["anthropic-version"] == "2023-06-01"
+    assert seen[0].headers["anthropic-beta"] == "context-management-2025-06-27"
+    assert "x-api-key" not in seen[0].headers
+    assert body["model"] == "glm-5.3"
+    assert body["thinking"] == {"type": "adaptive"}
+    assert body["context_management"] == {"edits": []}
+    assert body["output_config"] == {"effort": "high"}
+    assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert body["tools"][0]["cache_control"] == {"type": "ephemeral"}
+    assert "stream_options" not in body
+    assert internal.anthropic_payload == original_payload
+    assert converted == native_response
+    assert native_anthropic is True
+
+
+def test_zhipu_anthropic_stream_preserves_native_sse_events() -> None:
+    events = [
+        {
+            "type": "message_start",
+            "message": {"id": "msg_1", "type": "message", "role": "assistant",
+                        "model": "glm-5.3", "content": [], "stop_reason": None,
+                        "usage": {"input_tokens": 2, "output_tokens": 0}},
+        },
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "reason"},
+        },
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "signature_delta", "signature": "sig"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}},
+        {"type": "message_stop"},
+    ]
+
+    class NativeStream(AsyncByteStream):
+        async def __aiter__(self):
+            yield "".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                for event in events
+            ).encode()
+
+    request = AnthropicMessageRequest.model_validate({
+        "model": "glm-5.3",
+        "max_tokens": 128,
+        "stream": True,
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    internal = anthropic_to_openai_request(request)
+    adapter = ZhipuAdapter(SimpleNamespace(model_mapping={}, extra={}, key="unused"), None)
+    response = Response(
+        200,
+        stream=NativeStream(),
+        request=Request("POST", "https://open.bigmodel.cn/api/anthropic/v1/messages"),
+    )
+
+    async def collect() -> list[dict]:
+        return [
+            event
+            async for event in adapter.stream_convert_response(response, internal)
+        ]
+
+    assert asyncio.run(collect()) == events
+
+
+def test_zhipu_openai_stream_keeps_chat_completions_behavior() -> None:
+    seen: list[Request] = []
+    chunks = [
+        {
+            "id": "chatcmpl_1",
+            "choices": [{"delta": {"content": "OK"}, "finish_reason": None}],
+        },
+        {
+            "id": "chatcmpl_1",
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+        },
+    ]
+
+    class OpenAIStream(AsyncByteStream):
+        async def __aiter__(self):
+            yield "".join(
+                f"data: {json.dumps(chunk)}\n\n" for chunk in chunks
+            ).encode()
+            yield b"data: [DONE]\n\n"
+
+    async def handler(request: Request) -> Response:
+        seen.append(request)
+        return Response(200, stream=OpenAIStream())
+
+    request = ChatCompletionRequest.model_validate({
+        "model": "glm-5.3",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": True,
+    })
+    channel = SimpleNamespace(
+        type="zhipu",
+        protocol="openai",
+        base_url="https://open.bigmodel.cn/api/coding/paas/v4",
+        key="provider-key",
+        model_mapping={},
+        extra={
+            "anthropic_base_url": "https://proxy.example/anthropic/v1",
+        },
+    )
+
+    async def exercise() -> list[dict]:
+        async with AsyncClient(transport=MockTransport(handler)) as client:
+            adapter = ZhipuAdapter(channel, client)
+            response = await adapter.make_request(request)
+            return [
+                chunk
+                async for chunk in adapter.stream_convert_response(response, request)
+            ]
+
+    converted = asyncio.run(exercise())
+
+    body = json.loads(seen[0].content)
+    assert str(seen[0].url) == (
+        "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+    )
+    assert body["model"] == "glm-5.3"
+    assert body["messages"] == [{"role": "user", "content": "hello"}]
+    assert body["stream"] is True
+    assert "stream_options" not in body
+    assert converted == chunks
 
 
 def test_moonshot_adapter_allows_missing_extra_config() -> None:
@@ -1268,7 +1473,7 @@ def test_anthropic_stream_records_terminal_attempt_without_lease(
             request,
             anthropic_to_openai_request(request),
             FailingAdapter(),
-            SimpleNamespace(id=2, protocol="openai"),
+            SimpleNamespace(id=2, protocol="openai", key="unused"),
             SimpleNamespace(id=1),
             _TerminalStreamDatabase(),
             0.0,
@@ -1276,7 +1481,7 @@ def test_anthropic_stream_records_terminal_attempt_without_lease(
             http_client,
             "req-terminal",
             "conv-1",
-            object(),
+            Response(200),
             SimpleNamespace(conversation_id="conv-1"),
             attempt_context=anthropic_endpoint.AttemptContext.start(0),
             lease_session_id="session-a",
@@ -1294,3 +1499,115 @@ def test_anthropic_stream_records_terminal_attempt_without_lease(
     assert conversation_store.finishes[-1] == expected_status
     assert http_client.closed is True
     assert raised is (asyncio.CancelledError if expected_outcome == "cancelled" else None)
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["converted", "native"])
+@pytest.mark.parametrize("accounting_fails", [False, True], ids=["success", "accounting-failure"])
+def test_message_stop_is_sent_after_accounting_commit_and_archive_enqueue(
+    monkeypatch, tmp_path, native, accounting_fails,
+) -> None:
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from rotor.config import settings
+    from rotor.conversations.store import ConversationHandle, ConversationStore
+    from rotor.database import Base, create_database_engine
+    from rotor.gateway.accounting import AccountingService
+    from rotor.gateway.attempts import AttemptRecorder
+    from rotor.models.channel import Channel
+    from rotor.models.log import RequestLog
+    from rotor.models.request_attempt import RequestAttempt
+    from rotor.models.token import Token
+    from rotor.models.usage import UsageLedger
+
+    native_stop = {"type": "message_stop", "provider_extension": "preserved"}
+
+    class Adapter:
+        def map_model_name(self, model):
+            return model
+
+        async def stream_convert_response(self, response, request):
+            if native:
+                yield {"type": "message_start", "message": {
+                    "id": "native-message", "content": [],
+                    "type": "message", "role": "assistant", "model": "test", "stop_reason": None,
+                    "usage": {"input_tokens": 8, "output_tokens": 0},
+                }}
+                yield {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                       "usage": {"output_tokens": 4}}
+                yield native_stop
+            else:
+                yield {"choices": [{"delta": {"content": "hello"}, "finish_reason": None}]}
+                yield {"choices": [{"delta": {}, "finish_reason": "stop"}],
+                       "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12}}
+
+    async def exercise():
+        engine = create_database_engine(f"sqlite+aiosqlite:///{tmp_path / 'terminal.db'}")
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        store = ConversationStore()
+        store._queue = asyncio.Queue()
+        monkeypatch.setattr(settings, "CONVERSATION_STORE_ENABLED", True)
+        monkeypatch.setattr(anthropic_endpoint, "async_session_maker", sessions)
+        service = AccountingService()
+        if accounting_fails:
+            async def fail_accounting(*args, **kwargs):
+                raise RuntimeError("accounting failed")
+            monkeypatch.setattr(service, "record_success", fail_accounting)
+        monkeypatch.setattr(anthropic_endpoint, "accounting_service", service)
+        monkeypatch.setattr(anthropic_endpoint, "attempt_recorder", AttemptRecorder())
+        monkeypatch.setattr(anthropic_endpoint, "conversation_store", store)
+        client = _TerminalStreamClient()
+        response = None
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            async with sessions() as seed:
+                token = Token(key="terminal", name="terminal")
+                channel = Channel(name="test", type="openai", protocol="openai",
+                                  key="unused", base_url="https://unused.invalid")
+                seed.add_all([token, channel])
+                await seed.commit()
+            request = AnthropicMessageRequest.model_validate({
+                "model": "test", "max_tokens": 128, "stream": True,
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+            handle = ConversationHandle("conversation", "request", tmp_path / "archive.jsonl")
+            response = await anthropic_endpoint._handle_streaming_request(
+                request, anthropic_to_openai_request(request), Adapter(), channel, token,
+                sessions(), 0.0, StarletteRequest({
+                    "type": "http", "headers": [], "client": ("127.0.0.1", 1),
+                }), client, "request", "conversation", Response(200), handle,
+                native_anthropic_stream=native,
+                attempt_context=anthropic_endpoint.AttemptContext.start(0),
+            )
+            saw_stop = False
+            saw_error = False
+            async for chunk in response.body_iterator:
+                saw_error = saw_error or "event: error\n" in chunk
+                if "event: message_stop\n" not in chunk:
+                    continue
+                saw_stop = True
+                assert not accounting_fails
+                async with sessions() as verify:
+                    ledger = (await verify.scalars(select(UsageLedger))).one()
+                    assert ledger.total_tokens == 12
+                    assert (await verify.scalars(select(RequestLog))).one().success
+                    assert (await verify.scalars(select(RequestAttempt))).one().outcome == "success"
+                    saved_token = await verify.get(Token, token.id)
+                    assert (saved_token.request_count, saved_token.used_quota) == (1, 12)
+                assert store._queue.qsize() == 1
+                archived = store._queue.get_nowait()
+                assert archived.kind == "commit"
+                assert archived.payload["status"] == "success"
+                if native:
+                    assert json.loads(chunk.split("data: ", 1)[1]) == native_stop
+                break  # A real client can disconnect as soon as it sees message_stop.
+            assert saw_stop is not accounting_fails
+            assert saw_error is accounting_fails
+        finally:
+            if response is not None:
+                await response.body_iterator.aclose()
+            await engine.dispose()
+        assert client.closed
+
+    asyncio.run(exercise())

@@ -5,7 +5,10 @@ from httpx import AsyncClient, Response
 from typing import AsyncIterator, Any
 from copy import deepcopy
 from rotor.schemas.request import ChatCompletionRequest
-from rotor.core.exceptions import UpstreamOverloaded, is_overload_error_signal
+from rotor.core.exceptions import UpstreamOverloaded, UpstreamProtocolError
+from rotor.adapters.protocol.anthropic_integrity import (
+    NativeMessageStream, iter_anthropic_sse, validate_native_message,
+)
 import json
 
 
@@ -47,7 +50,16 @@ class AnthropicAdapter(AnthropicCompatibleAdapter):
 
     async def convert_response(self, response: Response, request: ChatCompletionRequest) -> dict[str, Any]:
         """Convert Anthropic response to OpenAI format."""
-        data = response.json()
+        try:
+            data = response.json()
+            validate_native_message(data, secret=self.channel.key)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            exc = UpstreamProtocolError("Upstream returned invalid Anthropic JSON")
+            exc.upstream_status = response.status_code
+            raise exc from None
+        except (UpstreamOverloaded, UpstreamProtocolError) as exc:
+            exc.upstream_status = response.status_code
+            raise
 
         if request.anthropic_payload is not None:
             return data
@@ -70,46 +82,17 @@ class AnthropicAdapter(AnthropicCompatibleAdapter):
         import uuid
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
-        async for line in response.aiter_lines():
-            line = line.strip()
-            # Skip empty lines and heartbeat/comments (lines starting with ':')
-            if not line or line.startswith(":"):
-                continue
-
-            # SSE format: lines start with "data: "
-            if line.startswith("data: "):
-                data_str = line[6:].strip()
-                # Check for stream end marker
-                if data_str == "[DONE]":
-                    break
-
-                try:
-                    # Parse the JSON data
-                    event = json.loads(data_str)
-                    if event.get("type") == "error":
-                        error = event.get("error") or {}
-                        error_message = error.get("message") or "Anthropic upstream stream error"
-                        error_type = error.get("type")
-                        if is_overload_error_signal(error_type, error_message):
-                            raise UpstreamOverloaded(
-                                error_message, error_type=error_type
-                            )
-                        raise RuntimeError(error_message)
-
-                    if request.anthropic_payload is not None:
-                        yield event
-                        continue
-
-                    # Convert to OpenAI format
-                    openai_chunk = ProtocolConverter.anthropic_stream_to_openai(
-                        event,
-                        request.model,
-                        chunk_id
-                    )
-
-                    if openai_chunk:
-                        yield openai_chunk
-
-                except json.JSONDecodeError:
-                    # Skip invalid JSON lines
+        tracker = NativeMessageStream(secret=self.channel.key)
+        try:
+            async for event in iter_anthropic_sse(response, secret=self.channel.key):
+                tracker.feed(event)
+                if request.anthropic_payload is not None:
+                    yield event
                     continue
+                openai_chunk = ProtocolConverter.anthropic_stream_to_openai(event, request.model, chunk_id)
+                if openai_chunk:
+                    yield openai_chunk
+            tracker.finish()
+        except (UpstreamOverloaded, UpstreamProtocolError) as exc:
+            exc.upstream_status = response.status_code
+            raise

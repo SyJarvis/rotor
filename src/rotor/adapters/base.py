@@ -180,7 +180,7 @@ class BaseAdapter(ABC):
             extra=self.channel.extra,
             name="request_path",
         ) or default_path
-        return join_api_url(self.channel.base_url, path)
+        return join_api_url(self.channel.base_url, path, protocol=self.channel.protocol)
 
     def build_request_headers(self) -> dict[str, str]:
         auth_type = channel_option(
@@ -203,6 +203,15 @@ class OpenAICompatibleAdapter(BaseAdapter):
         request: ChatCompletionRequest,
         body: dict[str, Any],
     ) -> dict[str, Any]:
+        # Preserve Chat options even when a provider overrides convert_request.
+        if request.max_completion_tokens is not None:
+            body["max_completion_tokens"] = request.max_completion_tokens
+        if request.reasoning_effort is not None:
+            body["reasoning_effort"] = request.reasoning_effort
+        if request.response_format is not None:
+            body["response_format"] = request.response_format
+        if request.parallel_tool_calls is not None:
+            body["parallel_tool_calls"] = request.parallel_tool_calls
         if request.stream:
             # Apply this after convert_request so provider adapters that
             # override conversion still request the final usage chunk.
@@ -252,7 +261,15 @@ class OpenAICompatibleAdapter(BaseAdapter):
 
     async def convert_response(self, response: Response, request: ChatCompletionRequest) -> dict[str, Any]:
         """Convert OpenAI-compatible response."""
-        return response.json()
+        from rotor.adapters.protocol.openai_integrity import validate_chat_response
+        from rotor.core.exceptions import UpstreamProtocolError
+        try:
+            payload = response.json()
+        except (ValueError, UnicodeDecodeError):
+            error = UpstreamProtocolError("Upstream returned invalid Chat JSON")
+            error.upstream_status = response.status_code
+            raise error from None
+        return validate_chat_response(payload, upstream_status=response.status_code, secret=self.channel.key)
 
     async def stream_convert_response(
         self,
@@ -260,16 +277,14 @@ class OpenAICompatibleAdapter(BaseAdapter):
         request: ChatCompletionRequest
     ) -> AsyncIterator[dict[str, Any]]:
         """Convert streaming OpenAI-compatible response."""
-        async for line in response.aiter_lines():
-            if line.strip() and line.startswith("data: "):
-                data = line[6:]  # Remove "data: " prefix
-                if data == "[DONE]":
-                    break
-                import json
-                try:
-                    yield json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+        if request.anthropic_payload is not None:
+            from rotor.adapters.protocol.anthropic_integrity import iter_anthropic_sse
+            async for event in iter_anthropic_sse(response, secret=self.channel.key, allow_done=True):
+                yield event
+            return
+        from rotor.adapters.protocol.openai_integrity import iter_chat_sse
+        async for event in iter_chat_sse(response, secret=self.channel.key):
+            yield event
 
 
 class AnthropicCompatibleAdapter(BaseAdapter):

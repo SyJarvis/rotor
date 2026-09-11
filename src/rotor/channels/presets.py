@@ -1,4 +1,5 @@
 from copy import deepcopy
+import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -109,7 +110,7 @@ def channel_option(
     return str(provider_defaults(provider, protocol)[name])
 
 
-def join_api_url(base_url: str, path: str) -> str:
+def join_api_url(base_url: str, path: str, *, protocol: str | None = None) -> str:
     base = base_url.strip().rstrip("/")
     if not path:
         return base
@@ -119,6 +120,18 @@ def join_api_url(base_url: str, path: str) -> str:
     parsed = urlsplit(base)
     base_path = parsed.path.rstrip("/")
     normalized_path = "/" + path.lstrip("/")
+    if str(protocol or "").lower() in {"anthropic", "anthropic_messages"}:
+        endpoint = re.fullmatch(r"/(?:(v\d+)/)?(messages|models)/?", normalized_path)
+        if endpoint:
+            # Only standard operations imply the Anthropic /v1 API root.
+            # Explicit versions win; custom paths retain the generic join.
+            root = re.sub(r"/(v\d+)/(messages|models)$", r"/\1", base_path)
+            base_version = re.search(r"/(v\d+)$", root)
+            version = endpoint[1] or (base_version[1] if base_version else "v1")
+            if base_version:
+                root = root[:base_version.start()]
+            final_path = f"{root}/{version}/{endpoint[2]}"
+            return urlunsplit((parsed.scheme, parsed.netloc, final_path, "", ""))
     if base_path and normalized_path.startswith(base_path + "/"):
         final_path = normalized_path
     else:

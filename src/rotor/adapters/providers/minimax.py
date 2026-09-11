@@ -3,7 +3,6 @@ from rotor.models.channel import Channel
 from httpx import AsyncClient, Response
 from typing import AsyncIterator
 from rotor.schemas.request import ChatCompletionRequest
-import json
 
 
 class MiniMaxAdapter(OpenAICompatibleAdapter):
@@ -64,12 +63,5 @@ class MiniMaxAdapter(OpenAICompatibleAdapter):
         request: ChatCompletionRequest
     ) -> AsyncIterator[dict]:
         """Convert MiniMax OpenAI-compatible streaming response."""
-        async for line in response.aiter_lines():
-            if line.strip() and line.startswith("data: "):
-                data = line[6:]  # Remove "data: " prefix
-                if data == "[DONE]":
-                    break
-                try:
-                    yield json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+        async for event in super().stream_convert_response(response, request):
+            yield event

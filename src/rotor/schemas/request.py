@@ -31,6 +31,7 @@ class ChatMessage(BaseModel):
     name: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
     tool_call_id: Optional[str] = None
+    reasoning_content: Optional[str] = None
 
 
 class Function(BaseModel):
@@ -55,11 +56,15 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = Field(1.0, ge=0, le=1)
     n: Optional[int] = Field(1, ge=1)
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
+    reasoning_effort: Optional[str] = None
+    response_format: Optional[Dict[str, Any]] = None
     presence_penalty: Optional[float] = Field(0, ge=-2, le=2)
     frequency_penalty: Optional[float] = Field(0, ge=-2, le=2)
     stop: Optional[Union[str, List[str]]] = None
     stream: Optional[bool] = False
     tools: Optional[List[Tool]] = None
+    parallel_tool_calls: Optional[bool] = None
     tool_choice: Optional[Union[Literal["none", "auto", "required"], Dict]] = None
     user: Optional[str] = None
     # Preserve protocol-native fields when an Anthropic request is routed to

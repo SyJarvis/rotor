@@ -3,7 +3,6 @@ from rotor.models.channel import Channel
 from httpx import AsyncClient, Response
 from typing import AsyncIterator
 from rotor.schemas.request import ChatCompletionRequest
-import json
 
 
 class KimiAdapter(OpenAICompatibleAdapter):
@@ -53,33 +52,11 @@ class KimiAdapter(OpenAICompatibleAdapter):
 
     async def convert_response(self, response: Response, request: ChatCompletionRequest) -> dict:
         """Convert Kimi OpenAI-compatible response."""
-        data = response.json()
+        data = await super().convert_response(response, request)
 
-        # Kimi should return OpenAI-compatible format
-        # Ensure the response has the expected structure
-        if "choices" not in data:
-            # Handle edge case where response might be different
-            return {
-                "id": data.get("id", "chatcmpl-unknown"),
-                "object": "chat.completion",
-                "created": data.get("created", 0),
-                "model": data.get("model", request.model),
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": data.get("content", data.get("message", "")),
-                        },
-                        "finish_reason": data.get("finish_reason", "stop"),
-                    }
-                ],
-                "usage": data.get("usage", {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0
-                })
-            }
+        if request.anthropic_payload is not None:
+            from rotor.adapters.protocol.anthropic_integrity import validate_chat_response
+            return validate_chat_response(data, secret=self.channel.key)
 
         return data
 
@@ -89,12 +66,5 @@ class KimiAdapter(OpenAICompatibleAdapter):
         request: ChatCompletionRequest
     ) -> AsyncIterator[dict]:
         """Convert Kimi OpenAI-compatible streaming response."""
-        async for line in response.aiter_lines():
-            if line.strip() and line.startswith("data: "):
-                data = line[6:]  # Remove "data: " prefix
-                if data == "[DONE]":
-                    break
-                try:
-                    yield json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+        async for event in super().stream_convert_response(response, request):
+            yield event
