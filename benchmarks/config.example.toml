@@ -1,0 +1,44 @@
+# Optional human-readable scenario template.  The runner currently exposes
+# these fields as CLI flags; TOML is used only to avoid adding a YAML runtime
+# dependency.
+base_url = "http://127.0.0.1:8000"
+model = "benchmark-model"
+protocol = "chat"       # chat | responses | anthropic | all
+stream = true
+concurrency = 4
+requests = 20
+rounds = 1                    # independent measured rounds
+# duration = 30.0             # seconds; takes precedence over requests
+warmup = 2
+timeout = 120.0
+rate = 0.0              # 0 means unset; closed-loop concurrency remains the cap
+max_tokens = 128
+
+# Optional deterministic mock fault schedule (used only by
+# `python -m benchmarks.mock_provider`; first two requests succeed, requests
+# 3-4 fail with 503, and request 5 onward recovers):
+# fail_after = 2
+# recover_after = 4
+# failure_status_code = 503
+
+# Optional process sampler settings.  Sampling is a separate command/API and
+# is not enabled unless a caller supplies a target PID:
+# target_pid = 12345          # runner --pid integration
+# sample_interval = 0.5       # strictly positive for runner background sampling
+# sample_duration = 30.0
+
+# Duration quantiles retain at most the first 4,096 measured rows in memory;
+# all rows still contribute to totals/RPS and are streamed to raw-results.jsonl.
+
+# Keep credentials outside this file, for example:
+#   ROTOR_API_KEY=... python -m benchmarks.runner ...
+api_key_env = "ROTOR_API_KEY"
+
+# Suggested isolated settings (do not point a benchmark at production data):
+# DATABASE_URL=sqlite:///./benchmark-rotor.db
+# CONVERSATION_STORE_DIR=./.benchmark-conversations
+
+# Compare completed direct and gateway rounds (paths are intentionally
+# separate so incomparable scenarios cannot be accidentally combined):
+# python -m benchmarks.compare benchmarks/results/direct/chat \
+#   benchmarks/results/gateway/chat --format markdown --output comparison.md
