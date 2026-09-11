@@ -10,6 +10,62 @@ from typing import Any, Mapping
 
 _MAX_IDENTIFIER_LENGTH = 100
 
+SESSION_SOURCE_TO_CLIENT = {
+    "codex-session-id": "codex",
+    "claude-code-session-id": "claude_code",
+    "metadata-user-session-id": "claude_code",
+    "opencode-session-affinity": "opencode",
+    "pi-session-id": "pi",
+    "pi-opencode-session": "pi",
+    "pi-prompt-cache-key": "pi",
+    "grok-conv-id": "grok_build",
+    "grok-session-id": "grok_build",
+    "grok-prompt-cache-key": "grok_build",
+    "mindcode-session-id": "mindcode",
+}
+
+
+def _is_pi_client(
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    user_agent = str(headers.get("user-agent") or "").strip().lower()
+    opencode_client = str(headers.get("x-opencode-client") or "").strip().lower()
+    originator = str(
+        headers.get("originator")
+        or (metadata or {}).get("originator")
+        or ""
+    ).strip().lower()
+    return (
+        originator == "pi"
+        or opencode_client == "pi"
+        or user_agent.startswith(("pi ", "pi/", "pi("))
+    )
+
+
+def _is_grok_client(headers: Mapping[str, str]) -> bool:
+    user_agent = str(headers.get("user-agent") or "").strip().lower()
+    client_identifier = (
+        str(headers.get("x-grok-client-identifier") or "").strip().lower()
+    )
+    token_auth = str(headers.get("x-xai-token-auth") or "").strip().lower()
+    branded_user_agent = any(
+        user_agent == marker
+        or user_agent.startswith(f"{marker}/")
+        or user_agent.startswith(f"{marker} ")
+        for marker in ("grok-shell", "grok-build")
+    )
+    has_complete_session_headers = bool(
+        headers.get("x-grok-conv-id") and headers.get("x-grok-session-id")
+    )
+    return (
+        client_identifier == "grok-shell"
+        or token_auth == "xai-grok-cli"
+        or user_agent.startswith("xai-grok-workspace/")
+        or branded_user_agent
+        or has_complete_session_headers
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class ClientSessionContext:
@@ -17,6 +73,7 @@ class ClientSessionContext:
     source: str | None
     thread_id: str | None = None
     cache_key: str | None = None
+    client_source: str | None = None
 
     def affinity_key(self, token_id: int) -> str | None:
         """Namespace affinity by Rotor token so tenants cannot collide."""
@@ -27,6 +84,7 @@ class ClientSessionContext:
     def routing_features(self) -> dict[str, Any]:
         return {
             "session_source": self.source,
+            "client_source": self.client_source,
             "thread_id": self.thread_id,
             "cache_key_present": self.cache_key is not None,
         }
@@ -64,14 +122,41 @@ def resolve_client_session(
     normalized_headers = {
         str(key).lower(): value for key, value in headers.items()
     }
-    header_candidates = (
+    is_pi = _is_pi_client(normalized_headers, metadata)
+    is_grok = _is_grok_client(normalized_headers)
+    has_grok_session = any(
+        normalized_headers.get(name)
+        for name in ("x-grok-conv-id", "x-grok-session-id")
+    )
+    header_candidates = [
         ("x-conversation-id", "x-conversation-id"),
         ("x-rotor-session-id", "x-rotor-session-id"),
-        ("session-id", "codex-session-id"),
+        ("x-mindcode-session-id", "mindcode-session-id"),
+    ]
+    if is_grok:
+        header_candidates.extend([
+            ("x-grok-conv-id", "grok-conv-id"),
+            ("x-grok-session-id", "grok-session-id"),
+        ])
+    elif has_grok_session:
+        header_candidates.extend([
+            ("x-grok-conv-id", "xai-conv-id"),
+            ("x-grok-session-id", "xai-session-id"),
+        ])
+    if is_pi:
+        header_candidates.extend([
+            ("session_id", "pi-session-id"),
+            ("x-opencode-session", "pi-opencode-session"),
+        ])
+    header_candidates.extend([
+        ("session-id", "pi-session-id" if is_pi else "codex-session-id"),
         ("x-claude-code-session-id", "claude-code-session-id"),
         ("x-session-affinity", "opencode-session-affinity"),
-        ("x-session-id", "client-session-id"),
-    )
+    ])
+    header_candidates.append((
+        "x-session-id",
+        "pi-session-id" if is_pi else "client-session-id",
+    ))
 
     session_id = None
     source = None
@@ -94,7 +179,12 @@ def resolve_client_session(
             cache_session = _normalize_identifier(prompt_cache_key)
             if cache_session is not None:
                 session_id = cache_session
-                source = "prompt-cache-key"
+                if is_grok:
+                    source = "grok-prompt-cache-key"
+                elif is_pi:
+                    source = "pi-prompt-cache-key"
+                else:
+                    source = "prompt-cache-key"
             else:
                 session_id = _normalize_identifier(legacy_user_id)
                 if session_id is not None:
@@ -108,7 +198,36 @@ def resolve_client_session(
             or normalized_headers.get("x-thread-id")
         ),
         cache_key=_normalize_identifier(prompt_cache_key),
+        client_source=_resolve_client_source(normalized_headers, metadata, source),
     )
+
+
+def _resolve_client_source(
+    headers: Mapping[str, str],
+    metadata: Mapping[str, Any] | None,
+    session_source: str | None,
+) -> str | None:
+    # Dedicated client hints also work when an explicit Rotor session wins.
+    if _normalize_identifier(headers.get("x-mindcode-session-id")):
+        return "mindcode"
+    if _is_pi_client(headers, metadata):
+        return "pi"
+    if _is_grok_client(headers):
+        return "grok_build"
+    user_agent = str(headers.get("user-agent") or "").strip().lower()
+    for client, markers in (
+        ("codex", ("codex-tui", "codex desktop", "codex_cli_rs")),
+        ("claude_code", ("claude-cli",)),
+        ("opencode", ("opencode",)),
+        ("mindcode", ("mindcode",)),
+    ):
+        if any(
+            user_agent == marker
+            or user_agent.startswith((f"{marker}/", f"{marker} "))
+            for marker in markers
+        ):
+            return client
+    return SESSION_SOURCE_TO_CLIENT.get(session_source)
 
 
 def _metadata_session(
