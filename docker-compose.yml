@@ -1,35 +1,17 @@
-version: '3.8'
-
 services:
   rotor:
     build: .
     container_name: rotor
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
-      - DATABASE_URL=postgresql+asyncpg://rotor:rotor@db:5432/rotor
+      - DATABASE_URL=sqlite+aiosqlite:////data/rotor.db
       - CONVERSATION_STORE_DIR=/data/conversations
       - ROTOR_LOG_DIR=/data/logs
       - LOG_LEVEL=INFO
+      # Set to true when serving the admin console over HTTPS.
+      - ROTOR_ADMIN_COOKIE_SECURE=false
     volumes:
-      - ./src:/app/src
+      # Persists the SQLite database, conversations, and runtime logs.
       - ./data:/data
-    depends_on:
-      - db
     restart: unless-stopped
-
-  db:
-    image: postgres:15-alpine
-    container_name: rotor-db
-    environment:
-      - POSTGRES_USER=rotor
-      - POSTGRES_PASSWORD=rotor
-      - POSTGRES_DB=rotor
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-    restart: unless-stopped
-
-volumes:
-  postgres_data:
