@@ -282,7 +282,6 @@ pytest -q
 - [路由与故障转移](gitbook/concepts/routing-and-fallback.md)
 - [日志、用量与数据存储](gitbook/operations/observability.md)
 - [数据库与迁移](gitbook/development/database-migrations.md)
-- [项目路线图](docs/roadmap.md)
 
 ## License
 

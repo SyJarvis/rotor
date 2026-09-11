@@ -25,7 +25,7 @@
 - 新增 [超大事件解析器](src/rotor/core/_response_event.py)，在 64 KiB 上限内识别完成、失败与不完整终态，修复较长输出被误判为失败的问题。
 - 新增 [管理监控 API](src/rotor/api/admin/monitoring.py) 与管理网页「监控 → 性能 / 会话来源」页面（[performance.js](src/rotor/frontend/pages/performance.js)、[monitoring.js](src/rotor/frontend/pages/monitoring.js)）。
 - 回归见 [test_gateway_metrics.py](tests/test_gateway_metrics.py)、[test_database_metrics.py](tests/test_database_metrics.py)、[test_performance_monitoring.py](tests/test_performance_monitoring.py)、[test_admin_monitoring.py](tests/test_admin_monitoring.py)。
-- 边界与读法见 [性能优化与监控总结](docs/2026-09-09-性能优化与监控总结.md)；性能计数属于单进程，不能视为全局汇总。
+- 性能计数属于单进程，不能视为全局汇总。
 
 ### 数据库与记账
 

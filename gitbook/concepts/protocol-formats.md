@@ -795,7 +795,6 @@ relay 增加同类记录；当前实现不是全链路完整日志。
 - [Anthropic route](../../src/rotor/api/v1/anthropic.py)
 - [客户端 API 参考](../reference/client-api.md)
 - [Channel 字段参考](../reference/channel-schema.md)
-- [整体设计快照](../../docs/rotor-design.md)
 
 ### 关键测试
 

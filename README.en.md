@@ -304,7 +304,6 @@ More documentation:
 - [Routing and fallback](gitbook/concepts/routing-and-fallback.md)
 - [Logs, usage, and storage](gitbook/operations/observability.md)
 - [Database migrations](gitbook/development/database-migrations.md)
-- [Project roadmap](docs/roadmap.md)
 
 ## License
 
