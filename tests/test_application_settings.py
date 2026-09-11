@@ -18,7 +18,8 @@ def test_settings_store_uses_defaults_when_file_does_not_exist(tmp_path) -> None
     assert settings.routing.strategy == "priority_weighted"
     assert settings.routing.affinity_enabled is True
     assert settings.routing.session_lease_enabled is True
-    assert settings.routing.session_lease_idle_ttl_seconds == 900
+    assert settings.routing.session_lease_idle_ttl_seconds == 1_800
+    assert settings.routing.session_lease_reassess_seconds == 300
     assert settings.display_timezone == "Asia/Shanghai"
 
 
@@ -31,6 +32,8 @@ def test_settings_store_persists_and_reloads_routing_settings(tmp_path) -> None:
             routing=RoutingSettings(
                 strategy="fallback_order",
                 affinity_enabled=False,
+                session_lease_idle_ttl_seconds=900,
+                session_lease_reassess_seconds=0,
             )
         )
     )
@@ -43,6 +46,8 @@ def test_settings_store_persists_and_reloads_routing_settings(tmp_path) -> None:
     reloaded = ApplicationSettingsStore(path).get()
     assert reloaded.routing.strategy == "fallback_order"
     assert reloaded.routing.affinity_enabled is False
+    assert reloaded.routing.session_lease_idle_ttl_seconds == 900
+    assert reloaded.routing.session_lease_reassess_seconds == 0
 
 
 def test_settings_store_persists_display_timezone(tmp_path) -> None:
@@ -76,6 +81,12 @@ def test_settings_accept_adaptive_routing_strategy() -> None:
 def test_settings_reject_session_lease_ttl_outside_safe_range() -> None:
     with pytest.raises(ValidationError):
         RoutingSettings(session_lease_idle_ttl_seconds=30)
+
+
+@pytest.mark.parametrize("interval", [-1, 86_401])
+def test_settings_reject_lease_reassessment_outside_safe_range(interval) -> None:
+    with pytest.raises(ValidationError):
+        RoutingSettings(session_lease_reassess_seconds=interval)
 
 
 def test_settings_reject_invalid_display_timezone() -> None:

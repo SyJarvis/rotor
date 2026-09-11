@@ -87,6 +87,12 @@ class AdaptiveScorer:
         with self._lock:
             self._get(model, channel_id).inflight += 1
 
+    def end(self, model: str, channel_id: int) -> None:
+        """Release an attempt that ended without an observable provider result."""
+        with self._lock:
+            stats = self._get(model, channel_id)
+            stats.inflight = max(0, stats.inflight - 1)
+
     def observe(
         self,
         model: str,

@@ -23,14 +23,16 @@ class RoutingSettings(BaseModel):
     affinity_enabled: bool = True
     session_lease_enabled: bool = True
     session_lease_idle_ttl_seconds: int = Field(
-        default=900,
+        default=1_800,
         ge=60,
         le=86_400,
     )
+    session_lease_reassess_seconds: int = Field(default=300, ge=0, le=86_400)
     adaptive_success_weight: float = Field(default=0.55, ge=0)
     adaptive_latency_weight: float = Field(default=0.25, ge=0)
     adaptive_cost_weight: float = Field(default=0.10, ge=0)
     adaptive_load_weight: float = Field(default=0.10, ge=0)
+    protocol_affinity_enabled: bool = True
     adaptive_ewma_alpha: float = Field(default=0.20, gt=0, le=1)
     adaptive_prior_successes: float = Field(default=9.0, ge=0)
     adaptive_prior_failures: float = Field(default=1.0, ge=0)

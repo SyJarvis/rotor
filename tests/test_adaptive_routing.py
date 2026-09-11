@@ -51,6 +51,7 @@ def test_routing_decision_record_preserves_training_snapshot() -> None:
         "session_lease": {
             "preferred_channel_id": None,
             "used": False,
+            "reassessment_attempted": False,
         },
         "candidate_resource_scopes": {
             "7": {

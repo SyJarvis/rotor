@@ -8,10 +8,17 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from rotor.database import _cancellation_safe, async_session_maker
+from rotor.database import _cancellation_safe
+from rotor.gateway.routing import AttemptAdmission
 from rotor.models.channel import Channel
 from rotor.models.request_attempt import RequestAttempt
 from rotor.schemas.error import UpstreamErrorFact
+
+
+def _session_factory():
+    from rotor.database import async_session_maker
+
+    return async_session_maker
 
 
 @dataclass(slots=True)
@@ -22,6 +29,7 @@ class AttemptContext:
     request_origin: str = "client"
     agent_run_id: str | None = None
     recorded: bool = field(default=False, init=False)
+    admission: AttemptAdmission | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def start(
@@ -44,27 +52,32 @@ class AttemptContext:
 
 
 class AttemptRecorder:
-    """Commit attempt facts independently from usage and request accounting."""
+    """Persist attempt facts, sharing the request transaction when possible."""
 
-    def __init__(self, session_factory: Any = async_session_maker) -> None:
+    def __init__(self, session_factory: Any = None) -> None:
+        # Resolve lazily so tests can monkeypatch rotor.database state.
         self._session_factory = session_factory
 
-    async def record(
+    def build_attempt(
         self,
         *,
-        context: AttemptContext,
+        context,
         request_id: str,
         channel: Channel,
         requested_model: str,
         provider_model: str | None,
         request_protocol: str,
         outcome: str,
-        error: UpstreamErrorFact | None = None,
-    ) -> bool:
-        if context.recorded:
-            return False
+        error=None,
+    ):
+        """Build the attempt ORM object without touching the database.
 
-        attempt = RequestAttempt(
+        Lets request handlers persist the attempt in their own transaction
+        instead of opening a second session + commit on the hot path.
+        """
+        from rotor.models.request_attempt import RequestAttempt
+
+        return RequestAttempt(
             request_id=request_id,
             attempt_index=context.attempt_index,
             channel_id=channel.id,
@@ -89,13 +102,63 @@ class AttemptRecorder:
             agent_run_id=context.agent_run_id,
         )
 
-        async with self._session_factory() as db:
-            db.add(attempt)
+    async def record(
+        self,
+        *,
+        context: AttemptContext,
+        request_id: str,
+        channel: Channel,
+        requested_model: str,
+        provider_model: str | None,
+        request_protocol: str,
+        outcome: str,
+        error: UpstreamErrorFact | None = None,
+        db=None,
+    ) -> bool:
+        if context.recorded:
+            return False
+
+        attempt = self.build_attempt(
+            context=context,
+            request_id=request_id,
+            channel=channel,
+            requested_model=requested_model,
+            provider_model=provider_model,
+            request_protocol=request_protocol,
+            outcome=outcome,
+            error=error,
+        )
+
+        if db is not None:
+            # Request/streaming accounting path: join the caller's
+            # transaction so the attempt shares one commit with usage
+            # accounting. Fake sessions in unit tests may not implement
+            # savepoints; fall back to plain add+flush then.
+            if hasattr(db, "begin_nested"):
+                try:
+                    async with db.begin_nested():
+                        db.add(attempt)
+                        await db.flush()
+                except IntegrityError:
+                    context.recorded = True
+                    return False
+            else:
+                db.add(attempt)
+                try:
+                    await db.flush()
+                except IntegrityError:
+                    context.recorded = True
+                    return False
+            context.recorded = True
+            return True
+
+        async with (self._session_factory or _session_factory())() as session:
+            session.add(attempt)
             try:
-                await _cancellation_safe(db.commit())
+                await _cancellation_safe(session.commit())
             except IntegrityError:
-                await _cancellation_safe(db.rollback())
-                existing = await db.scalar(
+                await _cancellation_safe(session.rollback())
+                existing = await session.scalar(
                     select(RequestAttempt.id).where(
                         RequestAttempt.request_id == request_id,
                         RequestAttempt.attempt_index == context.attempt_index,

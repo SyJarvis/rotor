@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 import hashlib
 import math
 import time
-from typing import Iterable, Optional
+from threading import RLock
+from typing import Callable, Iterable, Optional
 
 from rotor.application_settings import application_settings
 from rotor.models.channel import Channel
@@ -18,14 +21,55 @@ class RoutingDecision:
     scores: dict[int, dict] | None = None
     lease_channel_id: int | None = None
     lease_used: bool = False
+    temporarily_unavailable: bool = False
+    retry_after_seconds: int | None = None
+    lease_reassessment_attempted: bool = False
+
+
+@dataclass(slots=True)
+class AttemptAdmission:
+    engine: RoutingEngine
+    model: str
+    channel: Channel
+    generation: int | None
+    is_probe: bool
+    provider_succeeded: bool = False
+    observed: bool = False
+    released: bool = False
+
+
+@dataclass(slots=True)
+class _Cooldown:
+    deadline: float
+    generation: int = 0
+    probe: AttemptAdmission | None = None
+
+
+_RESPONSES_PROTOCOLS = {"responses", "openai_responses"}
+_ANTHROPIC_PROTOCOLS = {"anthropic", "anthropic_messages"}
+
+
+def protocol_family(protocol: str | None) -> str:
+    """Map a wire protocol to its canonical conversion family."""
+    value = str(protocol or "").lower()
+    if value in _RESPONSES_PROTOCOLS:
+        return "responses"
+    if value in _ANTHROPIC_PROTOCOLS:
+        return "anthropic"
+    return "openai"
 
 
 class RoutingEngine:
     """Select ordered channel candidates for a request."""
 
-    def __init__(self, strategy: str = "priority_weighted"):
+    def __init__(
+        self, strategy: str = "priority_weighted", *, clock: Callable[[], float] | None = None
+    ):
         self.strategy = strategy
-        self._cooldowns: dict[tuple[str, int], float] = {}
+        self.protocol_affinity_enabled = True
+        self._cooldowns: dict[tuple[str, int], _Cooldown] = {}
+        self._clock = clock
+        self._lock = RLock()
         self.adaptive = AdaptiveScorer()
 
     def route(
@@ -37,6 +81,7 @@ class RoutingEngine:
         required_capabilities: Optional[set[str]] = None,
         affinity_key: str | None = None,
         preferred_channel_id: int | None = None,
+        lease_reassessment_due: bool = False,
     ) -> RoutingDecision:
         candidates = list(channels)
         required_capabilities = required_capabilities or set()
@@ -52,10 +97,7 @@ class RoutingEngine:
             for channel in compatible
             if not self._is_cooling_down(model, channel.id)
         ]
-        # A cooldown should steer traffic to another compatible channel, not
-        # make a model unroutable when every channel is cooling. In that case
-        # retry the compatible set and let the upstream return the real error.
-        candidates = active or compatible
+        candidates = active
 
         score_snapshot = None
         if self.strategy == "fallback_order":
@@ -86,8 +128,28 @@ class RoutingEngine:
         else:
             ordered = self._priority_weighted_order(candidates)
 
+        # Protocol affinity is a soft tier, not a replacement for the
+        # strategy: partition the strategy ordering into same-family and
+        # convertible channels while keeping each partition's internal order.
+        # Channels whose protocol family cannot represent the request at all
+        # were already excluded by required_capabilities filtering above.
+        if self.protocol_affinity_enabled and ordered:
+            family = protocol_family(request_protocol)
+            ordered = [
+                *(ch for ch in ordered if protocol_family(ch.protocol) == family),
+                *(ch for ch in ordered if protocol_family(ch.protocol) != family),
+            ]
+
         lease_used = False
-        if preferred_channel_id is not None:
+        lease_reassessment_attempted = bool(
+            lease_reassessment_due
+            and self.protocol_affinity_enabled
+            and any(
+                protocol_family(channel.protocol) == protocol_family(request_protocol)
+                for channel in ordered
+            )
+        )
+        if preferred_channel_id is not None and not lease_reassessment_attempted:
             leased = next(
                 (
                     channel
@@ -109,6 +171,11 @@ class RoutingEngine:
             scores=score_snapshot,
             lease_channel_id=preferred_channel_id,
             lease_used=lease_used,
+            temporarily_unavailable=bool(compatible and not active),
+            retry_after_seconds=(
+                self.retry_after_seconds(model, compatible) if compatible and not active else None
+            ),
+            lease_reassessment_attempted=lease_reassessment_attempted,
         )
 
     def configure_adaptive(self, settings) -> None:
@@ -125,9 +192,82 @@ class RoutingEngine:
             latency_target_ms=settings.adaptive_latency_target_ms,
             cost_target=settings.adaptive_cost_target,
         )
+        protocol_affinity = getattr(settings, "protocol_affinity_enabled", None)
+        if protocol_affinity is not None:
+            self.protocol_affinity_enabled = bool(protocol_affinity)
 
     def begin_attempt(self, model: str, channel: Channel) -> None:
         self.adaptive.begin(model, channel.id)
+
+    def _now(self) -> float:
+        return self._clock() if self._clock is not None else time.monotonic()
+
+    def admit_attempt(self, model: str, channel: Channel) -> AttemptAdmission | None:
+        """Atomically admit normal traffic or one process-local recovery probe."""
+        with self._lock:
+            if not channel.enabled:
+                return None
+            state = self._cooldowns.get((model, channel.id))
+            if state is not None and (state.probe is not None or state.deadline > self._now()):
+                return None
+            admission = AttemptAdmission(
+                engine=self,
+                model=model,
+                channel=channel,
+                generation=state.generation if state is not None else None,
+                is_probe=state is not None,
+            )
+            if state is not None:
+                state.probe = admission
+            self.adaptive.begin(model, channel.id)
+            return admission
+
+    def release_attempt(self, admission: AttemptAdmission) -> None:
+        """Release ownership even if cancellation or persistence skipped observation."""
+        with self._lock:
+            if admission.released:
+                return
+            admission.released = True
+            if not admission.observed:
+                self.adaptive.end(admission.model, admission.channel.id)
+            key = (admission.model, admission.channel.id)
+            state = self._cooldowns.get(key)
+            if state is None or state.probe is not admission:
+                return
+            state.probe = None
+            if state.generation != admission.generation:
+                return
+            if admission.provider_succeeded:
+                self._cooldowns.pop(key)
+            else:
+                # A cancelled or locally aborted probe has not proved recovery.
+                self.mark_unavailable(admission.model, admission.channel)
+
+    def retry_after_seconds(self, model: str, channels: Iterable[Channel]) -> int:
+        """Return an advisory delay; a running probe has no expiry or timeout lease."""
+        with self._lock:
+            now = self._now()
+            delays = []
+            for channel in channels:
+                state = self._cooldowns.get((model, channel.id))
+                if state is not None:
+                    delays.append(max(1.0 if state.probe is not None else 0.0, state.deadline - now))
+            return max(1, math.ceil(min(delays))) if delays else 1
+
+    def available_native_channel_ids(
+        self,
+        channels: Iterable[Channel],
+        model: str,
+        request_protocol: str,
+        required_capabilities: set[str],
+    ) -> set[int]:
+        return {
+            channel.id for channel in channels
+            if channel.enabled
+            and protocol_family(channel.protocol) == protocol_family(request_protocol)
+            and self._supports_capabilities(channel, required_capabilities)
+            and not self._is_cooling_down(model, channel.id)
+        }
 
     def observe_result(
         self,
@@ -137,14 +277,20 @@ class RoutingEngine:
         success: bool,
         latency_ms: int | None,
         cost: float | None = None,
+        admission: AttemptAdmission | None = None,
     ) -> None:
-        self.adaptive.observe(
-            model,
-            channel.id,
-            success=success,
-            latency_ms=latency_ms,
-            cost=cost,
-        )
+        with self._lock:
+            if admission is not None:
+                if admission.observed or admission.released:
+                    return
+                admission.observed = True
+            self.adaptive.observe(
+                model,
+                channel.id,
+                success=success,
+                latency_ms=latency_ms,
+                cost=cost,
+            )
 
     def mark_unavailable(
         self,
@@ -159,9 +305,16 @@ class RoutingEngine:
                 cooldown_seconds = float(configured)
             except (TypeError, ValueError):
                 cooldown_seconds = 30
-        self._cooldowns[(model, channel.id)] = (
-            time.monotonic() + max(cooldown_seconds, 0)
-        )
+        if not math.isfinite(cooldown_seconds) or cooldown_seconds < 0:
+            cooldown_seconds = 30
+        with self._lock:
+            key = (model, channel.id)
+            state = self._cooldowns.get(key)
+            if state is None:
+                self._cooldowns[key] = _Cooldown(self._now() + cooldown_seconds)
+            else:
+                state.deadline = max(state.deadline, self._now() + cooldown_seconds)
+                state.generation += 1
 
     def diagnose(
         self,
@@ -171,11 +324,13 @@ class RoutingEngine:
     ) -> list[dict]:
         """Return secret-free reasons why channels are or are not routable."""
         required = required_capabilities or set()
-        now = time.monotonic()
+        now = self._now()
         diagnostics: list[dict] = []
         for channel in channels:
-            deadline = self._cooldowns.get((model, channel.id))
-            cooldown_seconds = max(0.0, (deadline or 0.0) - now)
+            with self._lock:
+                state = self._cooldowns.get((model, channel.id))
+                cooldown_seconds = max(0.0, state.deadline - now) if state else 0.0
+                probe_busy = state is not None and state.probe is not None
             capabilities_match = self._supports_capabilities(channel, required)
             reasons: list[str] = []
             if not channel.enabled:
@@ -184,6 +339,8 @@ class RoutingEngine:
                 reasons.append("capability_mismatch")
             if cooldown_seconds > 0:
                 reasons.append("cooldown")
+            if probe_busy:
+                reasons.append("recovery_probe_inflight")
             adaptive_score = self.adaptive.score(model, channel)
             diagnostics.append({
                 "id": channel.id,
@@ -192,7 +349,8 @@ class RoutingEngine:
                 "configured_capabilities": (channel.extra or {}).get("capabilities"),
                 "capabilities_match": capabilities_match,
                 "cooldown_seconds": round(cooldown_seconds, 3),
-                "routable": channel.enabled and capabilities_match,
+                "routable": channel.enabled and capabilities_match and cooldown_seconds == 0 and not probe_busy,
+                "recovery_probe_eligible": channel.enabled and capabilities_match and state is not None and cooldown_seconds == 0 and not probe_busy,
                 "reasons": reasons,
                 "adaptive": {
                     "score": round(adaptive_score.score, 6),
@@ -210,14 +368,9 @@ class RoutingEngine:
         return diagnostics
 
     def _is_cooling_down(self, model: str, channel_id: int) -> bool:
-        key = (model, channel_id)
-        deadline = self._cooldowns.get(key)
-        if deadline is None:
-            return False
-        if deadline <= time.monotonic():
-            self._cooldowns.pop(key, None)
-            return False
-        return True
+        with self._lock:
+            state = self._cooldowns.get((model, channel_id))
+            return state is not None and (state.probe is not None or state.deadline > self._now())
 
     def _affinity_order(
         self,
@@ -248,6 +401,33 @@ class RoutingEngine:
             return True
         remaining = set(required)
         protocol = str(channel.protocol or "").lower()
+        provider_type = str(getattr(channel, "type", "") or "").lower()
+        chat_protocol = (
+            protocol not in _RESPONSES_PROTOCOLS | _ANTHROPIC_PROTOCOLS
+            and provider_type != "anthropic"
+        )
+        if "stop_sequences" in remaining:
+            if protocol in _RESPONSES_PROTOCOLS:
+                return False
+            remaining.remove("stop_sequences")
+        if "openai_chat_native" in remaining:
+            if not chat_protocol:
+                return False
+            remaining.remove("openai_chat_native")
+        if "anthropic_native" in remaining:
+            # Zhipu's Chat adapter forwards Anthropic payloads through its
+            # native Messages endpoint when an Anthropic request is present.
+            native_anthropic = protocol in _ANTHROPIC_PROTOCOLS or (
+                protocol not in _RESPONSES_PROTOCOLS
+                and provider_type in {"anthropic", "zhipu"}
+            )
+            if not native_anthropic:
+                return False
+            remaining.remove("anthropic_native")
+        if "reasoning_effort" in remaining:
+            if not chat_protocol and protocol not in _RESPONSES_PROTOCOLS:
+                return False
+            remaining.remove("reasoning_effort")
         if "responses_native" in remaining:
             if protocol not in {"responses", "openai_responses"}:
                 return False
@@ -296,7 +476,16 @@ class RoutingEngine:
 def session_lease_success_reason(
     decision: RoutingDecision | None,
     attempt_index: int,
+    *,
+    channel: Channel | None = None,
+    request_protocol: str | None = None,
 ) -> str:
+    if decision is not None and getattr(decision, "lease_reassessment_attempted", False) and channel is not None:
+        if protocol_family(channel.protocol) == protocol_family(request_protocol):
+            return "protocol_recovered"
+        if channel.id == decision.lease_channel_id:
+            return "protocol_reassessment_deferred"
+        return "fallback_success"
     if attempt_index > 0:
         return "fallback_success"
     if (
