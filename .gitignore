@@ -92,9 +92,6 @@ venv.bak/
 # Rope project settings
 .ropeproject
 
-# mkdocs documentation
-/site
-
 # Private notes (scratch / debug logs, not for publishing)
 /private/
 
