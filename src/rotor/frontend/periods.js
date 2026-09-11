@@ -1,49 +1,107 @@
-export const CALENDAR_PERIODS = [
-  { key: "day", label: "当天", bucket: "hour" },
-  { key: "week", label: "本周", bucket: "day" },
-  { key: "month", label: "本月", bucket: "day" },
+export const TIME_RANGES = [
+  { key: "today", label: "今天", bucket: "hour" },
+  { key: "24h", label: "24小时", bucket: "hour", hours: 24 },
+  { key: "7d", label: "7天", bucket: "day", hours: 24 * 7 },
+  { key: "30d", label: "30天", bucket: "day", hours: 24 * 30 },
 ];
 
-export function localDate() {
-  const now = new Date();
-  return isoDate(now.getFullYear(), now.getMonth() + 1, now.getDate());
+export function createTimeRange(key, displayTimezone, now = new Date()) {
+  const definition = TIME_RANGES.find((item) => item.key === key) || TIME_RANGES[2];
+  if (definition.key === "today") {
+    const periodDate = dateInTimezone(now, displayTimezone);
+    return {
+      ...definition,
+      periodDate,
+      startDate: periodDate,
+      endDate: periodDate,
+      query: new URLSearchParams({
+        period: "day",
+        period_date: periodDate,
+      }).toString(),
+    };
+  }
+
+  const end = new Date(now.getTime());
+  const start = new Date(end.getTime() - definition.hours * 3600_000);
+  return {
+    ...definition,
+    start,
+    end,
+    startDate: dateInTimezone(start, displayTimezone),
+    endDate: dateInTimezone(end, displayTimezone),
+    query: new URLSearchParams({
+      start_time: start.toISOString(),
+      end_time: end.toISOString(),
+    }).toString(),
+  };
 }
 
-export function todayInTimezone(displayTimezone) {
+export function createCustomTimeRange(startDate, endDate) {
+  return {
+    key: "custom",
+    bucket: startDate === endDate ? "hour" : "day",
+    apiBucket: "hour",
+    startDate,
+    endDate,
+    query: new URLSearchParams({
+      start_date: startDate,
+      end_date: endDate,
+    }).toString(),
+  };
+}
+
+export function dateInTimezone(value, displayTimezone) {
   const parts = Object.fromEntries(
     new Intl.DateTimeFormat("en-CA", {
       timeZone: displayTimezone,
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
-    }).formatToParts(new Date())
+    }).formatToParts(value)
       .filter((part) => part.type !== "literal")
       .map((part) => [part.type, part.value]),
   );
   return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
-export function periodQuery(period, periodDate) {
-  return new URLSearchParams({
-    period,
-    period_date: periodDate,
-  }).toString();
-}
-
-export function periodDates(period, periodDate) {
-  const [year, month, day] = periodDate.split("-").map(Number);
-  const anchor = new Date(Date.UTC(year, month - 1, day));
-  if (period === "day") return [periodDate];
-  if (period === "week") {
-    const mondayOffset = (anchor.getUTCDay() + 6) % 7;
-    const start = addDays(anchor, -mondayOffset);
-    return Array.from({ length: 7 }, (_, index) => isoDateFromDate(addDays(start, index)));
+export function expectedRangeBuckets(range, displayTimezone) {
+  if (range.key === "today" || (range.key === "custom" && range.bucket === "hour")) {
+    return Array.from(
+      { length: 24 },
+      (_, hour) => `${range.startDate}T${String(hour).padStart(2, "0")}:00:00`,
+    );
   }
-  const days = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  return Array.from({ length: days }, (_, index) => isoDate(year, month, index + 1));
+  if (range.key === "custom") {
+    const start = new Date(`${range.startDate}T00:00:00Z`);
+    const end = new Date(`${range.endDate}T00:00:00Z`);
+    const buckets = [];
+    for (const cursor = start; cursor <= end; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+      buckets.push(cursor.toISOString().slice(0, 10));
+    }
+    return buckets;
+  }
+
+  const step = range.bucket === "hour" ? 3600_000 : 86400_000;
+  const cursor = new Date(range.start.getTime());
+  if (range.bucket === "hour") {
+    cursor.setUTCMinutes(0, 0, 0);
+  } else {
+    cursor.setUTCHours(0, 0, 0, 0);
+  }
+  const buckets = [];
+  const seen = new Set();
+  while (cursor < range.end) {
+    const key = bucketKey(cursor.toISOString(), range.bucket, displayTimezone);
+    if (!seen.has(key)) {
+      seen.add(key);
+      buckets.push(key);
+    }
+    cursor.setTime(cursor.getTime() + step);
+  }
+  return buckets;
 }
 
-export function bucketKey(bucket, period, displayTimezone) {
+export function bucketKey(bucket, resolution, displayTimezone) {
   const value = String(bucket || "");
   const date = new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(value) ? value : `${value}Z`);
   if (Number.isNaN(date.getTime())) return value;
@@ -60,17 +118,11 @@ export function bucketKey(bucket, period, displayTimezone) {
       .map((part) => [part.type, part.value]),
   );
   const day = `${parts.year}-${parts.month}-${parts.day}`;
-  return period === "day" ? `${day}T${parts.hour}:00:00` : day;
+  return resolution === "hour" ? `${day}T${parts.hour}:00:00` : day;
 }
 
-function addDays(value, days) {
-  return new Date(value.getTime() + days * 86400_000);
-}
-
-function isoDateFromDate(value) {
-  return isoDate(value.getUTCFullYear(), value.getUTCMonth() + 1, value.getUTCDate());
-}
-
-function isoDate(year, month, day) {
-  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+export function bucketLabel(bucket, range) {
+  if (range.bucket !== "hour") return bucket.slice(5);
+  if (range.key === "today" || range.key === "custom") return bucket.slice(11, 16);
+  return `${bucket.slice(5, 10)} ${bucket.slice(11, 16)}`;
 }

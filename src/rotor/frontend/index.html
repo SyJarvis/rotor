@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
-    <link rel="stylesheet" href="/styles.css?v=18">
+    <link rel="stylesheet" href="/styles.css?v=24">
     <script>
       // FOUC guard — must run before body paints.
       (function () {
@@ -56,6 +56,9 @@
           </button>
           <button class="nav-item" data-tab="logs">
             <i data-lucide="scroll-text"></i><span data-i18n="logs">请求日志</span>
+          </button>
+          <button class="nav-item" data-tab="monitoring">
+            <i data-lucide="radio-tower"></i><span data-i18n="monitoringTitle">监控</span>
           </button>
           <button class="nav-item" data-tab="mindagent">
             <i data-lucide="bot"></i><span data-i18n="mindagentChat">MindAgent 对话</span>
@@ -116,6 +119,7 @@
           <section id="tokens" class="panel"></section>
           <section id="usage" class="panel"></section>
           <section id="logs" class="panel"></section>
+          <section id="monitoring" class="panel"></section>
           <section id="mindagent" class="panel"></section>
         </main>
       </div>
@@ -273,7 +277,7 @@
                 <label>
                   <span data-i18n="sessionLeaseIdleTtl">Session Lease 空闲 TTL（秒）</span>
                   <small data-i18n="sessionLeaseIdleTtlDescription">租约在最后一次成功请求后保持的时间；可在 Channel extra 中按渠道或模型覆盖。</small>
-                  <input name="session_lease_idle_ttl_seconds" type="number" min="60" max="86400" step="1" value="900" required>
+                  <input name="session_lease_idle_ttl_seconds" type="number" min="60" max="86400" step="1" value="1800" required>
                 </label>
                 <label>
                   <span data-i18n="displayTimezone">日期与时间</span>
@@ -322,7 +326,7 @@
       </div>
     </div>
 
-    <script src="/config.js?v=22"></script>
-    <script type="module" src="/auth.js?v=4"></script>
+    <script src="/config.js?v=30"></script>
+    <script type="module" src="/auth.js?v=11"></script>
   </body>
 </html>

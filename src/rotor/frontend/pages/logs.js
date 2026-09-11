@@ -8,16 +8,19 @@ import {
 } from "../ui.js?v=12";
 import { renderStackedBar, isAvailable } from "../charts.js?v=8";
 import {
-  CALENDAR_PERIODS, bucketKey, localDate, periodDates, periodQuery, todayInTimezone,
-} from "../periods.js";
+  TIME_RANGES, bucketKey, bucketLabel, createCustomTimeRange, createTimeRange,
+  dateInTimezone, expectedRangeBuckets,
+} from "../periods.js?v=2";
 
 const PAGE_SIZE = 50;
 let state = {
   logs: [],
   total: 0,
   page: 0,
-  range: "week",
-  selectedDate: localDate(),
+  range: "today",
+  timeRange: null,
+  startDate: "",
+  endDate: "",
   displayTimezone: "",
   timeline: [],
   filter: { model: "", channel: "", status: "", q: "" },
@@ -36,18 +39,12 @@ export async function load() {
   const container = document.getElementById("logs");
   skeletonRows(container, 5, 8);
   try {
-    if (state.models.length === 0) {
-      const [models, channels] = await Promise.all([
-        api("/api/admin/logs/models?days=30&limit=30").catch(() => []),
-        api("/api/admin/channels").catch(() => []),
-      ]);
-      state.models = models.map((m) => m.model);
-      state.channels = channels;
+    if (state.channels.length === 0) {
+      state.channels = await api("/api/admin/channels").catch(() => []);
     }
     if (!state.displayTimezone) {
       const settings = await api("/api/admin/settings").catch(() => null);
       state.displayTimezone = settings?.display_timezone || "Asia/Shanghai";
-      state.selectedDate = todayInTimezone(state.displayTimezone);
     }
     await fetchPage();
     render();
@@ -58,28 +55,38 @@ export async function load() {
 }
 
 async function fetchPage() {
+  const range = selectedTimeRange();
+  state.startDate = range.startDate;
+  state.endDate = range.endDate;
   const skip = state.page * PAGE_SIZE;
-  const filters = buildFilterQuery();
-  const [logs, count, timeline] = await Promise.all([
-    api(`/api/admin/logs?limit=${PAGE_SIZE}&skip=${skip}${filters}`),
-    api(`/api/admin/logs/count?${filters.slice(1)}`),
-    api(`/api/admin/logs/timeseries?bucket=hour${filters}`).catch(() => []),
+  const filters = buildFilterQuery(range.query);
+  const [logs, count, timeline, models] = await Promise.all([
+    api(`/api/admin/logs?limit=${PAGE_SIZE}&skip=${skip}&${filters}`),
+    api(`/api/admin/logs/count?${filters}`),
+    api(`/api/admin/logs/timeseries?bucket=${range.apiBucket || range.bucket}&${filters}`).catch(() => []),
+    api(`/api/admin/logs/models?limit=30&${range.query}`).catch(() => []),
   ]);
+  state.timeRange = range;
   state.logs = logs;
   state.total = count.count;
   state.timeline = timeline;
+  state.models = models.map((item) => item.model);
   state.seen = new Set(state.logs.map((l) => l.id));
 }
 
-function buildFilterQuery() {
-  const params = new URLSearchParams();
+function buildFilterQuery(rangeQuery) {
+  const params = new URLSearchParams(rangeQuery);
   if (state.filter.model) params.set("model", state.filter.model);
   if (state.filter.channel) params.set("channel_id", state.filter.channel);
   if (state.filter.status === "success") params.set("success", "true");
   if (state.filter.status === "failed") params.set("success", "false");
-  params.set("period", state.range);
-  params.set("period_date", state.selectedDate);
-  return params.toString() ? `&${params.toString()}` : "";
+  return params.toString();
+}
+
+function selectedTimeRange() {
+  return state.range === "custom"
+    ? createCustomTimeRange(state.startDate, state.endDate)
+    : createTimeRange(state.range, state.displayTimezone);
 }
 
 export function render() {
@@ -89,7 +96,9 @@ export function render() {
   const totalItems = state.filter.q ? filtered.length : state.total;
   const totalPages = state.filter.q ? 1 : Math.max(1, Math.ceil(totalItems / PAGE_SIZE));
   const chartAvailable = isAvailable();
-  const range = CALENDAR_PERIODS.find((item) => item.key === state.range) || CALENDAR_PERIODS[1];
+  const range = state.timeRange || selectedTimeRange();
+  const rangeLabel = range.key === "custom" ? t("customDateRange") : range.label;
+  const today = dateInTimezone(new Date(), state.displayTimezone);
 
   container.innerHTML = `
     <div class="section-head">
@@ -108,11 +117,15 @@ export function render() {
 
     <div class="usage-period-controls logs-period-controls">
       <div class="range-switch" id="logRangeSwitch">
-        ${CALENDAR_PERIODS.map((item) => `<button data-log-range="${item.key}" class="${item.key === state.range ? "active" : ""}">${item.label}</button>`).join("")}
+        ${TIME_RANGES.map((item) => `<button data-log-range="${item.key}" class="${item.key === state.range ? "active" : ""}">${item.label}</button>`).join("")}
       </div>
       <label class="usage-date-picker">
-        <span>${t("usageDate")}</span>
-        <input class="input" id="logDate" type="date" value="${state.selectedDate}" max="${localDate()}">
+        <span>${t("startDate")}</span>
+        <input class="input" id="logStartDate" type="date" value="${state.startDate}" max="${state.endDate || today}">
+      </label>
+      <label class="usage-date-picker">
+        <span>${t("endDate")}</span>
+        <input class="input" id="logEndDate" type="date" value="${state.endDate}" min="${state.startDate}" max="${today}">
       </label>
     </div>
 
@@ -134,7 +147,7 @@ export function render() {
     <div class="chart-card log-chart-card">
       <div class="card-head">
         <div class="card-title">${t("requestTrend")}</div>
-        <div class="card-sub">${state.selectedDate} · ${state.displayTimezone}</div>
+        <div class="card-sub">${rangeLabel} · ${state.displayTimezone}</div>
       </div>
       <div class="chart-canvas-wrap" style="height:260px">
         ${chartAvailable ? `<canvas id="logRequestsChart"></canvas>` : renderChartFallback()}
@@ -264,15 +277,18 @@ function bindControls() {
   document.getElementById("logRangeSwitch")?.addEventListener("click", (e) => {
     const button = e.target.closest("button[data-log-range]");
     if (!button) return;
-    state.range = button.dataset.logRange;
+    const range = createTimeRange(button.dataset.logRange, state.displayTimezone);
+    state.range = range.key;
+    state.startDate = range.startDate;
+    state.endDate = range.endDate;
     state.page = 0;
     load();
   });
-  document.getElementById("logDate")?.addEventListener("change", (e) => {
-    if (!e.target.value) return;
-    state.selectedDate = e.target.value;
-    state.page = 0;
-    load();
+  document.getElementById("logStartDate")?.addEventListener("change", (e) => {
+    setCustomDate("startDate", e.target.value);
+  });
+  document.getElementById("logEndDate")?.addEventListener("change", (e) => {
+    setCustomDate("endDate", e.target.value);
   });
   document.getElementById("refreshLogsData")?.addEventListener("click", () => load());
   document.getElementById("logAutoRefresh")?.addEventListener("change", (e) => toggleAutoRefresh(e.target.checked));
@@ -280,21 +296,39 @@ function bindControls() {
   document.getElementById("logNext")?.addEventListener("click", () => { state.page++; load(); });
 }
 
+function setCustomDate(key, value) {
+  const startDate = key === "startDate" ? value : state.startDate;
+  const endDate = key === "endDate" ? value : state.endDate;
+  if (!startDate || !endDate || startDate > endDate) {
+    toast(t("invalidDateRange"), "error");
+    render();
+    return;
+  }
+  if (endDate > dateInTimezone(new Date(), state.displayTimezone)) {
+    toast(t("futureEndDate"), "error");
+    render();
+    return;
+  }
+  state.startDate = startDate;
+  state.endDate = endDate;
+  state.range = "custom";
+  state.page = 0;
+  load();
+}
+
 function drawChart(range) {
   const canvas = document.getElementById("logRequestsChart");
   if (!canvas) return;
-  const buckets = range.key === "day"
-    ? Array.from({ length: 24 }, (_, hour) => `${state.selectedDate}T${String(hour).padStart(2, "0")}:00:00`)
-    : periodDates(range.key, state.selectedDate);
+  const buckets = expectedRangeBuckets(range, state.displayTimezone);
   const values = new Map();
   state.timeline.forEach((row) => {
-    const key = bucketKey(row.bucket, range.key, state.displayTimezone);
+    const key = bucketKey(row.bucket, range.bucket, state.displayTimezone);
     const previous = values.get(key) || { success: 0, failed: 0 };
     previous.success += Number(row.success || 0);
     previous.failed += Number(row.failed || 0);
     values.set(key, previous);
   });
-  const labels = buckets.map((bucket) => range.key === "day" ? bucket.slice(11, 16) : bucket.slice(5));
+  const labels = buckets.map((bucket) => bucketLabel(bucket, range));
   renderStackedBar("logRequests", canvas, labels, [
     { label: t("reachable"), data: buckets.map((bucket) => values.get(bucket)?.success || 0) },
     { label: t("failed"), data: buckets.map((bucket) => values.get(bucket)?.failed || 0) },
@@ -331,7 +365,8 @@ function toggleAutoRefresh(on) {
 
 async function pollNew() {
   try {
-    const fresh = await api(`/api/admin/logs?limit=${PAGE_SIZE}${buildFilterQuery()}`);
+    const range = selectedTimeRange();
+    const fresh = await api(`/api/admin/logs?limit=${PAGE_SIZE}&${buildFilterQuery(range.query)}`);
     const newOnes = fresh.filter((l) => !state.seen.has(l.id));
     state.seen = new Set(fresh.map((l) => l.id));
     if (state.page === 0) {

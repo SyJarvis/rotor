@@ -4,15 +4,19 @@ import { api } from "../api.js?v=2";
 import { t } from "../i18n.js";
 import {
   escapeHtml, formatNumber, formatRequestCount, formatLatency, skeletonKpis, refreshIcons, badge,
+  toast,
 } from "../ui.js?v=11";
 import { renderStackedBar, renderDonut, renderHBar, isAvailable } from "../charts.js?v=8";
 import {
-  CALENDAR_PERIODS, bucketKey, localDate, periodDates, periodQuery, todayInTimezone,
-} from "../periods.js";
+  TIME_RANGES, bucketKey, bucketLabel, createCustomTimeRange, createTimeRange,
+  dateInTimezone, expectedRangeBuckets,
+} from "../periods.js?v=2";
 
 let state = {
-  range: "week",
-  selectedDate: localDate(),
+  range: "today",
+  timeRange: null,
+  startDate: "",
+  endDate: "",
   displayTimezone: "",
   modelFilter: "",
   channelFilter: "",
@@ -33,7 +37,6 @@ export async function load() {
     if (!state.displayTimezone) {
       const settings = await api("/api/admin/settings").catch(() => null);
       state.displayTimezone = settings?.display_timezone || "Asia/Shanghai";
-      state.selectedDate = todayInTimezone(state.displayTimezone);
     }
     await fetchAll();
     render();
@@ -43,29 +46,35 @@ export async function load() {
   }
 }
 
-function filterQuery() {
-  const params = new URLSearchParams();
+async function fetchAll() {
+  const range = state.range === "custom"
+    ? createCustomTimeRange(state.startDate, state.endDate)
+    : createTimeRange(state.range, state.displayTimezone);
+  state.startDate = range.startDate;
+  state.endDate = range.endDate;
+  const params = new URLSearchParams(range.query);
   if (state.channelFilter) params.set("channel_id", state.channelFilter);
   if (state.modelFilter) params.set("model", state.modelFilter);
-  return params.toString() ? `&${params.toString()}` : "";
-}
-
-async function fetchAll() {
-  const range = CALENDAR_PERIODS.find((r) => r.key === state.range) || CALENDAR_PERIODS[1];
-  const period = periodQuery(range.key, state.selectedDate);
-  const q = filterQuery();
+  const query = params.toString();
   const [stats, timeline, modelsAgg] = await Promise.all([
-    api(`/api/admin/logs/stats?${period}${q}`).catch(() => null),
-    api(`/api/admin/logs/timeseries_by_model?${period}&bucket=hour${q}`).catch(() => null),
-    api(`/api/admin/logs/models?${period}&limit=8${q}`).catch(() => []),
+    api(`/api/admin/logs/stats?${query}`).catch(() => null),
+    api(`/api/admin/logs/timeseries_by_model?${query}&bucket=${range.apiBucket || range.bucket}`).catch(() => null),
+    api(`/api/admin/logs/models?${query}&limit=8`).catch(() => []),
   ]);
+  state.timeRange = range;
   state.stats = stats;
   state.timelineLoaded = Array.isArray(timeline);
   state.timeline = timeline || [];
   state.modelsAgg = modelsAgg;
 }
 
-export async function setRange(range) { state.range = range; await load(); }
+export async function setRange(rangeKey) {
+  const range = createTimeRange(rangeKey, state.displayTimezone);
+  state.range = range.key;
+  state.startDate = range.startDate;
+  state.endDate = range.endDate;
+  await load();
+}
 export async function setFilter(key, value) { state[key] = value; await load(); }
 export function setDisplayTimezone(value) { state.displayTimezone = value || "Asia/Shanghai"; }
 
@@ -74,7 +83,7 @@ export function render() {
   // The chart rows are already constrained to the selected range and filters.
   // Derive the headline token total from those same rows so the KPI can never
   // accidentally show an all-time aggregate while the request KPI/chart show
-  // only 7 or 30 days.
+  // only the selected window.
   const rangedTokenTotal = state.timeline.reduce(
     (total, row) => total + Number(row.tokens || 0),
     0,
@@ -85,7 +94,9 @@ export function render() {
       ? rangedTokenTotal
       : (state.stats?.total_tokens || 0),
   };
-  const range = CALENDAR_PERIODS.find((r) => r.key === state.range) || CALENDAR_PERIODS[1];
+  const range = state.timeRange || createTimeRange(state.range, state.displayTimezone);
+  const rangeLabel = range.key === "custom" ? t("customDateRange") : range.label;
+  const today = dateInTimezone(new Date(), state.displayTimezone);
   const successRate = s.total_requests ? ((s.success_requests / s.total_requests) * 100) : 0;
   const chartAvailable = isAvailable();
   const filtering = state.modelFilter || state.channelFilter;
@@ -99,11 +110,15 @@ export function render() {
       <div><h2>${t("usage")}</h2><p>${t("usageHint")}</p></div>
       <div class="usage-period-controls">
         <div class="range-switch" id="rangeSwitch">
-        ${CALENDAR_PERIODS.map((r) => `<button data-range="${r.key}" class="${r.key === state.range ? "active" : ""}">${r.label}</button>`).join("")}
+        ${TIME_RANGES.map((r) => `<button data-range="${r.key}" class="${r.key === state.range ? "active" : ""}">${r.label}</button>`).join("")}
         </div>
         <label class="usage-date-picker">
-          <span>${t("usageDate")}</span>
-          <input class="input" id="usageDate" type="date" value="${state.selectedDate}" max="${localDate()}">
+          <span>${t("startDate")}</span>
+          <input class="input" id="usageStartDate" type="date" value="${state.startDate}" max="${state.endDate || today}">
+        </label>
+        <label class="usage-date-picker">
+          <span>${t("endDate")}</span>
+          <input class="input" id="usageEndDate" type="date" value="${state.endDate}" min="${state.startDate}" max="${today}">
         </label>
       </div>
     </div>
@@ -161,7 +176,7 @@ export function render() {
     <div class="chart-card">
       <div class="card-head">
         <div class="card-title">${t("tokenByModel") || "按模型的 Token 消耗"}</div>
-        <div class="card-sub">${chartAvailable ? `${state.selectedDate} · ${distinctModels(state.timeline).length} ${t("models")}` : t("chartUnavailable")}</div>
+        <div class="card-sub">${chartAvailable ? `${rangeLabel} · ${distinctModels(state.timeline).length} ${t("models")}` : t("chartUnavailable")}</div>
       </div>
       <div class="chart-canvas-wrap" style="height:320px">
         ${chartAvailable ? `<canvas id="stackedChart"></canvas>` : renderStackedFallback()}
@@ -244,10 +259,11 @@ function bindControls() {
   });
   document.getElementById("usageModelFilter")?.addEventListener("change", (e) => setFilter("modelFilter", e.target.value));
   document.getElementById("usageChannelFilter")?.addEventListener("change", (e) => setFilter("channelFilter", e.target.value));
-  document.getElementById("usageDate")?.addEventListener("change", (e) => {
-    if (!e.target.value) return;
-    state.selectedDate = e.target.value;
-    setRange("day");
+  document.getElementById("usageStartDate")?.addEventListener("change", (e) => {
+    setCustomDate("startDate", e.target.value);
+  });
+  document.getElementById("usageEndDate")?.addEventListener("change", (e) => {
+    setCustomDate("endDate", e.target.value);
   });
   document.getElementById("clearUsageFilter")?.addEventListener("click", () => {
     state.modelFilter = "";
@@ -256,10 +272,29 @@ function bindControls() {
   });
 }
 
+function setCustomDate(key, value) {
+  const startDate = key === "startDate" ? value : state.startDate;
+  const endDate = key === "endDate" ? value : state.endDate;
+  if (!startDate || !endDate || startDate > endDate) {
+    toast(t("invalidDateRange"), "error");
+    render();
+    return;
+  }
+  if (endDate > dateInTimezone(new Date(), state.displayTimezone)) {
+    toast(t("futureEndDate"), "error");
+    render();
+    return;
+  }
+  state.startDate = startDate;
+  state.endDate = endDate;
+  state.range = "custom";
+  load();
+}
+
 function drawCharts(range) {
   // Grouped histogram: every model starts from the same baseline, with one
   // colored bar per model inside each time bucket.
-  const { labels, datasets } = pivotByModel(state.timeline, range.key);
+  const { labels, datasets } = pivotByModel(state.timeline, range);
   const stackedCanvas = document.getElementById("stackedChart");
   if (stackedCanvas) {
     if (datasets.length) {
@@ -300,16 +335,15 @@ function distinctModels(rows) {
   return [...new Set(rows.map((r) => r.model))];
 }
 
-function pivotByModel(rows, period) {
-  const range = CALENDAR_PERIODS.find((r) => r.key === state.range) || CALENDAR_PERIODS[1];
-  const buckets = expectedBuckets(range);
+function pivotByModel(rows, range) {
+  const buckets = expectedRangeBuckets(range, state.displayTimezone);
   const models = distinctModels(rows).sort();
   const lookup = new Map();
   rows.forEach((row) => {
-    const key = `${bucketKey(row.bucket, period, state.displayTimezone)}|${row.model}`;
+    const key = `${bucketKey(row.bucket, range.bucket, state.displayTimezone)}|${row.model}`;
     lookup.set(key, (lookup.get(key) || 0) + Number(row.tokens || 0));
   });
-  const labels = buckets.map((bucket) => period === "day" ? bucket.slice(11, 16) : bucket.slice(5));
+  const labels = buckets.map((bucket) => bucketLabel(bucket, range));
   const datasets = models
     .map((m) => {
       const data = buckets.map((b) => lookup.get(`${b}|${m}`) || 0);
@@ -321,17 +355,6 @@ function pivotByModel(rows, period) {
     })
     .sort((a, b) => b.total - a.total || a.label.localeCompare(b.label));
   return { labels, datasets };
-}
-
-function expectedBuckets(range) {
-  if (range.key === "day") {
-    return Array.from({ length: 24 }, (_, hour) => `${state.selectedDate}T${pad(hour)}:00:00`);
-  }
-  return periodDates(range.key, state.selectedDate);
-}
-
-function pad(value) {
-  return String(value).padStart(2, "0");
 }
 
 function renderStackedFallback() {

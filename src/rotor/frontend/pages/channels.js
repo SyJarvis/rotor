@@ -2,6 +2,7 @@
 
 import { api } from "../api.js?v=2";
 import { t } from "../i18n.js";
+import { channelDefaults, rememberChannelDefaults, applyChannelDefaults } from "../channel-form.js";
 import {
   escapeHtml, parseCsv, parseJson, badge, statusBadge,
   skeletonCards, showInline, hideInline, refreshIcons, toast,
@@ -22,8 +23,6 @@ export function openCreate() {
   editState.id = null;
   withForm((form) => {
     form.reset();
-    form.elements.models_path.value = "/models";
-    form.elements.request_path.value = "/chat/completions";
     form.elements.priority.value = "1";
     form.elements.weight.value = "1";
     form.elements.enabled.checked = true;
@@ -31,8 +30,7 @@ export function openCreate() {
     keyInput.value = "";
     keyInput.required = true;
     keyInput.placeholder = "provider api key";
-    // trigger preset population for the default type
-    form.elements.type.dispatchEvent(new Event("change"));
+    applyChannelDefaults(form, { reset: true });
   });
   setTitle(t("addChannelTitle"));
   document.getElementById("probeResult").className = "inline-result hidden";
@@ -50,9 +48,10 @@ export function openEdit(channel) {
     form.elements.type.value = channel.type || "openai";
     form.elements.base_url.value = channel.base_url || "";
     form.elements.protocol.value = channel.protocol || "openai";
-    form.elements.auth_type.value = auth_type || "bearer";
-    form.elements.models_path.value = models_path || "/models";
-    form.elements.request_path.value = request_path || "/chat/completions";
+    const defaults = channelDefaults(form.elements.type.value, form.elements.protocol.value);
+    form.elements.auth_type.value = auth_type || defaults.auth_type;
+    form.elements.models_path.value = models_path || defaults.models_path;
+    form.elements.request_path.value = request_path || defaults.request_path;
     form.elements.priority.value = channel.priority ?? 1;
     form.elements.weight.value = channel.weight ?? 1;
     form.elements.models.value = (channel.models || []).join(", ");
@@ -64,6 +63,7 @@ export function openEdit(channel) {
     keyInput.value = "";
     keyInput.required = false;
     keyInput.placeholder = t("keepUnchanged");
+    rememberChannelDefaults(form);
   });
   setTitle(`${t("editChannel")} · ${channel.name}`);
   document.getElementById("probeResult").className = "inline-result hidden";
@@ -314,7 +314,7 @@ async function runTest(id) {
     state.testResult[id] = {
       ok: result.ok,
       message: result.ok
-        ? `${t("reachable")} · ${result.latency_ms} ms · ${result.models.length} models`
+        ? `${t("modelCatalogReachable")} · ${result.latency_ms} ms · ${result.models.length} models`
         : `${t("failed")} · ${result.latency_ms} ms · ${escapeHtml(result.error || result.status_code)}`,
     };
   } catch (e) {

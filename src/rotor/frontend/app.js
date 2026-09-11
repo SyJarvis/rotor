@@ -5,22 +5,25 @@ import { toggleTheme } from "./theme.js";
 import { api, copyText } from "./api.js?v=2";
 import { parseCsv, parseJson, refreshIcons, toast } from "./ui.js?v=12";
 import { refreshTheme } from "./charts.js?v=8";
+import { setChannelPresets, applyChannelDefaults, channelConnection } from "./channel-form.js";
 
 import * as overview from "./pages/overview.js?v=5";
 import * as channels from "./pages/channels.js";
 import { editState as channelEditState } from "./pages/channels.js";
 import * as tokens from "./pages/tokens.js?v=9";
-import * as usage from "./pages/usage.js?v=12";
-import * as logs from "./pages/logs.js?v=3";
+import * as usage from "./pages/usage.js?v=13";
+import * as logs from "./pages/logs.js?v=4";
+import * as monitoring from "./pages/monitoring.js?v=6";
 import * as mindagent from "./pages/mindagent.js?v=15";
 
-const PAGES = { overview, channels, tokens, usage, logs, mindagent };
+const PAGES = { overview, channels, tokens, usage, logs, monitoring, mindagent };
 const TITLES = {
   overview: () => t("overview"),
   channels: () => t("channels"),
   tokens: () => t("apiKeys"),
   usage: () => t("usage"),
   logs: () => t("logs"),
+  monitoring: () => t("monitoringTitle"),
   mindagent: () => t("mindagentChat"),
 };
 
@@ -30,6 +33,7 @@ let channelPresets = [];
 
 async function loadChannelPresets() {
   channelPresets = await api("/api/admin/channels/presets");
+  setChannelPresets(channelPresets);
   const select = document.getElementById("channelForm")?.elements.type;
   if (!select) return;
   const selected = select.value;
@@ -39,18 +43,14 @@ async function loadChannelPresets() {
   select.value = channelPresets.some((preset) => preset.id === selected)
     ? selected
     : channelPresets[0]?.id || "openai";
-  applyChannelPreset(select.value);
+  applyChannelPreset(select.value, true);
 }
 
-function applyChannelPreset(provider) {
+function applyChannelPreset(provider, reset = false) {
   const preset = channelPresets.find((item) => item.id === provider);
   const form = document.getElementById("channelForm");
   if (!preset || !form) return;
-  form.elements.base_url.value = preset.base_url;
-  form.elements.protocol.value = preset.protocol;
-  form.elements.models_path.value = preset.models_path;
-  form.elements.request_path.value = preset.request_path;
-  form.elements.auth_type.value = preset.auth_type;
+  applyChannelDefaults(form, { providerChanged: true, reset });
 }
 
 export async function refreshActive() {
@@ -63,6 +63,7 @@ export async function refreshActive() {
 
 function switchTab(tab) {
   if (current === tab) return refreshActive();
+  PAGES[current]?.unload?.();
   current = tab;
   document.getElementById("content")?.classList.toggle("mindagent-content", tab === "mindagent");
   document.querySelectorAll(".nav-item").forEach((el) => {
@@ -160,15 +161,7 @@ document.getElementById("channelForm")?.elements.type.addEventListener("change",
 document.getElementById("channelForm")?.elements.protocol.addEventListener("change", (event) => {
   const form = document.getElementById("channelForm");
   if (!form) return;
-  if (event.target.value === "openai_responses") {
-    form.elements.request_path.value = "/responses";
-  } else if (event.target.value === "anthropic") {
-    form.elements.request_path.value = "/messages";
-  } else {
-    form.elements.request_path.value = "/chat/completions";
-  }
-  const preset = channelPresets.find((item) => item.id === form.elements.type.value);
-  form.elements.auth_type.value = preset?.auth_type || "bearer";
+  applyChannelDefaults(form);
 });
 document.getElementById("closeChannelModal")?.addEventListener("click", () => {
   channelModal.classList.add("hidden");
@@ -252,25 +245,19 @@ document.getElementById("probeModels")?.addEventListener("click", async (event) 
   button.innerHTML = `<i data-lucide="loader-2" class="spin"></i>${t("probing") || "..."}`;
   refreshIcons(button);
   try {
+    const draft = channelConnection(form, parseJson(form.elements.extra.value, {}));
     let result;
     if (useSaved) {
       result = await api(`/api/admin/channels/${channelId}/probe-models`, {
         method: "POST",
+        body: JSON.stringify(draft),
       });
     } else {
       result = await api("/api/admin/channels/probe-models", {
         method: "POST",
         body: JSON.stringify({
-          base_url: form.elements.base_url.value.trim(),
+          ...draft,
           key: keyInput,
-          type: form.elements.type.value,
-          protocol: form.elements.protocol.value,
-          extra: {
-            ...parseJson(form.elements.extra.value, {}),
-            models_path: form.elements.models_path.value.trim(),
-            request_path: form.elements.request_path.value.trim(),
-            auth_type: form.elements.auth_type.value,
-          },
         }),
       });
     }
@@ -302,30 +289,22 @@ document.getElementById("channelForm")?.addEventListener("submit", async (event)
     const form = new FormData(formElement);
     const extra = parseJson(form.get("extra"), {});
     const payload = {
+      ...channelConnection(formElement, extra),
       name: form.get("name"),
-      type: form.get("type"),
       key: form.get("key") || undefined,
-      base_url: form.get("base_url"),
       models: parseCsv(form.get("models")),
       model_mapping: parseJson(form.get("model_mapping"), {}),
       priority: Number(form.get("priority") || 1),
       weight: Number(form.get("weight") || 1),
       enabled: Boolean(form.get("enabled")),
       test_only: false,
-      protocol: form.get("protocol"),
-      extra: {
-        ...extra,
-        models_path: form.get("models_path"),
-        request_path: form.get("request_path"),
-        auth_type: form.get("auth_type"),
-      },
     };
     const editingId = channelEditState.id;
     const method = editingId ? "PUT" : "POST";
     const url = editingId ? `/api/admin/channels/${editingId}` : "/api/admin/channels";
     await api(url, { method, body: JSON.stringify(payload) });
     formElement.reset();
-    applyChannelPreset(formElement.elements.type.value);
+    applyChannelPreset(formElement.elements.type.value, true);
     channelModal.classList.add("hidden");
     toast(`${t("channels")} "${payload.name}" ${editingId ? t("updated") : t("created")}`, "success");
     channelEditState.id = null;

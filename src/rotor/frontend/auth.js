@@ -133,7 +133,7 @@ async function startApp(actor) {
   document.body.classList.remove("auth-pending");
   if (!appLoaded) {
     appLoaded = true;
-    await import("./app.js?v=25");
+    await import("./app.js?v=32");
   }
 }
 
