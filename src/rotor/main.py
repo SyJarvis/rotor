@@ -2,6 +2,9 @@ import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from httpx import HTTPStatusError, RequestError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -12,10 +15,18 @@ from rotor.core.exceptions import (
     APIRouterException,
     api_router_exception_handler,
     general_exception_handler,
+    UpstreamProtocolError,
+    UpstreamOverloaded,
+)
+from rotor.core.anthropic_errors import (
+    protocol_http_exception_handler,
+    protocol_validation_exception_handler,
+    protocol_upstream_exception_handler,
 )
 from rotor.core.middleware import LoggingMiddleware
 from rotor.core.logging_config import LOG_FORMAT, configure_file_logging
 from rotor.api.v1 import chat, images, models, anthropic, responses
+from rotor.api.v1 import anthropic_models
 from rotor.api.admin import (
     auth as admin_auth,
     channels,
@@ -23,6 +34,7 @@ from rotor.api.admin import (
     tokens,
     logs,
     mindagent,
+    monitoring,
     settings as admin_settings,
 )
 from rotor.api.control import channels as control_channels
@@ -105,6 +117,12 @@ app.add_middleware(LoggingMiddleware)
 
 # Exception handlers
 app.add_exception_handler(APIRouterException, api_router_exception_handler)
+app.add_exception_handler(StarletteHTTPException, protocol_http_exception_handler)
+app.add_exception_handler(RequestValidationError, protocol_validation_exception_handler)
+app.add_exception_handler(HTTPStatusError, protocol_upstream_exception_handler)
+app.add_exception_handler(RequestError, protocol_upstream_exception_handler)
+app.add_exception_handler(UpstreamProtocolError, protocol_upstream_exception_handler)
+app.add_exception_handler(UpstreamOverloaded, protocol_upstream_exception_handler)
 app.add_exception_handler(
     ControlAPIException,
     control_api_exception_handler,
@@ -171,6 +189,7 @@ app.include_router(images.router, prefix=settings.API_V1_STR, tags=["images"])
 app.include_router(models.router, prefix=settings.API_V1_STR, tags=["models"])
 # Anthropic-compatible endpoint
 app.include_router(anthropic.router, prefix="/anthropic/v1", tags=["anthropic"])
+app.include_router(anthropic_models.router, prefix="/anthropic/v1", tags=["anthropic"])
 
 # Admin routes
 app.include_router(admin_auth.router, prefix="/api/admin")
@@ -192,6 +211,11 @@ app.include_router(
 )
 app.include_router(
     logs.router,
+    prefix="/api/admin",
+    dependencies=admin_dependencies,
+)
+app.include_router(
+    monitoring.router,
     prefix="/api/admin",
     dependencies=admin_dependencies,
 )

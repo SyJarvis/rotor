@@ -18,6 +18,38 @@ def main() -> None:
     serve_parser.add_argument("--reload", action="store_true", help="Enable uvicorn reload")
     serve_parser.set_defaults(func=serve)
 
+    cleanup_parser = subparsers.add_parser(
+        "cleanup-empty-requests",
+        help="Inspect or archive the known empty-stream request batch",
+    )
+    cleanup_parser.add_argument(
+        "--database",
+        type=Path,
+        help="SQLite database path (defaults to the configured Rotor database)",
+    )
+    cleanup_parser.add_argument(
+        "--archive",
+        type=Path,
+        help="Archive path to create when applying the cleanup",
+    )
+    cleanup_mode = cleanup_parser.add_mutually_exclusive_group()
+    cleanup_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Archive and delete matching rows (requires --yes)",
+    )
+    cleanup_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print matching counts without writing (the default)",
+    )
+    cleanup_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Explicitly confirm the destructive cleanup",
+    )
+    cleanup_parser.set_defaults(func=cleanup_empty_requests_command)
+
     args = parser.parse_args()
     args.func(args)
 
@@ -32,6 +64,38 @@ def serve(args: argparse.Namespace) -> None:
         reload=args.reload,
         log_level=settings.LOG_LEVEL.lower(),
     )
+
+
+def cleanup_empty_requests_command(args: argparse.Namespace) -> None:
+    """Run the guarded empty-request maintenance operation."""
+    from rotor.maintenance.empty_requests import (
+        EmptyRequestCleanupError,
+        cleanup_empty_requests,
+    )
+
+    database_path = args.database or sqlite_path_from_url(settings.DATABASE_URL)
+    if database_path is None:
+        raise SystemExit("cleanup-empty-requests requires a SQLite database")
+    try:
+        report = cleanup_empty_requests(
+            database_path,
+            archive_path=args.archive,
+            apply=bool(args.apply),
+            confirm=bool(args.yes),
+        )
+    except EmptyRequestCleanupError as exc:
+        raise SystemExit(f"cleanup-empty-requests failed: {exc}") from exc
+
+    mode = "applied" if args.apply else "dry-run"
+    print(f"mode: {mode}")
+    print(f"matched usage_ledger rows: {report.matched_usage_ledger}")
+    print(f"mapped request_logs rows: {report.matched_request_logs}")
+    for table, count in report.related_rows.items():
+        print(f"related {table} rows: {count}")
+    if report.archived_path is not None:
+        print(f"archive: {report.archived_path}")
+        for table, count in report.deleted_rows.items():
+            print(f"deleted {table} rows: {count}")
 
 
 def ensure_runtime_dirs() -> None:
