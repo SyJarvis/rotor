@@ -6,6 +6,7 @@
 
 - 新增 [上游完整性校验](src/rotor/adapters/protocol/openai_integrity.py) 与 [Anthropic 完整性校验](src/rotor/adapters/protocol/anthropic_integrity.py)：在返回结果与流式事件上校验完成状态、截断与业务错误，替代原先仅按 HTTP 状态判断的做法。
 - 新增 [协议错误外壳](src/rotor/core/anthropic_errors.py)，[应用入口](src/rotor/main.py) 注册对应异常处理器；错误响应不再泄漏校验输入。
+- 新增 [OpenAI 协议错误外壳](src/rotor/core/openai_errors.py)：OpenAI 兼容调用失败时返回结构化错误，保留上游状态码、请求 ID 与脱敏响应体，并按类映射状态；不再统一降级为 500。管理网页聊天展示同一份上游诊断信息，回归见 [test_openai_error_envelope.py](tests/test_openai_error_envelope.py)、[test_mindagent_chat.py](tests/test_mindagent_chat.py)。
 - [异常归一](src/rotor/core/exceptions.py) 补充 `Retry-After` 解析与失败分类，回归见 [test_retry_after.py](tests/test_retry_after.py)、[test_openai_response_integrity.py](tests/test_openai_response_integrity.py)、[test_anthropic_response_integrity.py](tests/test_anthropic_response_integrity.py)。
 
 ### 路由能力约束与尝试准入
@@ -52,7 +53,7 @@
 
 ### 验证
 
-- 全量测试：`pytest -q` 1485 passed、6 subtests passed、13 项既有弃用警告。
+- 全量测试：`pytest -q` 1498 passed、6 subtests passed、13 项既有弃用警告。
 - 前端测试：`node --experimental-vm-modules` 运行 4 个 `tests/*.mjs`，14 passed、0 fail。
 - `git diff --check` 通过。
 
