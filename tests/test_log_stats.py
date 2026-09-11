@@ -1,16 +1,22 @@
 import asyncio
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
+import pytest
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from rotor.api.admin.logs import (
     _cache_hit_rate,
     _calendar_time_window,
+    _usage_time_window,
     count_logs,
     get_log_stats,
     get_log_timeseries_by_model,
     get_model_usage,
+    list_logs,
 )
+from rotor.application_settings import application_settings
 from rotor.database import Base
 from rotor.models.log import RequestLog
 
@@ -289,7 +295,120 @@ def test_usage_queries_respect_an_explicit_day_window():
     asyncio.run(scenario())
 
 
-def test_log_count_respects_list_filters():
+def test_usage_date_window_includes_the_complete_selected_day():
+    timezone_name = application_settings.get().display_timezone
+    display_timezone = ZoneInfo(timezone_name)
+    selected = date(2026, 8, 11)
+
+    start, end = _usage_time_window(
+        days=7,
+        start_time=None,
+        end_time=None,
+        start_date=selected,
+        end_date=selected,
+    )
+
+    assert (start, end) == (
+        datetime.combine(selected, time.min, display_timezone)
+        .astimezone(timezone.utc).replace(tzinfo=None),
+        datetime.combine(selected + timedelta(days=1), time.min, display_timezone)
+        .astimezone(timezone.utc).replace(tzinfo=None),
+    )
+
+
+def test_log_stats_date_window_includes_both_boundary_dates():
+    async def scenario():
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        timezone_name = application_settings.get().display_timezone
+        display_timezone = ZoneInfo(timezone_name)
+        first_date = date(2026, 8, 11)
+        last_date = first_date + timedelta(days=1)
+        start = datetime.combine(first_date, time.min, display_timezone).astimezone(
+            timezone.utc
+        ).replace(tzinfo=None)
+        end = datetime.combine(
+            last_date + timedelta(days=1), time.min, display_timezone
+        ).astimezone(timezone.utc).replace(tzinfo=None)
+        async with sessions() as db:
+            db.add_all([
+                _log(created_at=start - timedelta(seconds=1), model="before", total_tokens=1),
+                _log(created_at=start, model="first-date", total_tokens=10),
+                _log(created_at=end - timedelta(seconds=1), model="last-date", total_tokens=20),
+                _log(created_at=end, model="after", total_tokens=100),
+            ])
+            await db.commit()
+
+            stats = await get_log_stats(
+                token_id=None,
+                channel_id=None,
+                model=None,
+                days=7,
+                start_date=first_date,
+                end_date=last_date,
+                db=db,
+            )
+
+        await engine.dispose()
+
+        assert stats["total_requests"] == 2
+        assert stats["total_tokens"] == 30
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"start_date": date(2026, 8, 11)}, "must be provided together"),
+        (
+            {"start_date": date(2026, 8, 12), "end_date": date(2026, 8, 11)},
+            "end_date must not be before start_date",
+        ),
+        (
+            {
+                "start_date": date.today() + timedelta(days=2),
+                "end_date": date.today() + timedelta(days=2),
+            },
+            "end_date cannot be in the future",
+        ),
+        (
+            {
+                "start_date": date(2026, 8, 11),
+                "end_date": date(2026, 8, 11),
+                "start_time": datetime(2026, 8, 11, tzinfo=timezone.utc),
+                "end_time": datetime(2026, 8, 12, tzinfo=timezone.utc),
+            },
+            "date range cannot be combined",
+        ),
+        (
+            {
+                "start_date": date(2026, 8, 11),
+                "end_date": date(2026, 8, 11),
+                "period": "day",
+            },
+            "date range cannot be combined",
+        ),
+    ],
+)
+def test_usage_date_window_rejects_invalid_combinations(overrides, message):
+    arguments = {
+        "days": 7,
+        "start_time": None,
+        "end_time": None,
+        "start_date": None,
+        "end_date": None,
+    }
+    arguments.update(overrides)
+
+    with pytest.raises(HTTPException, match=message):
+        _usage_time_window(**arguments)
+
+
+def test_log_list_and_count_keep_all_time_behavior_without_a_window():
     async def scenario():
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -298,15 +417,73 @@ def test_log_count_respects_list_filters():
 
         async with sessions() as db:
             db.add_all([
-                _log(created_at=datetime.utcnow(), model="selected", total_tokens=10),
+                _log(created_at=datetime(2020, 1, 1), model="selected", total_tokens=10),
                 _log(created_at=datetime.utcnow(), model="other", total_tokens=20),
             ])
             await db.commit()
 
+            logs = await list_logs(
+                skip=0,
+                limit=100,
+                model="selected",
+                db=db,
+            )
             count = await count_logs(model="selected", db=db)
+            assert [item.model for item in logs] == ["selected"]
             assert count == {"count": 1}
 
         await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_log_list_and_count_normalize_the_same_explicit_window():
+    async def scenario():
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        start = datetime(2026, 8, 11, 8, tzinfo=timezone(timedelta(hours=8)))
+        end = start + timedelta(hours=24)
+        start_utc = start.astimezone(timezone.utc).replace(tzinfo=None)
+        end_utc = end.astimezone(timezone.utc).replace(tzinfo=None)
+        async with sessions() as db:
+            db.add_all([
+                _log(created_at=start_utc - timedelta(seconds=1), model="before", total_tokens=1),
+                _log(created_at=start_utc, model="first", total_tokens=10),
+                _log(created_at=end_utc - timedelta(seconds=1), model="last", total_tokens=20),
+                _log(created_at=end_utc, model="after", total_tokens=100),
+            ])
+            await db.commit()
+
+            logs = await list_logs(
+                skip=0,
+                limit=100,
+                start_time=start,
+                end_time=end,
+                db=db,
+            )
+            count = await count_logs(start_time=start, end_time=end, db=db)
+
+        await engine.dispose()
+
+        assert {item.model for item in logs} == {"first", "last"}
+        assert count == {"count": 2}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("endpoint", [list_logs, count_logs])
+def test_log_list_and_count_reject_incomplete_explicit_window(endpoint):
+    async def scenario():
+        with pytest.raises(HTTPException, match="must be provided together"):
+            await endpoint(
+                **({"skip": 0, "limit": 100} if endpoint is list_logs else {}),
+                start_time=datetime(2026, 8, 11, tzinfo=timezone.utc),
+                end_time=None,
+                db=None,
+            )
 
     asyncio.run(scenario())
 

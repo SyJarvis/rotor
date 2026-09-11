@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -10,6 +11,7 @@ from sqlalchemy import update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from rotor.observability import performance_metrics
 from rotor.config import settings
 from rotor.conversations.sanitizer import sanitize
 from rotor.conversations.schema import utc_now_iso
@@ -22,6 +24,7 @@ from rotor.schemas.request import ChatCompletionRequest
 logger = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS = 3  # 1 initial + 2 retries
+_DB_BATCH_SIZE = 32
 
 
 @dataclass(slots=True)
@@ -58,6 +61,8 @@ class _Event:
     record_op: Optional[dict[str, Any]] = None  # {"action":"upsert"|"update","fields":{...}}
     record_key: Optional[tuple[str, str]] = None  # (conversation_id, request_id)
     attempt: int = 0
+    file_written: bool = False
+    queued_at: float | None = None
 
 
 class ConversationStore:
@@ -96,6 +101,31 @@ class ConversationStore:
             self._worker(), name="conversation-store-worker"
         )
         logger.info("Conversation store worker started")
+
+    async def drain(self, timeout: float = 10.0) -> None:
+        """Wait for queued and in-flight events, including retries, to finish."""
+        if self._queue is None:
+            return
+        worker = self._worker_task
+        if worker is None:
+            raise RuntimeError("Conversation worker is not running")
+        started_at = time.monotonic()
+        joined = asyncio.create_task(self._queue.join())
+        try:
+            done, _ = await asyncio.wait(
+                (joined, worker), timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if worker in done:
+                await worker
+                raise RuntimeError("Conversation worker stopped before drain completed")
+            if joined not in done:
+                raise TimeoutError("Conversation store drain timed out")
+            await joined
+        finally:
+            joined.cancel()
+            await asyncio.gather(joined, return_exceptions=True)
+            performance_metrics.observe("store.drain_ms", (time.monotonic() - started_at) * 1000)
 
     async def shutdown(self, timeout: float = 10.0) -> None:
         """Signal the worker to stop and wait for it to drain.
@@ -315,6 +345,7 @@ class ConversationStore:
 
     def _enqueue(self, ev: _Event) -> None:
         assert self._queue is not None, "ConversationStore.attach() not called"
+        ev.queued_at = time.monotonic()
         try:
             self._queue.put_nowait(ev)
         except asyncio.QueueFull:
@@ -329,38 +360,77 @@ class ConversationStore:
 
     async def _worker(self) -> None:
         assert self._queue is not None
+        pending = None
         async with async_session_maker() as db:
             while True:
-                item = await self._queue.get()
+                item = pending if pending is not None else await self._queue.get()
+                pending = None
                 if item is self._SENTINEL:
+                    self._queue.task_done()
                     break
-                await self._handle_event(db, item)  # type: ignore[arg-type]
+                batch = [item]
+                if item.kind == "db_only":
+                    while len(batch) < _DB_BATCH_SIZE:
+                        try:
+                            following = self._queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        if following is self._SENTINEL or following.kind != "db_only":
+                            pending = following
+                            break
+                        batch.append(following)
+                batch_started = time.monotonic()
+                performance_metrics.observe("store.batch_size", len(batch))
+                for ev in batch:
+                    if ev.queued_at is not None:
+                        performance_metrics.observe("store.queue_wait_ms", (batch_started - ev.queued_at) * 1000)
+                try:
+                    if len(batch) == 1:
+                        await self._handle_event(db, item)
+                    else:
+                        try:
+                            for ev in batch:
+                                await self._process(db, ev)
+                            await db.commit()
+                        except Exception:
+                            logger.exception("Conversation batch failed; retrying events in order")
+                            await self._safe_rollback(db)
+                            for ev in batch:
+                                ev.attempt += 1
+                                await self._handle_event(db, ev)
+                finally:
+                    performance_metrics.observe("store.batch_ms", (time.monotonic() - batch_started) * 1000)
+                    for _ in batch:
+                        self._queue.task_done()
 
     async def _handle_event(self, db: AsyncSession, ev: _Event) -> None:
-        try:
-            await self._process(db, ev)
-            await db.commit()
-        except Exception:
-            logger.exception("Conversation event failed kind=%s attempt=%d", ev.kind, ev.attempt)
-            await self._safe_rollback(db)
-            if ev.attempt + 1 < _MAX_ATTEMPTS:
+        while ev.attempt < _MAX_ATTEMPTS:
+            try:
+                await self._process(db, ev)
+                await db.commit()
+                return
+            except Exception:
+                logger.exception("Conversation event failed kind=%s attempt=%d", ev.kind, ev.attempt)
+                await self._safe_rollback(db)
                 ev.attempt += 1
-                self._enqueue(ev)
-            else:
-                self.dropped_retry_exhausted += 1
-                logger.error(
-                    "Dropping event kind=%s after %d attempts "
-                    "(dropped_total=%d)",
-                    ev.kind,
-                    _MAX_ATTEMPTS,
-                    self.dropped_queue_full + self.dropped_retry_exhausted,
-                )
+        self.dropped_retry_exhausted += 1
+        logger.error(
+            "Dropping event kind=%s after %d attempts "
+            "(dropped_total=%d)",
+            ev.kind,
+            _MAX_ATTEMPTS,
+            self.dropped_queue_full + self.dropped_retry_exhausted,
+        )
 
     async def _process(self, db: AsyncSession, ev: _Event) -> None:
         # File write — only on commit, one complete line per request.
-        if ev.kind == "commit" and ev.payload is not None and ev.file_path is not None:
+        if (
+            ev.kind == "commit" and not ev.file_written
+            and ev.payload is not None and ev.file_path is not None
+        ):
             line = json.dumps(ev.payload, ensure_ascii=False, separators=(",", ":")) + "\n"
             await self._append_raw(ev.file_path, line)
+            ev.file_written = True
 
         # DB op.
         if ev.record_op is not None:

@@ -1,37 +1,103 @@
 import asyncio
 import logging
+import time
 
 from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.engine import make_url
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 from rotor.config import settings
+import rotor.observability as observability
 
 
 logger = logging.getLogger(__name__)
 
-# Create async engine
-engine = create_async_engine(
+
+class _MeasuredQueuePool(AsyncAdaptedQueuePool):
+    def connect(self):
+        started = time.perf_counter()
+        try:
+            return super().connect()
+        except BaseException:
+            observability.performance_metrics.observe("db.acquire_errors", 1)
+            raise
+        finally:
+            observability.performance_metrics.observe("db.acquire_ms", (time.perf_counter() - started) * 1000)
+
+
+def _instrument_engine(db_engine):
+    sync_engine = db_engine.sync_engine
+
+    @event.listens_for(sync_engine, "before_cursor_execute")
+    def before_sql(conn, cursor, statement, parameters, context, executemany):
+        context._rotor_started = None if observability.metrics_suppressed() else time.perf_counter()
+
+    def finish_sql(context, failed=False):
+        started = getattr(context, "_rotor_started", None)
+        if started is not None:
+            context._rotor_started = None
+            observability.performance_metrics.observe("db.sql_ms", (time.perf_counter() - started) * 1000)
+            if failed:
+                observability.performance_metrics.observe("db.sql_errors", 1)
+
+    @event.listens_for(sync_engine, "after_cursor_execute")
+    def after_sql(conn, cursor, statement, parameters, context, executemany):
+        finish_sql(context)
+
+    @event.listens_for(sync_engine, "handle_error")
+    def sql_error(exception_context):
+        finish_sql(exception_context.execution_context, failed=True)
+
+    @event.listens_for(sync_engine, "checkout")
+    def checkout(connection, record, proxy):
+        record.info["rotor_checkout"] = None if observability.metrics_suppressed() else time.perf_counter()
+
+    @event.listens_for(sync_engine, "checkin")
+    def checkin(connection, record):
+        started = record.info.pop("rotor_checkout", None)
+        if started is not None:
+            observability.performance_metrics.observe("db.hold_ms", (time.perf_counter() - started) * 1000)
+
+    original_commit = sync_engine.dialect.do_commit
+
+    def commit(connection):
+        started = time.perf_counter()
+        try:
+            return original_commit(connection)
+        except BaseException:
+            observability.performance_metrics.observe("db.commit_errors", 1)
+            raise
+        finally:
+            observability.performance_metrics.observe("db.commit_ms", (time.perf_counter() - started) * 1000)
+
+    sync_engine.dialect.do_commit = commit
+
+
+def create_database_engine(database_url: str, *, echo: bool = False):
+    """Create an engine with the gateway's connection settings."""
+    url = make_url(database_url)
+    default_pool = url.get_dialect(_is_async=True).get_pool_class(url)
+    pool_options = {"poolclass": _MeasuredQueuePool} if issubclass(default_pool, AsyncAdaptedQueuePool) else {}
+    db_engine = create_async_engine(database_url, echo=echo, future=True, **pool_options)
+    # WAL allows reads alongside writes; busy_timeout lets writers queue.
+    if database_url.startswith("sqlite"):
+        @event.listens_for(db_engine.sync_engine, "connect")
+        def _set_sqlite_pragma(dbapi_connection, _connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.close()
+    _instrument_engine(db_engine)
+    return db_engine
+
+
+engine = create_database_engine(
     settings.DATABASE_URL,
     echo=settings.LOG_LEVEL == "DEBUG",
-    future=True
 )
-
-# SQLite under default PRAGMAs (journal_mode=DELETE, busy_timeout=0) throws
-# "database is locked" the instant two sessions write concurrently. The
-# conversation-store worker, the request-path accounting session, and the
-# streaming generator's short-lived session all write to the same file, so
-# lock collisions are frequent under load. WAL lets reads proceed while a
-# write is in flight, busy_timeout makes writers queue instead of failing
-# immediately, and synchronous=NORMAL is the safe+fast pairing for WAL.
-if settings.DATABASE_URL.startswith("sqlite"):
-    @event.listens_for(engine.sync_engine, "connect")
-    def _set_sqlite_pragma(dbapi_connection, _connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA busy_timeout=5000")
-        cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.close()
 
 # Create async session factory
 async_session_maker = async_sessionmaker(
@@ -63,7 +129,10 @@ async def get_db() -> AsyncSession:
     session = async_session_maker()
     try:
         yield session
-        await _cancellation_safe(session.commit())
+        # Flushed ORM changes and Core DML can leave the dirty collections
+        # empty while the transaction still needs committing.
+        if session.in_transaction():
+            await _cancellation_safe(session.commit())
     except BaseException:
         if session.in_transaction():
             try:

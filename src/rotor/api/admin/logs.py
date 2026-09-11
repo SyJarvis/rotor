@@ -43,13 +43,54 @@ def _usage_time_window(
     days: int,
     start_time: datetime | None,
     end_time: datetime | None,
+    start_date: date | None = None,
+    end_date: date | None = None,
     period: Literal["day", "week", "month"] | None = None,
     period_date: date | None = None,
 ) -> tuple[datetime, datetime | None]:
+    has_date_range = start_date is not None or end_date is not None
+    if has_date_range:
+        if period is not None or start_time is not None or end_time is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    "date range cannot be combined with period, start_time, "
+                    "or end_time"
+                ),
+            )
+        if start_date is None or end_date is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="start_date and end_date must be provided together",
+            )
+        if start_date > end_date:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="end_date must not be before start_date",
+            )
+
+        display_timezone = ZoneInfo(
+            application_settings.get().display_timezone
+        )
+        if end_date > datetime.now(display_timezone).date():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="end_date cannot be in the future",
+            )
+
+        def utc_naive_date(day: date) -> datetime:
+            return datetime.combine(day, time.min, display_timezone).astimezone(
+                timezone.utc
+            ).replace(tzinfo=None)
+
+        return utc_naive_date(start_date), utc_naive_date(
+            end_date + timedelta(days=1)
+        )
+
     if period is not None:
         if start_time is not None or end_time is not None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="period cannot be combined with start_time or end_time",
             )
         return _calendar_time_window(period, period_date)
@@ -57,7 +98,7 @@ def _usage_time_window(
         return datetime.utcnow() - timedelta(days=days), None
     if start_time is None or end_time is None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="start_time and end_time must be provided together",
         )
 
@@ -70,7 +111,7 @@ def _usage_time_window(
     end = utc_naive(end_time)
     if start >= end:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="end_time must be after start_time",
         )
     return start, end
@@ -184,6 +225,8 @@ async def list_logs(
     success: Optional[bool] = None,
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
     period: Literal["day", "week", "month"] | None = None,
     period_date: date | None = None,
     db: AsyncSession = Depends(get_db),
@@ -201,11 +244,19 @@ async def list_logs(
         start_time: Filter logs after this time
         end_time: Filter logs before this time
     """
-    if period is not None:
+    if (
+        period is not None
+        or start_time is not None
+        or end_time is not None
+        or start_date is not None
+        or end_date is not None
+    ):
         start_time, end_time = _usage_time_window(
             days=1,
             start_time=start_time,
             end_time=end_time,
+            start_date=start_date,
+            end_date=end_date,
             period=period,
             period_date=period_date,
         )
@@ -239,16 +290,26 @@ async def count_logs(
     success: Optional[bool] = None,
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
     period: Literal["day", "week", "month"] | None = None,
     period_date: date | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Count request logs matching the list filters."""
-    if period is not None:
+    if (
+        period is not None
+        or start_time is not None
+        or end_time is not None
+        or start_date is not None
+        or end_date is not None
+    ):
         start_time, end_time = _usage_time_window(
             days=1,
             start_time=start_time,
             end_time=end_time,
+            start_date=start_date,
+            end_date=end_date,
             period=period,
             period_date=period_date,
         )
@@ -275,6 +336,8 @@ async def get_log_stats(
     days: int = Query(7, ge=1, le=90),
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
     period: Literal["day", "week", "month"] | None = None,
     period_date: date | None = None,
     db: AsyncSession = Depends(get_db),
@@ -292,6 +355,8 @@ async def get_log_stats(
         days=days,
         start_time=start_time,
         end_time=end_time,
+        start_date=start_date,
+        end_date=end_date,
         period=period,
         period_date=period_date,
     )
@@ -391,6 +456,8 @@ async def get_log_timeseries(
     success: Optional[bool] = None,
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
     period: Literal["day", "week", "month"] | None = None,
     period_date: date | None = None,
     db: AsyncSession = Depends(get_db),
@@ -409,6 +476,8 @@ async def get_log_timeseries(
         days=days,
         start_time=start_time,
         end_time=end_time,
+        start_date=start_date,
+        end_date=end_date,
         period=period,
         period_date=period_date,
     )
@@ -466,6 +535,8 @@ async def get_log_timeseries_by_model(
     today: bool = Query(False),
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
     period: Literal["day", "week", "month"] | None = None,
     period_date: date | None = None,
     channel_id: Optional[int] = None,
@@ -478,11 +549,13 @@ async def get_log_timeseries_by_model(
     (useful for "today 0:00 → now" views). Otherwise the window is `days` days back.
     """
     resolved_bucket = "hour" if (bucket == "auto" and days <= 3) or bucket == "hour" else "day"
-    if period is not None:
+    if period is not None or start_date is not None or end_date is not None:
         start_time, end_time = _usage_time_window(
             days=days,
             start_time=start_time,
             end_time=end_time,
+            start_date=start_date,
+            end_date=end_date,
             period=period,
             period_date=period_date,
         )
@@ -495,6 +568,8 @@ async def get_log_timeseries_by_model(
             days=days,
             start_time=start_time,
             end_time=end_time,
+            start_date=start_date,
+            end_date=end_date,
         )
 
     conditions = [RequestLog.created_at >= start_time]
@@ -544,6 +619,8 @@ async def get_model_usage(
     model: Optional[str] = None,
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
     period: Literal["day", "week", "month"] | None = None,
     period_date: date | None = None,
     db: AsyncSession = Depends(get_db),
@@ -553,6 +630,8 @@ async def get_model_usage(
         days=days,
         start_time=start_time,
         end_time=end_time,
+        start_date=start_date,
+        end_date=end_date,
         period=period,
         period_date=period_date,
     )
