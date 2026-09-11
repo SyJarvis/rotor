@@ -1,6 +1,6 @@
 [project]
 name = "rotor-gateway"
-version = "0.3.2"
+version = "0.5.1"
 description = ""
 authors = [
     {name = "runkezhong",email = "jarvisshangye@gmail.com"}
@@ -35,6 +35,7 @@ rotor = "rotor.cli:main"
 packages = [
     {include = "rotor", from = "src"},
     {include = "mindagent", from = "src"},
+    {include = "benchmarks"},
 ]
 include = [
     "src/rotor/frontend/**/*",
