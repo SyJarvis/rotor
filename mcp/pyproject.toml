@@ -11,7 +11,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# mindagent supplies ToolContext for the Rotor MCP client adapter tests; the
+# adapter itself lives in rotor-gateway and is imported through pythonpath.
 test = [
+    "mindagent>=0.5.3",
     "pytest>=8,<9",
 ]
 

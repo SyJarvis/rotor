@@ -43,3 +43,14 @@ jobs:
           python -m pip install -e .
       - name: Run frontend tests
         run: node --experimental-vm-modules --test tests/test_*.mjs
+
+  mcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Run rotor-mcp tests
+        working-directory: mcp
+        run: |
+          uv sync --extra test
+          uv run --extra test python -m pytest -q

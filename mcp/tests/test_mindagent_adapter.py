@@ -7,7 +7,9 @@ from typing import Any
 from mcp import Client
 
 from mindagent.core import AgentContext
-from mindagent.tools import MCPConnectionError, MCPToolSet, ToolContext
+from mindagent.tools import ToolContext
+
+from rotor.mcp_toolset import MCPConnectionError, MCPToolSet
 import rotor_mcp.server as server_module
 
 
