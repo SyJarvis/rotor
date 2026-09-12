@@ -1,0 +1,21 @@
+# Keep the build context small: the image only needs pyproject.toml, README.md,
+# alembic.ini, and src/.
+.git
+.gitignore
+.venv
+base
+dist
+private
+tests
+examples
+mcp
+gitbook
+benchmarks
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+data
+*.db
+*.db-shm
+*.db-wal

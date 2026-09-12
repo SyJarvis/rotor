@@ -80,13 +80,26 @@ class LegacyDatabaseError(RuntimeError):
     """Raised when an unversioned database cannot be adopted safely."""
 
 
+class UnsupportedDatabaseError(RuntimeError):
+    """Raised when DATABASE_URL cannot be used by the startup migration path."""
+
+
 def _sqlite_url_and_path(database_url: str) -> tuple[str, Path]:
     parsed = make_url(database_url)
     if not parsed.drivername.startswith("sqlite"):
-        raise ValueError("Rotor startup migrations currently require SQLite")
+        raise UnsupportedDatabaseError(
+            f"This Rotor release supports file-backed SQLite only, but "
+            f"DATABASE_URL uses the '{parsed.drivername}' driver. Startup "
+            f"migrations would be skipped, leaving the schema incomplete. "
+            f"Set DATABASE_URL to a SQLite file URL such as "
+            f"sqlite+aiosqlite:///~/.cache/rotor/rotor.db, or run an older "
+            f"release that supports this driver."
+        )
     if parsed.database in (None, "", ":memory:"):
-        raise ValueError(
-            "Rotor startup migrations require a file-backed SQLite database"
+        raise UnsupportedDatabaseError(
+            "This Rotor release supports file-backed SQLite only, but "
+            "DATABASE_URL does not name a database file. Use a file URL such as "
+            "sqlite+aiosqlite:///~/.cache/rotor/rotor.db."
         )
 
     path = Path(parsed.database).expanduser().resolve()

@@ -12,11 +12,14 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
+from httpx import HTTPStatusError, RequestError
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
+from starlette.exceptions import HTTPException
 
 from rotor.api.v1.chat import chat_completions
 from rotor.config import settings
+from rotor.core.openai_errors import openai_error_payload
 from rotor.database import async_session_maker
 from rotor.models.channel import Channel
 from rotor.models.token import Token
@@ -131,6 +134,24 @@ def _decode_gateway_events(chunk: str | bytes) -> list[dict[str, Any]]:
     return events
 
 
+def _gateway_failure_message(exc: Exception) -> str:
+    """Return one line of upstream failure detail for the chat transcript."""
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        error = detail.get("error") if isinstance(detail, dict) else None
+        if not isinstance(error, dict):
+            return str(detail)
+        message = str(error.get("message") or error.get("code") or detail)
+        original = error.get("original_error")
+        return f"{message}: {original}" if original else message
+    error = openai_error_payload(exc)["error"]
+    upstream = error.get("upstream")
+    if not upstream:
+        return str(error["message"])
+    detail = json.dumps(upstream, ensure_ascii=False, separators=(",", ":"))
+    return f"{error['message']}: {detail}"
+
+
 def _build_gateway_provider(
     *,
     http_request: Request,
@@ -188,13 +209,20 @@ def _build_gateway_provider(
                 user=f"mindagent:{http_request.headers.get('x-conversation-id', 'chat')}",
             )
             async with async_session_maker() as gateway_db:
-                gateway_response = await chat_completions(
-                    gateway_request,
-                    http_request,
-                    Response(),
-                    gateway_db,
-                    token,
-                )
+                try:
+                    gateway_response = await chat_completions(
+                        gateway_request,
+                        http_request,
+                        Response(),
+                        gateway_db,
+                        token,
+                    )
+                except (HTTPStatusError, RequestError, HTTPException) as exc:
+                    # The admin chat drives the gateway handler in-process, so
+                    # the protocol exception handlers never run.  Raise the
+                    # upstream status and sanitized body instead of letting
+                    # httpx's URL-only message reach the chat transcript.
+                    raise RuntimeError(_gateway_failure_message(exc)) from exc
                 async for raw_chunk in gateway_response.body_iterator:
                     for event in _decode_gateway_events(raw_chunk):
                         if event.get("error"):
@@ -251,11 +279,10 @@ async def _build_rotor_mcp_registry(run_id: str):
             "ROTOR_CONTROL_API_TOKEN 未配置，无法启动 Rotor MCP"
         )
     try:
-        from mindagent.tools import MCPToolSet
-    except ImportError as exc:
+        from rotor.mcp_toolset import MCPToolSet
+    except ImportError as exc:  # pragma: no cover - mindagent is a dependency
         raise RuntimeError(
-            "当前 MindAgent 版本不支持 Rotor MCP；请升级 MindAgent，"
-            "或清除 ROTOR_MINDAGENT_MCP_COMMAND 以禁用 MCP。"
+            "缺少 mindagent 依赖，无法启动 Rotor MCP"
         ) from exc
 
     tool_set = MCPToolSet.stdio(

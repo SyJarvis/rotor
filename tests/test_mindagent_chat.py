@@ -467,3 +467,159 @@ def test_mindagent_runtime_executes_discovered_mcp_tool(monkeypatch):
     )
     assert "upstream_availability" in str(provider_requests[1][0])
     assert '"answer": "上游渠道不可用"' in output
+
+
+def test_gateway_provider_reports_upstream_failure_detail(monkeypatch):
+    import httpx
+
+    class FakeSession:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    async def failing_chat_completions(*args, **kwargs):
+        request = httpx.Request(
+            "POST", "https://opencode.ai/zen/go/v1/chat/completions"
+        )
+        response = httpx.Response(
+            400,
+            request=request,
+            json={"error": {"message": "unknown model"}},
+        )
+        raise httpx.HTTPStatusError(
+            "Client error '400 Bad Request'",
+            request=request,
+            response=response,
+        )
+
+    monkeypatch.setattr(endpoint, "async_session_maker", lambda: FakeSession())
+    monkeypatch.setattr(endpoint, "chat_completions", failing_chat_completions)
+
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "headers": [],
+        "client": ("127.0.0.1", 1),
+    })
+    provider = endpoint._build_gateway_provider(
+        http_request=request,
+        token=object(),
+        model="fake-model",
+    )
+
+    async def consume():
+        async for _ in provider.stream_chat(
+            [{"role": "user", "content": "hi"}]
+        ):
+            pass
+
+    with pytest.raises(RuntimeError) as error:
+        asyncio.run(consume())
+
+    message = str(error.value)
+    assert message.startswith("Upstream returned HTTP 400")
+    assert "unknown model" in message
+    assert "Client error" not in message
+
+
+def test_gateway_provider_reports_channel_failure_detail(monkeypatch):
+    from rotor.core.exceptions import ChannelException
+
+    class FakeSession:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    async def failing_chat_completions(*args, **kwargs):
+        raise ChannelException(
+            "All channels failed for model 'fake-model'",
+            status_code=502,
+            original_error="ConnectError: connection refused",
+        )
+
+    monkeypatch.setattr(endpoint, "async_session_maker", lambda: FakeSession())
+    monkeypatch.setattr(endpoint, "chat_completions", failing_chat_completions)
+
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "headers": [],
+        "client": ("127.0.0.1", 1),
+    })
+    provider = endpoint._build_gateway_provider(
+        http_request=request,
+        token=object(),
+        model="fake-model",
+    )
+
+    async def consume():
+        async for _ in provider.stream_chat(
+            [{"role": "user", "content": "hi"}]
+        ):
+            pass
+
+    with pytest.raises(RuntimeError) as error:
+        asyncio.run(consume())
+
+    assert str(error.value) == (
+        "All channels failed for model 'fake-model': "
+        "ConnectError: connection refused"
+    )
+
+
+def test_runtime_streams_provider_failure_message_to_the_chat(monkeypatch):
+    mindagent = pytest.importorskip("mindagent.providers")
+
+    class FailingProvider(mindagent.BaseProvider):
+        name = "fake"
+        capabilities = mindagent.ProviderCapabilities(
+            text=True,
+            streaming=True,
+            max_context_tokens=128_000,
+        )
+
+        async def chat(self, messages, **kwargs):
+            raise RuntimeError("Upstream returned HTTP 400: unknown model")
+
+        async def stream_chat(self, messages, **kwargs):
+            raise RuntimeError("Upstream returned HTTP 400: unknown model")
+            yield mindagent.ProviderStreamChunk(content_delta="")
+
+    monkeypatch.setattr(
+        endpoint,
+        "_build_gateway_provider",
+        lambda **kwargs: FailingProvider(),
+    )
+    request_data = endpoint.MindAgentChatRequest(
+        conversation_id="chat-failure",
+        model="fake-model",
+        messages=[{"role": "user", "content": "你好"}],
+    )
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "headers": [],
+        "client": ("127.0.0.1", 1),
+    })
+
+    async def collect():
+        return "".join([
+            chunk
+            async for chunk in endpoint._run_mindagent(
+                request_data,
+                request,
+                object(),
+            )
+        ])
+
+    output = asyncio.run(collect())
+
+    assert '"type": "error"' in output
+    assert "Upstream returned HTTP 400: unknown model" in output

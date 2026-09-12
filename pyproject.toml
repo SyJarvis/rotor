@@ -1,12 +1,24 @@
 [project]
 name = "rotor-gateway"
 version = "0.5.1"
-description = ""
+description = "Self-hosted LLM gateway exposing OpenAI Chat, OpenAI Responses, and Anthropic Messages over multiple upstream channels."
 authors = [
     {name = "runkezhong",email = "jarvisshangye@gmail.com"}
 ]
+license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.11"
+keywords = ["llm", "gateway", "openai", "anthropic", "responses", "router"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
@@ -17,6 +29,9 @@ dependencies = [
     "asyncpg>=0.29.0",
     "alembic>=1.12.0",
     "aiosqlite==0.22.1",
+    # Pinned exactly: the admin chat depends on MindAgent runtime behavior that
+    # is not covered by semver, so upgrades must be reviewed deliberately.
+    "mindagent==0.5.3",
 ]
 
 [project.optional-dependencies]
@@ -31,11 +46,19 @@ mcp = [
 [project.scripts]
 rotor = "rotor.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/SyJarvis/rotor"
+Repository = "https://github.com/SyJarvis/rotor"
+Documentation = "https://github.com/SyJarvis/rotor/tree/main/gitbook"
+Changelog = "https://github.com/SyJarvis/rotor/blob/main/changelog.md"
+
 [tool.poetry]
+# "benchmarks" is a developer harness, not part of the installable API: keeping
+# it out of the wheel avoids publishing a generic top-level import name.
+# "mindagent" is the published MindAgent package (see dependencies), not a
+# vendored copy: shipping it here would shadow a user's own install.
 packages = [
     {include = "rotor", from = "src"},
-    {include = "mindagent", from = "src"},
-    {include = "benchmarks"},
 ]
 include = [
     "src/rotor/frontend/**/*",

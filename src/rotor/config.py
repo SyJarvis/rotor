@@ -5,6 +5,8 @@ from pydantic import Field
 from pydantic_settings import SettingsConfigDict
 from pydantic_settings import BaseSettings
 
+from rotor import __version__ as ROTOR_VERSION
+
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "rotor"
 
@@ -15,7 +17,7 @@ class Settings(BaseSettings):
     # API Settings
     API_V1_STR: str = "/v1"
     PROJECT_NAME: str = "Rotor"
-    VERSION: str = "1.0.0"
+    VERSION: str = ROTOR_VERSION
 
     API_KEY_PREFIX: str = "sk-"
     ROTOR_DEFAULT_ADMIN_USERNAME: str = "admin"
@@ -45,10 +47,9 @@ class Settings(BaseSettings):
     ROTOR_MINDAGENT_MCP_COMMAND: str | None = None
     ROTOR_MINDAGENT_MCP_ARGS: list[str] = Field(default_factory=list)
     ROTOR_MINDAGENT_MCP_CWD: str | None = None
-    # Database
+    # Database. This release runs the startup migration path against a
+    # file-backed SQLite database only; other drivers are rejected at startup.
     DATABASE_URL: str = f"sqlite+aiosqlite:///{DEFAULT_CACHE_DIR / 'rotor.db'}"
-    # For PostgreSQL use:
-    # DATABASE_URL: str = "postgresql+asyncpg://user:password@localhost/rotor"
 
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:8000"]

@@ -19,14 +19,16 @@ separately authenticated read-only Control API, and an independent
   and usage data across OpenAI Chat, Responses, and Anthropic Messages.
 - **Multi-channel routing**: channel selection by model, protocol, priority,
   weight, and runtime state, with fallback, conversation affinity, and adaptive
-  scoring.
+  scoring; same-protocol channels are preferred (configurable), and requests
+  needing native semantics are never silently downgraded.
 - **Observability**: request logs, individual channel attempts, normalized
-  errors, latency, token usage, and cached tokens, exposed through the admin UI.
+  errors, latency, token usage, and cached tokens; the admin **Monitoring** page
+  shows process-local performance samples, client sources, and incremental
+  reconciliation.
 - **Administration and diagnostics**: manage channels and user tokens in the
   admin UI; expose read-only diagnostic facts to MCP, CLIs, and automation
   through the Control API.
-- **Local-first storage**: SQLite by default, with PostgreSQL support and local
-  conversation storage.
+- **Local-first storage**: file-backed SQLite, with local conversation storage.
 
 ## How it works
 
@@ -55,7 +57,7 @@ image does not bundle or automatically start the MCP server.
 ### Requirements
 
 - Python 3.11 or later
-- SQLite (default) or PostgreSQL
+- SQLite (this release supports file-backed SQLite only)
 
 ### Install and run
 
@@ -116,18 +118,17 @@ The image stores SQLite at `/data/rotor.db`, the conversation store under
 `/data/conversations/`, and runtime logs under `/data/logs/` by default. The
 single mount above persists all of them under `~/.cache/rotor/` on the host.
 
-Run Rotor and PostgreSQL with Docker Compose:
+Run Rotor with Docker Compose and keep runtime data in `./data`:
 
 ```bash
 docker compose up --build -d
 docker compose logs -f rotor
 ```
 
-The repository Compose file uses development database credentials and exposes
-the PostgreSQL port; change both before production deployment. Compose uses a
-PostgreSQL volume for the primary database and mounts conversations and runtime
-logs under `./data/` on the host. The current Docker configuration runs
-Rotor only. `rotor-mcp` is intended to use a separate image.
+The repository Compose file uses SQLite, binds the port to `127.0.0.1` only, and
+mounts the database, conversation store, and runtime logs under `./data/` on the
+host. The current Docker configuration runs Rotor only. `rotor-mcp` is intended
+to use a separate image.
 
 ## Make your first request
 
@@ -184,9 +185,10 @@ Claude Code, and OpenCode configuration.
 | OpenAI Chat | `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` and Response resource endpoints |
 | OpenAI Images | `POST /v1/images/generations` |
-| Anthropic | `POST /anthropic/v1/messages`, `POST /anthropic/v1/messages/count_tokens` |
+| Anthropic | `POST /anthropic/v1/messages`, `POST /anthropic/v1/messages/count_tokens`, `GET /anthropic/v1/models` |
 | Models | `GET /v1/models` |
 | Admin API | `/api/admin/channels`, `/api/admin/tokens`, `/api/admin/logs`, `/api/admin/settings` |
+| Monitoring | `/api/admin/monitoring/sources`, `/api/admin/monitoring/performance`, `/api/admin/monitoring/reconciliation` |
 | Control API | `/api/control/v1/channels`, request traces, recent failures, model usage, and Session Lease evaluation |
 
 The Responses API supports creation, retrieval, cancellation, deletion, input
@@ -205,9 +207,15 @@ Rotor currently provides:
 - `adaptive`: dynamically score channels within the same priority using
   success rate, latency, and current load.
 
+Candidate generation is then bounded by two more rules: capability filtering
+(hard) drops channels that cannot express the request semantics, and
+`routing.protocol_affinity_enabled` (on by default) orders same-family channels
+ahead of the ones that require protocol conversion. Requests needing native
+Responses or Anthropic semantics are never silently downgraded.
+
 Inspect and update runtime settings through `GET/PUT /api/admin/settings`.
-Adaptive statistics are process-local and relearned after restart, while
-request outcomes and routing decisions are persisted.
+Adaptive statistics and channel cooldowns are process-local and relearned after
+restart, while request outcomes and routing decisions are persisted.
 
 ## Control API, MCP, and MindAgent
 
@@ -240,10 +248,11 @@ database-backed `rck_` credential under **API Keys → MCP Control Keys**. The
 full value is shown only once, can be disabled or deleted independently, and
 does not accept ordinary `sk-` user tokens.
 
-The MindAgent chat in the admin UI can run independently. It loads Rotor MCP
-diagnostic tools only when an MCP command and Control token are configured.
-Its local conversation history can be created, exported as JSON, or deleted
-from the sidebar.
+The MindAgent chat in the admin UI is powered by the MindAgent library
+(`mindagent==0.5.3`, installed with Rotor) and can run independently. Loading
+the Rotor MCP diagnostic tools additionally requires `rotor-gateway[mcp]`, an
+MCP command, and a Control token. Its local conversation history can be
+created, exported as JSON, or deleted from the sidebar.
 
 ## Important configuration
 
@@ -283,9 +292,15 @@ Read [Security boundaries](gitbook/operations/security.md) before deployment.
 ## Development and tests
 
 ```bash
-python -m pip install -r requirements.txt
 python -m pip install -e .
+python -m pip install pytest pytest-asyncio openai anthropic
 pytest -q
+```
+
+Frontend tests use Node:
+
+```bash
+node --experimental-vm-modules --test tests/test_*.mjs
 ```
 
 MCP tests:
@@ -304,7 +319,6 @@ More documentation:
 - [Routing and fallback](gitbook/concepts/routing-and-fallback.md)
 - [Logs, usage, and storage](gitbook/operations/observability.md)
 - [Database migrations](gitbook/development/database-migrations.md)
-- [Project roadmap](docs/roadmap.md)
 
 ## License
 

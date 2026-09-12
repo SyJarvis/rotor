@@ -45,8 +45,8 @@ Adapter 封装上游 URL、鉴权头、模型映射、请求格式和流式响�
 
 ## 状态层
 
-默认数据库为 SQLite，也可使用 PostgreSQL。关系数据库保存渠道、Token、日志、
-usage ledger、路由决策和 Responses 归属；会话正文由异步 ConversationStore
-写入文件系统。
+当前版本使用文件型 SQLite；关系数据库保存渠道、Token、日志、usage ledger、路由决策
+和 Responses 归属，会话正文由异步 ConversationStore 写入文件系统。启动迁移路径只
+接受 SQLite，其他 `DATABASE_URL` 会在启动阶段明确报错。
 
 下一步可以分别阅读[协议兼容与转换](protocols.md)和[记账、会话与状态](accounting-and-state.md)。

@@ -151,9 +151,19 @@ async def get_db() -> AsyncSession:
 
 async def init_db():
     """Migrate the database and ensure the default administrator exists."""
-    from rotor.migrations.runner import run_startup_migrations
+    from rotor.migrations.runner import (
+        UnsupportedDatabaseError,
+        run_startup_migrations,
+    )
 
-    await asyncio.to_thread(run_startup_migrations, settings.DATABASE_URL)
+    try:
+        await asyncio.to_thread(run_startup_migrations, settings.DATABASE_URL)
+    except UnsupportedDatabaseError as error:
+        logger.error(
+            "Refusing to start: DATABASE_URL is not usable by this release (%s)",
+            error,
+        )
+        raise
 
     from rotor.core.admin_auth import ensure_default_admin
 

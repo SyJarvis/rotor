@@ -10,8 +10,9 @@ from starlette.exceptions import HTTPException
 
 from rotor.core.exceptions import (
     UpstreamOverloaded, UpstreamProtocolError,
-    classify_error_status, general_exception_handler,
+    classify_error_status,
 )
+from rotor.core.openai_errors import openai_error_response
 
 
 def is_anthropic_request(request) -> bool:
@@ -86,4 +87,4 @@ async def protocol_validation_exception_handler(request, exc):
 async def protocol_upstream_exception_handler(request, exc):
     if is_anthropic_request(request):
         return anthropic_error_response(request, exc)
-    return await general_exception_handler(request, exc)
+    return openai_error_response(exc)

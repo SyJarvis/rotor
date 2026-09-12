@@ -23,6 +23,11 @@ curl -b "$ROTOR_ADMIN_COOKIE_JAR" \
 | `weighted` | 忽略优先级，按权重生成候选顺序 |
 | `adaptive` | 不跨越优先级层，在层内根据成功率、延迟、负载和成本信号评分 |
 
+排序之后还有一层**协议亲和**软分层：`protocol_affinity_enabled`（默认开启）把与
+请求同协议族的渠道排在需要协议转换的渠道之前，组内保持策略顺序。它不替代优先级、
+权重或 adaptive；关掉它会保留策略排序与租约置顶。需要原生 Responses 或 Anthropic
+语义的请求由能力过滤（硬条件）排除不兼容渠道，不受该开关影响。
+
 Tariff 与费用事实已经可以记录，但尚未经过 Session Lease 和真实流量验证，因此
 adaptive 的成本信号仍保持中性，不会因为峰谷价逐请求切换渠道。
 
@@ -41,7 +46,8 @@ curl -X PUT -b "$ROTOR_ADMIN_COOKIE_JAR" \
       "strategy": "adaptive",
       "affinity_enabled": true,
       "session_lease_enabled": true,
-      "session_lease_idle_ttl_seconds": 900,
+      "session_lease_idle_ttl_seconds": 1800,
+      "protocol_affinity_enabled": true,
       "adaptive_success_weight": 0.55,
       "adaptive_latency_weight": 0.25,
       "adaptive_cost_weight": 0.10,
@@ -72,7 +78,7 @@ Session 可以来自显式 `X-Conversation-Id` / `X-Rotor-Session-Id`，也可�
 渠道仍健康且兼容时优先使用。只有成功的上游请求才 assigned/renewed 租约；fallback
 成功后迁移到实际成功渠道，因此旧渠道 cooldown 结束也不会立即抢回活跃 Session。
 
-默认 `session_lease_idle_ttl_seconds=900`，范围为 60–86400 秒。Channel `extra` 可用
+默认 `session_lease_idle_ttl_seconds=1800`，范围为 60–86400 秒。Channel `extra` 可用
 `session_lease_idle_ttl_seconds` 覆盖渠道值，或用
 `session_lease_idle_ttl_by_model` 对 logical model 和 `*` 配置。它是路由空闲 TTL，
 不是 provider cache TTL。

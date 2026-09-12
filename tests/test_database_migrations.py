@@ -9,6 +9,7 @@ from sqlalchemy import MetaData, Text, create_engine, inspect, text
 from rotor.database import Base, _ensure_usage_fact_columns
 from rotor.migrations.runner import (
     LegacyDatabaseError,
+    UnsupportedDatabaseError,
     run_startup_migrations,
 )
 import rotor.main  # noqa: F401  # Register every model in Base.metadata.
@@ -332,3 +333,14 @@ def test_startup_migrations_reject_unknown_legacy_schema(
         assert "alembic_version" not in inspect(connection).get_table_names()
     engine.dispose()
     assert list(tmp_path.glob("unknown.db.pre-alembic-*.bak")) == []
+
+
+def test_startup_migrations_reject_non_sqlite_driver(tmp_path: Path) -> None:
+    """A non-SQLite URL must fail clearly instead of skipping the schema."""
+    with pytest.raises(UnsupportedDatabaseError, match="SQLite only"):
+        run_startup_migrations("postgresql+asyncpg://rotor:rotor@127.0.0.1:5432/rotor")
+
+
+def test_startup_migrations_reject_in_memory_sqlite() -> None:
+    with pytest.raises(UnsupportedDatabaseError, match="file-backed"):
+        run_startup_migrations("sqlite+aiosqlite:///:memory:")

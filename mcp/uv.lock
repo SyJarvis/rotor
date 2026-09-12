@@ -371,6 +371,15 @@ wheels = [
 ]
 
 [[package]]
+name = "mindagent"
+version = "0.5.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f9/55/fa80a12c6ffad1f5cda554f0ea082c2081dd39c79350d28492c867f2be00/mindagent-0.5.3.tar.gz", hash = "sha256:28cbc16888f26e12ab0863c590eb5a7a4f2ef65d83ef2e1033c158a18beca21d", size = 170554, upload-time = "2026-09-09T03:26:51.926Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2f/f2/65c92a0e84186da0d8dc2ac446af95a07e3da94538729619654ea447f582/mindagent-0.5.3-py3-none-any.whl", hash = "sha256:6ebe2eeaedb2e376065826cf76f873ac6e3aee5e0b73beb566ef299a14ca5239", size = 192545, upload-time = "2026-09-09T03:26:53.535Z" },
+]
+
+[[package]]
 name = "opentelemetry-api"
 version = "1.44.0"
 source = { registry = "https://pypi.org/simple" }
@@ -645,6 +654,7 @@ dependencies = [
 
 [package.optional-dependencies]
 test = [
+    { name = "mindagent" },
     { name = "pytest" },
 ]
 
@@ -652,6 +662,7 @@ test = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "mcp", specifier = ">=2,<3" },
+    { name = "mindagent", marker = "extra == 'test'", specifier = "==0.5.3" },
     { name = "pydantic-settings", specifier = ">=2.1,<3" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8,<9" },
 ]

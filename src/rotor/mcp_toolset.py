@@ -1,18 +1,25 @@
+"""MCP client adapter that exposes an allowlisted server tool set.
+
+Rotor starts the Rotor MCP Server as a stdio child process and hands the
+resulting tools to MindAgent.  The adapter owns the connection for the whole
+chat run and closes it when the registry is closed.
+"""
+
 from __future__ import annotations
 
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
-from .base import BaseTool, ToolContext, ToolDefinition
+from mindagent.tools import BaseTool, ToolContext, ToolDefinition
 
 
 class MCPConnectionError(RuntimeError):
-    pass
+    """The MCP client or server connection could not be established."""
 
 
 class MCPToolCallError(RuntimeError):
-    pass
+    """A remote MCP tool reported a failure."""
 
 
 class MCPToolSet:
@@ -46,7 +53,7 @@ class MCPToolSet:
             from mcp import Client, StdioServerParameters, stdio_client
         except (ImportError, AttributeError) as exc:
             raise MCPConnectionError(
-                "MindAgent MCP Client 未安装；请安装 rotor-gateway[mcp]"
+                "MCP 客户端未安装；请安装 rotor-gateway[mcp]"
             ) from exc
 
         parameters = StdioServerParameters(
@@ -97,9 +104,7 @@ class MCPToolSet:
         result = await self._client.call_tool(name, arguments)
         if result.is_error:
             message = self._error_text(result.content)
-            raise MCPToolCallError(
-                f"MCP tool {name} failed: {message}"
-            )
+            raise MCPToolCallError(f"MCP tool {name} failed: {message}")
         if result.structured_content is not None:
             return result.structured_content
         return {
@@ -152,10 +157,7 @@ class MCPTool(BaseTool):
         arguments: dict[str, Any],
         context: ToolContext,
     ) -> Any:
-        return await self._owner.call_tool(
-            self.definition.name,
-            arguments,
-        )
+        return await self._owner.call_tool(self.definition.name, arguments)
 
     async def close(self) -> None:
         await self._owner.close()

@@ -6,6 +6,7 @@
 
 - 新增 [上游完整性校验](src/rotor/adapters/protocol/openai_integrity.py) 与 [Anthropic 完整性校验](src/rotor/adapters/protocol/anthropic_integrity.py)：在返回结果与流式事件上校验完成状态、截断与业务错误，替代原先仅按 HTTP 状态判断的做法。
 - 新增 [协议错误外壳](src/rotor/core/anthropic_errors.py)，[应用入口](src/rotor/main.py) 注册对应异常处理器；错误响应不再泄漏校验输入。
+- 新增 [OpenAI 协议错误外壳](src/rotor/core/openai_errors.py)：OpenAI 兼容调用失败时返回结构化错误，保留上游状态码、请求 ID 与脱敏响应体，并按类映射状态；不再统一降级为 500。管理网页聊天展示同一份上游诊断信息，回归见 [test_openai_error_envelope.py](tests/test_openai_error_envelope.py)、[test_mindagent_chat.py](tests/test_mindagent_chat.py)。
 - [异常归一](src/rotor/core/exceptions.py) 补充 `Retry-After` 解析与失败分类，回归见 [test_retry_after.py](tests/test_retry_after.py)、[test_openai_response_integrity.py](tests/test_openai_response_integrity.py)、[test_anthropic_response_integrity.py](tests/test_anthropic_response_integrity.py)。
 
 ### 路由能力约束与尝试准入
@@ -25,7 +26,7 @@
 - 新增 [超大事件解析器](src/rotor/core/_response_event.py)，在 64 KiB 上限内识别完成、失败与不完整终态，修复较长输出被误判为失败的问题。
 - 新增 [管理监控 API](src/rotor/api/admin/monitoring.py) 与管理网页「监控 → 性能 / 会话来源」页面（[performance.js](src/rotor/frontend/pages/performance.js)、[monitoring.js](src/rotor/frontend/pages/monitoring.js)）。
 - 回归见 [test_gateway_metrics.py](tests/test_gateway_metrics.py)、[test_database_metrics.py](tests/test_database_metrics.py)、[test_performance_monitoring.py](tests/test_performance_monitoring.py)、[test_admin_monitoring.py](tests/test_admin_monitoring.py)。
-- 边界与读法见 [性能优化与监控总结](docs/2026-09-09-性能优化与监控总结.md)；性能计数属于单进程，不能视为全局汇总。
+- 性能计数属于单进程，不能视为全局汇总。
 
 ### 数据库与记账
 
@@ -50,9 +51,15 @@
 - 版本提升至 `0.5.1`（[pyproject.toml](pyproject.toml)、[__init__.py](src/rotor/__init__.py)）；容器基础镜像改为 `python:3.12-slim`。
 - 递增入口缓存版本：`index.html` 的 `config.js?v=30`、`auth.js?v=11`；`app.js` 动态加载的 `monitoring.js?v=6`。
 
+### 打包与依赖
+
+- 移除仓库内自带的 `mindagent` 副本，改为依赖已发布的 `mindagent==0.5.3`（精确固定）；wheel 顶层包因此只剩 `rotor`，不再有第二个可被 `pip` 覆盖的顶层导入名。
+- 新增 [MCP 客户端](src/rotor/mcp_toolset.py)：Rotor 自己持有 MCP Client（基于官方 MCP SDK），管理页聊天在安装 `rotor-gateway[mcp]` 后仍可加载 Rotor MCP 诊断工具，回归见 [test_mcp_toolset.py](tests/test_mcp_toolset.py)。
+- 同步 `uv.lock`：补入 `mindagent 0.5.3`，并把 `rotor-gateway` 版本从 `0.5.0` 修正为 `0.5.1`。
+
 ### 验证
 
-- 全量测试：`pytest -q` 1485 passed、6 subtests passed、13 项既有弃用警告。
+- 全量测试：`pytest -q` 1509 passed、6 subtests passed、13 项既有弃用警告。
 - 前端测试：`node --experimental-vm-modules` 运行 4 个 `tests/*.mjs`，14 passed、0 fail。
 - `git diff --check` 通过。
 
