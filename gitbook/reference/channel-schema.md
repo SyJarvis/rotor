@@ -42,6 +42,17 @@ Channel 是路由和上游适配的主要配置对象。
 
 未配置路径和认证方式时，Rotor 使用 provider preset 和 `protocol` 推导默认值。
 
+`headers` 中的键和值都必须是非空字符串；这些请求头会覆盖 Rotor 生成的同名上游请求头。例如需要 OpenCode
+coding plan 路由时，可按渠道配置会话标识：
+
+```json
+{
+  "headers": {
+    "x-opencode-session": "coding-plan-session"
+  }
+}
+```
+
 ### capabilities 可用值
 
 `extra.capabilities` 是**允许表**：未配置视为不限；一旦配置，只有列出的能力会被视为

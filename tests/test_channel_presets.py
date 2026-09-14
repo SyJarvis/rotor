@@ -43,6 +43,56 @@ def test_anthropic_defaults_and_headers() -> None:
     assert "Authorization" not in headers
 
 
+def test_provider_headers_allow_channel_specific_session_header() -> None:
+    headers = provider_headers(
+        key="secret",
+        auth_type="bearer",
+        extra_headers={"x-opencode-session": "coding-plan-session"},
+    )
+
+    assert headers["x-opencode-session"] == "coding-plan-session"
+
+
+def test_channel_schema_validates_extra_headers() -> None:
+    from pydantic import ValidationError
+    from rotor.schemas.channel import ChannelCreate
+
+    channel = ChannelCreate(
+        name="coding-plan",
+        type="openai",
+        base_url="https://provider.example",
+        key="secret",
+        extra={"headers": {"x-opencode-session": "session-1"}},
+    )
+    assert channel.extra["headers"]["x-opencode-session"] == "session-1"
+
+    try:
+        ChannelCreate(
+            name="invalid",
+            type="openai",
+            base_url="https://provider.example",
+            key="secret",
+            extra={"headers": {"x-opencode-session": 123}},
+        )
+    except ValidationError as exc:
+        assert "extra.headers" in str(exc)
+    else:
+        raise AssertionError("non-string channel header value must be rejected")
+
+    try:
+        ChannelCreate(
+            name="blank-header",
+            type="openai",
+            base_url="https://provider.example",
+            key="secret",
+            extra={"headers": {"x-opencode-session": "  "}},
+        )
+    except ValidationError as exc:
+        assert "extra.headers" in str(exc)
+    else:
+        raise AssertionError("blank channel header value must be rejected")
+
+
 def test_anthropic_protocol_keeps_non_anthropic_provider_auth() -> None:
     defaults = provider_defaults("zhipu", "anthropic")
 
