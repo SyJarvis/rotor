@@ -5,6 +5,28 @@ from datetime import datetime
 from rotor.core.resource_scopes import normalize_scope_config
 
 
+def _normalize_extra(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate channel-level provider overrides while preserving extensions."""
+    normalized = normalize_scope_config(value)
+    headers = normalized.get("headers")
+    if headers is None:
+        return normalized
+    if not isinstance(headers, dict):
+        raise ValueError("extra.headers must be an object")
+    if any(
+        not isinstance(name, str)
+        or not name.strip()
+        or not isinstance(header_value, str)
+        or not header_value.strip()
+        for name, header_value in headers.items()
+    ):
+        raise ValueError("extra.headers must map non-empty names to string values")
+    normalized["headers"] = {
+        name.strip(): header_value for name, header_value in headers.items()
+    }
+    return normalized
+
+
 class ChannelBase(BaseModel):
     """Base channel schema."""
     name: str = Field(..., min_length=1, max_length=100, description="Channel name")
@@ -29,7 +51,7 @@ class ChannelCreate(ChannelBase):
     @field_validator("extra")
     @classmethod
     def validate_resource_scopes(cls, value: Dict[str, Any]) -> Dict[str, Any]:
-        return normalize_scope_config(value)
+        return _normalize_extra(value)
 
 
 class ChannelUpdate(BaseModel):
@@ -55,7 +77,7 @@ class ChannelUpdate(BaseModel):
         cls,
         value: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        return normalize_scope_config(value) if value is not None else None
+        return _normalize_extra(value) if value is not None else None
 
 
 class ChannelResponse(ChannelBase):
