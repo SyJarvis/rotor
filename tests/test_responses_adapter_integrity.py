@@ -201,6 +201,23 @@ def test_late_error_withholds_terminal_but_preserves_verified_usage(mode, late):
     assert captured.value.upstream_status == 200
 
 
+@pytest.mark.parametrize("tail_type", [
+    "response.content_part.done",
+    "response.output_item.done",
+    "response.output_text.done",
+    "response.function_call_arguments.done",
+    "response.reasoning_summary_part.done",
+])
+def test_provider_lifecycle_events_after_terminal_are_ignored(tail_type):
+    events = [terminal(), {"type": tail_type}]
+    assert execute(mode="native", events=events) == [events[0]]
+
+
+def test_content_after_terminal_remains_invalid():
+    with pytest.raises(UpstreamProtocolError, match="after its terminal event"):
+        execute(mode="native", events=[terminal(), {"type": "response.output_text.delta", "delta": "late"}])
+
+
 def test_transport_error_after_terminal_keeps_usage_without_yielding_completion():
     class BrokenStream(httpx.AsyncByteStream):
         async def __aiter__(self):
