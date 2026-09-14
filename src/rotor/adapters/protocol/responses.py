@@ -24,6 +24,19 @@ from rotor.schemas.request import (
 )
 from rotor.schemas.responses import ResponsesRequest
 
+# Some Responses providers flush lifecycle ``*.done`` notifications after the
+# response terminal event.  They carry no additional response state and are
+# safe to discard, while content/error events must still fail the stream.
+_POST_TERMINAL_LIFECYCLE_EVENTS = frozenset(
+    {
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.output_text.done",
+        "response.function_call_arguments.done",
+        "response.reasoning_summary_part.done",
+    }
+)
+
 
 def _stringify(value: Any) -> str:
     if isinstance(value, str):
@@ -1055,8 +1068,6 @@ class OpenAIResponsesAdapter(BaseAdapter):
                     raise UpstreamProtocolError("Responses upstream returned an invalid SSE event")
                 if event_name and event_name != event["type"]:
                     raise UpstreamProtocolError("Responses SSE event name conflicts with payload type")
-                if pending_terminal is not None:
-                    raise UpstreamProtocolError("Responses stream contains events after its terminal event")
                 event_type = event["type"]
                 if event_type in {"error", "response.failed", "response.cancelled"} or event.get("error") is not None or event.get("success") is False:
                     message, error_type = self._stream_error_details(event, event_type)
@@ -1076,6 +1087,10 @@ class OpenAIResponsesAdapter(BaseAdapter):
                     error = _responses_protocol_error(message, payload)
                     error.error_type = error_type or "api_error"
                     raise error
+                if pending_terminal is not None:
+                    if event_type in _POST_TERMINAL_LIFECYCLE_EVENTS:
+                        continue
+                    raise UpstreamProtocolError("Responses stream contains events after its terminal event")
                 if event_type in {"response.completed", "response.incomplete"}:
                     native = validate_responses_response(event.get("response"))
                     if native["status"] != event_type.removeprefix("response."):
