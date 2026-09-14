@@ -25,7 +25,7 @@ from rotor.schemas.request import (
 from rotor.schemas.responses import ResponsesRequest
 
 # Some Responses providers flush lifecycle ``*.done`` notifications after the
-# response terminal event.  They carry no additional response state and are
+# response terminal event. They carry no additional response state and are
 # safe to discard, while content/error events must still fail the stream.
 _POST_TERMINAL_LIFECYCLE_EVENTS = frozenset(
     {
@@ -1091,7 +1091,14 @@ class OpenAIResponsesAdapter(BaseAdapter):
                     error.error_type = error_type or "api_error"
                     raise error
                 if pending_terminal is not None:
-                    if event_type in _POST_TERMINAL_LIFECYCLE_EVENTS:
+                    if (
+                        event_type in _POST_TERMINAL_LIFECYCLE_EVENTS
+                        or (
+                            event_type.startswith("response.")
+                            and event_type.endswith(".done")
+                            and event_type not in {"response.completed", "response.incomplete"}
+                        )
+                    ):
                         continue
                     raise UpstreamProtocolError("Responses stream contains events after its terminal event")
                 if event_type in {"response.completed", "response.incomplete"}:
