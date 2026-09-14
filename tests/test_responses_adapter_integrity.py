@@ -207,6 +207,9 @@ def test_late_error_withholds_terminal_but_preserves_verified_usage(mode, late):
     "response.output_text.done",
     "response.function_call_arguments.done",
     "response.reasoning_summary_part.done",
+    "response.reasoning_summary_text.done",
+    "response.audio.done",
+    "response.refusal.done",
 ])
 def test_provider_lifecycle_events_after_terminal_are_ignored(tail_type):
     events = [terminal(), {"type": tail_type}]

@@ -34,6 +34,9 @@ _POST_TERMINAL_LIFECYCLE_EVENTS = frozenset(
         "response.output_text.done",
         "response.function_call_arguments.done",
         "response.reasoning_summary_part.done",
+        "response.reasoning_summary_text.done",
+        "response.audio.done",
+        "response.refusal.done",
     }
 )
 
