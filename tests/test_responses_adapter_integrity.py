@@ -191,7 +191,13 @@ def test_stream_invalid_or_missing_terminal_fails(mode, body):
 
 
 @pytest.mark.parametrize("mode", ["chat", "native"])
-@pytest.mark.parametrize("late", ["data: {bad json\n\n", sse([{"type": "error", "message": "late failure"}]), sse([terminal()])])
+@pytest.mark.parametrize("late", [
+    "data: {bad json\n\n",
+    sse([{"type": "error", "message": "late failure"}]),
+    # An exact duplicate terminal is tolerated provider noise; only a
+    # conflicting one stays a late protocol failure.
+    sse([terminal(result("completed", id="resp-other"))]),
+])
 def test_late_error_withholds_terminal_but_preserves_verified_usage(mode, late):
     observed = []
     with pytest.raises(UpstreamProtocolError) as captured:
@@ -220,6 +226,47 @@ def test_provider_lifecycle_events_after_terminal_are_ignored(tail_type):
 def test_content_after_terminal_remains_invalid():
     with pytest.raises(UpstreamProtocolError, match="after its terminal event"):
         execute(mode="native", events=[terminal(), {"type": "response.output_text.delta", "delta": "late"}])
+
+
+@pytest.mark.parametrize("mode", ["chat", "native"])
+def test_ping_heartbeat_after_terminal_is_ignored(mode):
+    ping = {"type": "ping", "cost": "0"}
+    events = [terminal(), ping]
+    converted = execute(mode=mode, events=events)
+    assert len(converted) == 1
+    if mode == "native":
+        assert converted == [events[0]]
+    else:
+        assert converted[0]["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.parametrize("mode", ["chat", "native"])
+def test_ping_heartbeat_before_terminal_is_ignored(mode):
+    ping = {"type": "ping", "cost": "0"}
+    event = terminal()
+    converted = execute(mode=mode, events=[ping, event])
+    assert len(converted) == 1
+    if mode == "native":
+        assert converted == [event]
+    else:
+        assert converted[0]["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.parametrize("mode", ["chat", "native"])
+def test_duplicate_matching_terminal_is_ignored(mode):
+    event = terminal()
+    converted = execute(mode=mode, events=[event, deepcopy(event)])
+    if mode == "native":
+        assert converted == [event]
+    else:
+        assert len(converted) == 1
+        assert converted[0]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_duplicate_conflicting_terminal_is_invalid():
+    conflicting = terminal(result("completed", id="resp-other"))
+    with pytest.raises(UpstreamProtocolError, match="conflicting terminal"):
+        execute(mode="native", events=[terminal(), conflicting])
 
 
 def test_transport_error_after_terminal_keeps_usage_without_yielding_completion():

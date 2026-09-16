@@ -1090,7 +1090,24 @@ class OpenAIResponsesAdapter(BaseAdapter):
                     error = _responses_protocol_error(message, payload)
                     error.error_type = error_type or "api_error"
                     raise error
+                # Provider-specific heartbeat (e.g. opencode-go
+                # {"type":"ping","cost":"0"} after response.completed).
+                # Carries no response state: never forward, never count usage.
+                if event_type == "ping":
+                    continue
                 if pending_terminal is not None:
+                    if event_type in {"response.completed", "response.incomplete"}:
+                        native = validate_responses_response(event.get("response"))
+                        first_native = pending_terminal.get("response") or {}
+                        if (
+                            native.get("status") != first_native.get("status")
+                            or native.get("status") != event_type.removeprefix("response.")
+                            or native.get("id") != first_native.get("id")
+                        ):
+                            raise UpstreamProtocolError(
+                                "Responses stream contains a conflicting terminal event"
+                            )
+                        continue
                     if (
                         event_type in _POST_TERMINAL_LIFECYCLE_EVENTS
                         or (
