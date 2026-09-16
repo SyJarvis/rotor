@@ -47,6 +47,23 @@ def _stringify(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+# Client headers that carry routing/protocol intent for a native Responses
+# upstream (Codex sends originator/session_id/conversation_id). Only these
+# ever reach the upstream; credentials stay channel-owned.
+_FORWARDED_RESPONSES_HEADERS = frozenset(
+    {"originator", "session_id", "conversation_id", "openai-beta", "user-agent"}
+)
+
+
+def forwarded_responses_headers(headers) -> dict[str, str]:
+    """Pick the allowlisted client headers a native Responses relay keeps."""
+    return {
+        name: value
+        for name in _FORWARDED_RESPONSES_HEADERS
+        if (value := headers.get(name))
+    }
+
+
 def _supports_gpt56_prompt_cache(model: str) -> bool:
     normalized = model.strip().lower()
     return normalized == "gpt-5.6" or normalized.startswith("gpt-5.6-")
@@ -1021,6 +1038,15 @@ class OpenAIResponsesAdapter(BaseAdapter):
         headers = self.build_request_headers()
         if request.stream:
             headers["accept"] = "text/event-stream"
+        if request.responses_payload is not None:
+            # Native Responses-to-Responses relay: keep the client's routing
+            # headers, but only the allowlisted ones (the field can also be
+            # set on converted requests, which must not relay anything).
+            headers.update({
+                name: value
+                for name, value in (request.responses_headers or {}).items()
+                if name.lower() in _FORWARDED_RESPONSES_HEADERS
+            })
         return headers
 
     async def convert_request(self, request: ChatCompletionRequest) -> dict[str, Any]:

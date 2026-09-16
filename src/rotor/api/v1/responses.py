@@ -20,6 +20,7 @@ from rotor.adapters.factory import AdapterFactory
 from rotor.adapters.protocol.responses import (
     OpenAIResponsesAdapter,
     chat_response_to_responses,
+    forwarded_responses_headers,
     responses_required_capabilities,
     responses_request_to_chat,
     unsupported_chat_reasoning_fields,
@@ -399,6 +400,7 @@ async def create_response(
 ):
     """Minimal OpenAI Responses API-compatible endpoint."""
     chat_request = responses_request_to_chat(request)
+    chat_request.responses_headers = forwarded_responses_headers(http_request.headers)
 
     previous_route = None
     if request.previous_response_id:

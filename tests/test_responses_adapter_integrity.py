@@ -10,6 +10,7 @@ from rotor.adapters.factory import AdapterFactory
 from rotor.adapters.protocol.responses import (
     chat_response_to_responses,
     extract_responses_usage,
+    forwarded_responses_headers,
     validate_responses_response,
 )
 from rotor.core.exceptions import UpstreamOverloaded, UpstreamProtocolError
@@ -35,13 +36,16 @@ def sse(events):
     return "".join(f"data: {json.dumps(event)}\n\n" for event in events)
 
 
-def execute(payload=None, *, mode="chat", events=None, body=None, source=None, observed=None):
+def execute(payload=None, *, mode="chat", events=None, body=None, source=None, observed=None,
+            sent=None, responses_headers=None):
     streaming = events is not None or body is not None or source is not None
     request = ChatCompletionRequest(model="model", messages=[{"role": "user", "content": "hello"}], stream=streaming)
     if mode == "native":
         request.responses_payload = {"model": "model", "input": "hello", "stream": streaming}
     elif mode == "anthropic":
         request.anthropic_payload = {"model": "model", "max_tokens": 16, "messages": []}
+    if responses_headers is not None:
+        request.responses_headers = responses_headers
     channel = SimpleNamespace(
         id=1, type="openai", protocol="openai_responses", name="responses",
         base_url="https://provider.invalid/v1", key="mock-provider-secret", extra={},
@@ -51,6 +55,8 @@ def execute(payload=None, *, mode="chat", events=None, body=None, source=None, o
     def upstream(http_request):
         assert http_request.url.path == "/v1/responses"
         assert json.loads(http_request.content)["model"] == "provider-model"
+        if sent is not None:
+            sent.append(http_request)
         if source is not None:
             return httpx.Response(200, stream=source)
         if streaming:
@@ -267,6 +273,47 @@ def test_duplicate_conflicting_terminal_is_invalid():
     conflicting = terminal(result("completed", id="resp-other"))
     with pytest.raises(UpstreamProtocolError, match="conflicting terminal"):
         execute(mode="native", events=[terminal(), conflicting])
+
+
+def test_native_responses_relays_allowlisted_client_headers():
+    sent = []
+    execute(mode="native", events=[terminal()], sent=sent, responses_headers={
+        "originator": "codex_cli_rs",
+        "session_id": "sess-123",
+        "openai-beta": "responses=experimental",
+        # Not allowlisted: must never reach the upstream.
+        "authorization": "Bearer client-side-key",
+        "x-injected": "nope",
+    })
+    headers = sent[0].headers
+    assert headers["authorization"] == "Bearer mock-provider-secret"
+    assert headers["originator"] == "codex_cli_rs"
+    assert headers["session_id"] == "sess-123"
+    assert headers["openai-beta"] == "responses=experimental"
+    assert "x-injected" not in headers
+
+
+def test_converted_chat_requests_do_not_relay_client_headers():
+    sent = []
+    execute(events=[terminal()], sent=sent, responses_headers={
+        "originator": "codex_cli_rs",
+    })
+    assert "originator" not in sent[0].headers
+
+
+def test_forwarded_responses_headers_picks_only_allowlisted_entries():
+    picked = forwarded_responses_headers({
+        "originator": "codex_cli_rs",
+        "session_id": "sess-123",
+        "user-agent": "codex_cli_rs/0.154.0",
+        "authorization": "Bearer nope",
+        "x-other": "dropped",
+    })
+    assert picked == {
+        "originator": "codex_cli_rs",
+        "session_id": "sess-123",
+        "user-agent": "codex_cli_rs/0.154.0",
+    }
 
 
 def test_transport_error_after_terminal_keeps_usage_without_yielding_completion():
