@@ -105,6 +105,20 @@ def validate_chat_response(payload, *, expected_choices=None, upstream_status=No
     return payload
 
 
+def _carries_stream_content(delta):
+    """A role-only echo carries no response content.
+
+    OpenRouter's usage tail repeats {"content":"","role":"assistant"} with the
+    finish reason after the terminal chunk; only a real payload makes a delta
+    meaningful once a choice has finished.
+    """
+    return any(
+        value not in (None, "", [], {})
+        for key, value in delta.items()
+        if not (key == "role" and value == "assistant")
+    )
+
+
 class ChatStreamIntegrity:
     def __init__(self, *, expected_choices=None, upstream_status=None, secret=None):
         self.expected_choices = expected_choices
@@ -144,7 +158,7 @@ class ChatStreamIntegrity:
                 delta = {}
             if not isinstance(delta, dict):
                 self._fail("Invalid Chat stream delta")
-            if self.choices.get(index) is not None and any(value not in (None, "", [], {}) for value in delta.values()):
+            if self.choices.get(index) is not None and _carries_stream_content(delta):
                 self._fail("Chat content followed a choice finish reason")
             finish_reason = choice.get("finish_reason")
             if finish_reason is not None:

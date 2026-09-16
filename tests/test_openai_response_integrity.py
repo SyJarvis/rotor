@@ -306,6 +306,24 @@ def test_stream_content_or_conflicting_finish_after_terminal_is_invalid(late):
         state.feed(late)
 
 
+def test_openrouter_role_echo_after_finish_is_tolerated_and_usage_kept():
+    # Captured from api.commandcode.ai (OpenRouter): every delta repeats
+    # {"role":"assistant"}, and the usage tail lands in a final chunk whose
+    # delta repeats the role after finish_reason was already sent.
+    reasoning = chunk(delta={"content": "", "role": "assistant", "reasoning": "thinking"})
+    answer = chunk(delta={"content": "ok", "role": "assistant"})
+    finish = chunk(delta={"content": "", "role": "assistant", "reasoning": None}, finish="stop")
+    usage = {"choices": [{"index": 0, "delta": {"content": "", "role": "assistant"}, "finish_reason": "stop"}],
+             "usage": USAGE}
+    body = wire([reasoning, answer, finish, usage]) + "data: [DONE]\n\n"
+    result = asyncio.run(convert("openai", body, stream=True))
+    state = ChatStreamIntegrity(expected_choices=1, upstream_status=200)
+    for event in result:
+        state.feed(event)
+    state.finish()
+    assert state.provider_usage == USAGE
+
+
 def test_data_after_done_is_invalid_even_if_choices_finished():
     body = wire([chunk(finish="stop")]) + "data: [DONE]\n\n" + wire([chunk(finish="stop")])
     with pytest.raises(UpstreamProtocolError, match=r"after \[DONE\]"):
