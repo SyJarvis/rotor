@@ -312,6 +312,38 @@ def test_data_after_done_is_invalid_even_if_choices_finished():
         asyncio.run(convert("zhipu", body, stream=True))
 
 
+@pytest.mark.parametrize("tail", [
+    'data: {"choices":[],"cost":"0"}\n\n',  # opencode-go-chat captured trailing noise
+    'data: {"type":"ping","cost":"0"}\n\n',
+    "data: [DONE]\n\n",
+])
+def test_inert_tail_after_done_is_tolerated_and_stream_stays_complete(tail):
+    first = chunk(delta={"content": "ok"})
+    finish = chunk(finish="stop")
+    usage = {"choices": [], "usage": USAGE}
+    body = wire([first, finish, usage]) + "data: [DONE]\n\n" + tail
+    result = asyncio.run(convert("zhipu", body, stream=True))
+    assert result == [first, finish, usage]
+    state = ChatStreamIntegrity(expected_choices=1, upstream_status=200)
+    for event in result:
+        state.feed(event)
+    state.finish()
+    assert state.provider_usage == USAGE
+
+
+@pytest.mark.parametrize("tail", [
+    'data: {"choices":[{"index":0,"delta":{"content":"late"},"finish_reason":null}]}\n\n',
+    'data: {"error":{"message":"boom"}}\n\n',
+    'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}\n\n',
+    "data:{broken}\n\n",
+])
+def test_meaningful_data_after_done_stays_a_protocol_error(tail):
+    body = wire([chunk(delta={"content": "ok"}, finish="stop")]) + "data: [DONE]\n\n" + tail
+    with pytest.raises(UpstreamProtocolError, match=r"after \[DONE\]") as caught:
+        asyncio.run(convert("zhipu", body, stream=True))
+    assert caught.value.upstream_status == 200
+
+
 def test_named_error_cannot_be_disguised_as_done():
     body = wire([chunk(delta={"content": "ok"}, finish="stop")]) + "event: error\ndata: [DONE]\n\n"
     with pytest.raises(UpstreamProtocolError, match="error event"):

@@ -163,6 +163,21 @@ class ChatStreamIntegrity:
             self._fail("Chat stream ended with an unexpected choice count")
 
 
+def _inert_after_done(raw):
+    """Trailing frames after [DONE] that carry no response state are provider noise."""
+    if raw.strip() == "[DONE]":
+        return True
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("error") is not None or payload.get("usage") is not None:
+        return False
+    return payload.get("choices") in (None, [])
+
+
 async def iter_chat_sse(response, *, secret=None):
     """Parse raw SSE strictly; completion/empty-retry policy belongs to callers."""
     status = response.status_code
@@ -184,6 +199,12 @@ async def iter_chat_sse(response, *, secret=None):
         nonlocal done
         raw = "\n".join(data)
         if done:
+            # Provider trailing noise (e.g. opencode-go sends
+            # {"choices":[],"cost":"0"} after [DONE]) carries no response
+            # state: silently skip it, but anything meaningful after the
+            # terminator stays a protocol violation.
+            if _inert_after_done(raw):
+                return None
             _fail("Chat stream contains data after [DONE]", upstream_status=status)
         if raw.strip() == "[DONE]":
             if event_name == "error":
