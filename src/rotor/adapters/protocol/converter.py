@@ -217,7 +217,7 @@ class ProtocolConverter:
         anthropic_request: Dict[str, Any] = {
             "model": request.model,
             "messages": messages,
-            "max_tokens": request.max_tokens or 4096,
+            "max_tokens": request.max_completion_tokens or request.max_tokens or 4096,
             "stream": request.stream or False,
         }
 
@@ -260,6 +260,16 @@ class ProtocolConverter:
                     }
                 else:
                     anthropic_request["tool_choice"] = request.tool_choice
+
+        # Map parallel_tool_calls=False onto Anthropic's closest semantic:
+        # disable parallel tool use. Anthropic allows parallel tools by
+        # default, so True or unset needs no field.
+        if request.parallel_tool_calls is False and request.tools and request.tool_choice != "none":
+            choice = anthropic_request.get("tool_choice")
+            if not isinstance(choice, dict):
+                choice = {"type": "auto"}
+            choice["disable_parallel_tool_use"] = True
+            anthropic_request["tool_choice"] = choice
 
         return anthropic_request
 

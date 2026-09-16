@@ -396,6 +396,32 @@ def chat_content_to_responses(content: Any) -> Any:
     return blocks
 
 
+def _chat_response_format_to_responses_text_format(
+    response_format: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Map a Chat ``response_format`` to a Responses ``text.format`` entry."""
+    if response_format is None:
+        return None
+    kind = response_format.get("type") if isinstance(response_format, dict) else None
+    if kind == "text":
+        # Responses defaults to plain text; no explicit format needed.
+        return None
+    if kind == "json_object":
+        return {"type": "json_object"}
+    if kind == "json_schema" and isinstance(response_format.get("json_schema"), dict):
+        schema_spec = response_format["json_schema"]
+        text_format: dict[str, Any] = {"type": "json_schema"}
+        # Chat nests name/schema/strict/description under "json_schema" while
+        # Responses expects them flattened next to "type".
+        for key in ("name", "schema", "strict", "description"):
+            if key in schema_spec:
+                text_format[key] = schema_spec[key]
+        return text_format
+    raise UpstreamProtocolError(
+        f"Chat response_format cannot be represented as a Responses text format: {response_format!r}"
+    )
+
+
 def chat_request_to_responses_payload(request: ChatCompletionRequest) -> dict[str, Any]:
     input_items: list[dict[str, Any]] = []
     for message in request.messages:
@@ -436,14 +462,22 @@ def chat_request_to_responses_payload(request: ChatCompletionRequest) -> dict[st
     optional = {
         "temperature": request.temperature,
         "top_p": request.top_p,
-        "max_output_tokens": request.max_tokens,
+        # max_completion_tokens is the newer Chat field; prefer it when the
+        # client sends both, mirroring upstream Chat semantics.
+        "max_output_tokens": request.max_completion_tokens or request.max_tokens,
         "tools": chat_tools_to_responses(request.tools),
         "tool_choice": chat_tool_choice_to_responses(request.tool_choice),
         "user": request.user,
+        # Responses accepts this natively; False must survive the is-not-None
+        # filter below just like None-free tools values.
+        "parallel_tool_calls": request.parallel_tool_calls,
     }
     payload.update({key: value for key, value in optional.items() if value is not None})
     if request.reasoning_effort is not None:
         payload["reasoning"] = {"effort": request.reasoning_effort}
+    text_format = _chat_response_format_to_responses_text_format(request.response_format)
+    if text_format is not None:
+        payload["text"] = {"format": text_format}
     return payload
 
 

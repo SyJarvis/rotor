@@ -432,6 +432,13 @@ class RoutingEngine:
             if protocol not in {"responses", "openai_responses"}:
                 return False
             remaining.remove("responses_native")
+        if "structured_output" in remaining:
+            # Chat response_format and Responses text.format both express
+            # JSON-object / JSON-schema structured output, so either protocol
+            # can serve it; Anthropic has no faithful equivalent.
+            if not (chat_protocol or protocol in _RESPONSES_PROTOCOLS):
+                return False
+            remaining.remove("structured_output")
         if protocol in {"responses", "openai_responses"}:
             # Declaring a native Responses channel means the upstream accepts
             # the Responses wire protocol, whose core contract includes

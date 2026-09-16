@@ -47,9 +47,14 @@ def _channel(channel_id, protocol, capabilities=None, provider_type="openai"):
         ({"stream": True, "messages": [{"role": "user", "content": [{
             "type": "image_url", "image_url": {"url": "https://image.example/a.png"},
         }]}]}, {"stream", "vision"}),
-        ({"response_format": {"type": "json_object"}}, {"openai_chat_native"}),
-        ({"parallel_tool_calls": False}, {"openai_chat_native"}),
-        ({"max_completion_tokens": 32}, {"openai_chat_native"}),
+        ({"max_completion_tokens": 32}, set()),
+        ({"parallel_tool_calls": False}, set()),
+        ({"response_format": {"type": "text"}}, set()),
+        ({"response_format": {"type": "json_object"}}, {"structured_output"}),
+        ({"response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}}}, {"structured_output"}),
+        ({"response_format": {"type": "json_object", "extra_vendor": True}}, {"structured_output"}),
+        ({"response_format": {"type": "vendor_custom"}}, {"openai_chat_native"}),
+        ({"response_format": {"type": "json_schema"}}, {"openai_chat_native"}),
         ({"messages": [{"role": "assistant", "content": "ok", "reasoning_content": "thought"}]}, {"openai_chat_native"}),
         ({"reasoning_effort": "high"}, {"reasoning_effort"}),
     ],
@@ -125,14 +130,19 @@ def test_missing_allow_list_preserves_compatibility(protocol):
 
 
 @pytest.mark.parametrize(
-    ("required", "expected_ids"),
-    [({"openai_chat_native"}, [1]), ({"anthropic_native"}, [2]), ({"reasoning_effort"}, [1, 3])],
+    ("required", "preferred", "expected_ids"),
+    [
+        ({"openai_chat_native"}, 3, [1]),
+        ({"anthropic_native"}, 3, [2]),
+        ({"reasoning_effort"}, 2, [1, 3]),
+        ({"structured_output"}, 2, [1, 3]),
+    ],
 )
-def test_protocol_guards_precede_protocol_affinity_and_lease(required, expected_ids):
+def test_protocol_guards_precede_protocol_affinity_and_lease(required, preferred, expected_ids):
     channels = [_channel(1, "openai"), _channel(2, "anthropic"), _channel(3, "openai_responses")]
     decision = RoutingEngine(strategy="fallback_order").route(
         channels, "model-a", required_capabilities=required,
-        preferred_channel_id=3 if "reasoning_effort" not in required else 2,
+        preferred_channel_id=preferred,
     )
     assert [channel.id for channel in decision.candidates] == expected_ids
     assert not decision.lease_used

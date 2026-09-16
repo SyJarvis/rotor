@@ -7,11 +7,21 @@ def chat_required_capabilities(request: ChatCompletionRequest) -> set[str]:
     required = {"stream"} if request.stream else set()
     if request.tools or request.tool_choice not in (None, "none", "auto"):
         required.add("function_call")
-    if any(
-        getattr(request, field, None) is not None
-        for field in ("response_format", "parallel_tool_calls", "max_completion_tokens")
-    ):
-        required.add("openai_chat_native")
+    # max_completion_tokens and parallel_tool_calls map losslessly onto both
+    # the Responses and Anthropic protocols, so they need no native capability.
+    # response_format is only portable for the shapes the cross-protocol
+    # converters implement; anything else stays on Chat-native channels.
+    if request.response_format is not None:
+        response_format = request.response_format
+        kind = response_format.get("type") if isinstance(response_format, dict) else None
+        if kind == "text":
+            pass
+        elif kind == "json_object":
+            required.add("structured_output")
+        elif kind == "json_schema" and isinstance(response_format.get("json_schema"), dict):
+            required.add("structured_output")
+        else:
+            required.add("openai_chat_native")
     if request.reasoning_effort is not None:
         required.add("reasoning_effort")
     for message in request.messages:

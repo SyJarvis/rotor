@@ -35,6 +35,13 @@ def anthropic_request(**fields):
     })
 
 
+def chat_request(**fields):
+    return ChatCompletionRequest.model_validate({
+        "model": "model",
+        "messages": [{"role": "user", "content": "hello"}], **fields,
+    })
+
+
 @pytest.mark.parametrize("protocol", ["responses", "openai_responses"])
 def test_stop_sequences_exclude_responses_even_when_configured_or_leased(protocol):
     request = anthropic_request(stop_sequences=["END"])
@@ -75,6 +82,50 @@ def test_stop_sequences_reach_supported_upstream_http(protocol, provider_type):
 @pytest.mark.parametrize("stop_sequences", [None, []])
 def test_absent_stop_sequences_do_not_block_responses(stop_sequences):
     assert anthropic_required_capabilities(anthropic_request(stop_sequences=stop_sequences)) == set()
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({"max_completion_tokens": 64}, 64),
+        ({"max_tokens": 32, "max_completion_tokens": 64}, 64),
+        ({"max_tokens": 32}, 32),
+    ],
+)
+def test_chat_token_limits_reach_responses_max_output_tokens(fields, expected):
+    payload = chat_request_to_responses_payload(chat_request(**fields))
+    assert payload["max_output_tokens"] == expected
+
+
+def test_chat_parallel_tool_calls_false_survives_responses_conversion():
+    payload = chat_request_to_responses_payload(chat_request(parallel_tool_calls=False))
+    assert payload["parallel_tool_calls"] is False
+
+
+def test_chat_response_format_json_object_reaches_responses_text_format():
+    payload = chat_request_to_responses_payload(chat_request(response_format={"type": "json_object"}))
+    assert payload["text"]["format"]["type"] == "json_object"
+
+
+def test_chat_response_format_json_schema_flattens_into_responses_text_format():
+    payload = chat_request_to_responses_payload(chat_request(response_format={
+        "type": "json_schema",
+        "json_schema": {"name": "x", "schema": {"type": "object"}, "strict": True},
+    }))
+    assert payload["text"]["format"] == {
+        "type": "json_schema", "name": "x",
+        "schema": {"type": "object"}, "strict": True,
+    }
+
+
+def test_chat_response_format_text_keeps_responses_default_omitted():
+    payload = chat_request_to_responses_payload(chat_request(response_format={"type": "text"}))
+    assert "text" not in payload
+
+
+def test_chat_response_format_unknown_shape_fails_instead_of_silent_drop():
+    with pytest.raises(UpstreamProtocolError, match="response_format"):
+        chat_request_to_responses_payload(chat_request(response_format={"type": "weird"}))
 
 
 def test_anthropic_thinking_is_separate_from_text_nonstream_and_stream():
