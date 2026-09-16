@@ -12,7 +12,19 @@ _TOKEN_FIELDS = {
     "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
 }
 _DETAIL_FIELDS = {"prompt_tokens_details", "completion_tokens_details", "input_tokens_details", "output_tokens_details", "cache_creation"}
-_FINISH_REASONS = {"stop", "length", "tool_calls", "content_filter", "function_call"}
+# Providers echo native stop reasons (Gemini "STOP"/"safety" via OpenRouter,
+# Anthropic "end_turn"/"max_tokens") instead of the Chat finish reasons.
+# Map the known ones to their canonical meaning; anything else is invalid.
+_FINISH_REASON_ALIASES = {
+    "stop": "stop", "eos": "stop", "end_turn": "stop", "stop_sequence": "stop",
+    "length": "length", "max_tokens": "length",
+    "tool_calls": "tool_calls", "function_call": "function_call",
+    "content_filter": "content_filter", "safety": "content_filter",
+    "refusal": "content_filter", "recitation": "content_filter",
+    "prohibited_content": "content_filter", "blocklist": "content_filter",
+    "spii": "content_filter", "image_safety": "content_filter",
+}
+_FINISH_REASONS = set(_FINISH_REASON_ALIASES.values())
 _MESSAGE_FIELDS = {"content", "tool_calls", "function_call", "refusal", "audio", "reasoning_content"}
 
 
@@ -161,14 +173,24 @@ class ChatStreamIntegrity:
             if self.choices.get(index) is not None and _carries_stream_content(delta):
                 self._fail("Chat content followed a choice finish reason")
             finish_reason = choice.get("finish_reason")
-            if finish_reason is not None:
-                if not isinstance(finish_reason, str) or finish_reason not in _FINISH_REASONS:
-                    self._fail("Invalid Chat stream finish reason")
-                if self.choices.get(index) not in (None, finish_reason):
-                    self._fail("Conflicting Chat stream finish reasons")
-                self.choices[index] = finish_reason
-            else:
+            if finish_reason in (None, ""):
+                # null means "more to come"; the empty string is the same
+                # provider noise some gateways emit on trailing chunks.
+                if finish_reason == "":
+                    choice["finish_reason"] = None
                 self.choices.setdefault(index, None)
+            else:
+                canonical = (
+                    _FINISH_REASON_ALIASES.get(finish_reason.strip().lower())
+                    if isinstance(finish_reason, str) else None
+                )
+                if canonical is None:
+                    self._fail(f"Invalid Chat stream finish reason: {finish_reason!r}")
+                # Native stop reasons must not leak to Chat clients.
+                choice["finish_reason"] = canonical
+                if self.choices.get(index) not in (None, canonical):
+                    self._fail("Conflicting Chat stream finish reasons")
+                self.choices[index] = canonical
 
     def finish(self):
         if not self.choices or any(reason is None for reason in self.choices.values()):

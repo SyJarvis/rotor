@@ -233,13 +233,34 @@ def test_nonstream_rejects_empty_message_or_explicit_nonassistant_role(message):
         validate_chat_response({"choices": [{"message": message, "finish_reason": "stop"}]})
 
 
-@pytest.mark.parametrize("finish", ["error", "unknown", "max_tokens", "end_turn", "", " "])
+@pytest.mark.parametrize("finish", ["error", "unknown", " "])
 def test_unknown_or_empty_finish_never_becomes_chat_or_responses_success(finish):
     with pytest.raises(UpstreamProtocolError, match="finish reason"):
         validate_chat_response(completion(finish=finish))
     state = ChatStreamIntegrity()
     with pytest.raises(UpstreamProtocolError, match="finish reason"):
         state.feed(chunk(delta={"content": "partial"}, finish=finish))
+
+
+@pytest.mark.parametrize("finish", ["max_tokens", "end_turn"])
+def test_native_finish_values_canonicalize_in_stream_but_fail_nonstream(finish):
+    with pytest.raises(UpstreamProtocolError, match="finish reason"):
+        validate_chat_response(completion(finish=finish))
+    state = ChatStreamIntegrity()
+    event = chunk(delta={"content": "partial"}, finish=finish)
+    state.feed(event)
+    assert state.choices == {0: {"max_tokens": "length", "end_turn": "stop"}[finish]}
+
+
+def test_empty_finish_reason_is_stream_noise_but_stays_invalid_nonstream():
+    with pytest.raises(UpstreamProtocolError, match="finish reason"):
+        validate_chat_response(completion(finish=""))
+    state = ChatStreamIntegrity()
+    event = chunk(delta={"content": "ok"}, finish="")
+    state.feed(event)
+    assert event["choices"][0]["finish_reason"] is None
+    with pytest.raises(UpstreamProtocolError, match="finish reasons"):
+        state.finish()
 
 
 def test_stream_all_observed_choices_must_finish_and_expected_count_is_checked():
@@ -274,7 +295,7 @@ def test_tool_arguments_are_client_validated_and_no_usage_is_fabricated():
     assert state.provider_usage is None
 
 
-@pytest.mark.parametrize("bad", [chunk(finish=""), chunk(finish=123), {"choices": [False]},
+@pytest.mark.parametrize("bad", [chunk(finish=" "), chunk(finish=123), {"choices": [False]},
                                 {"choices": [{"index": True, "delta": {}}]}, {"choices": "bad"},
                                 {"choices": [{"delta": "bad"}]},
                                 {"choices": [{"delta": {}}, {"delta": {}}]},
@@ -304,6 +325,34 @@ def test_stream_content_or_conflicting_finish_after_terminal_is_invalid(late):
     state.feed(chunk(finish="stop"))
     with pytest.raises(UpstreamProtocolError):
         state.feed(late)
+
+
+@pytest.mark.parametrize("native,canonical", [
+    ("STOP", "stop"),
+    ("end_turn", "stop"),
+    ("stop_sequence", "stop"),
+    ("max_tokens", "length"),
+    ("safety", "content_filter"),
+    ("Refusal", "content_filter"),
+])
+def test_native_finish_reasons_map_to_canonical(native, canonical):
+    state = ChatStreamIntegrity()
+    finish = chunk(finish=native)
+    state.feed(finish)
+    assert finish["choices"][0]["finish_reason"] == canonical
+
+
+def test_unknown_finish_reason_fails_with_the_offending_value():
+    state = ChatStreamIntegrity()
+    with pytest.raises(UpstreamProtocolError, match="malformed_function_call"):
+        state.feed(chunk(finish="malformed_function_call"))
+
+
+def test_empty_finish_reason_is_treated_as_absent():
+    state = ChatStreamIntegrity()
+    state.feed(chunk(delta={"content": "ok"}, finish=""))
+    state.feed(chunk(finish="stop"))
+    state.finish()
 
 
 def test_openrouter_role_echo_after_finish_is_tolerated_and_usage_kept():
