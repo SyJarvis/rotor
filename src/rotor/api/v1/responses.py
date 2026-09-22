@@ -115,10 +115,10 @@ class ResponsesStreamTransform:
         if usage is not None:
             response["usage"] = {
                 **usage,
-                "input_tokens_details": {
-                    "cached_tokens": 0,
-                    **(usage.get("input_tokens_details") or {}),
-                },
+                "input_tokens_details": dict(
+                    usage.get("input_tokens_details")
+                    or {"cached_tokens": 0, "cache_write_tokens": 0}
+                ),
                 "output_tokens_details": {
                     "reasoning_tokens": 0,
                     **(usage.get("output_tokens_details") or {}),

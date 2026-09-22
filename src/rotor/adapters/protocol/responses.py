@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import logging
 import time
 import uuid
 from typing import Any, AsyncIterator
@@ -40,11 +41,26 @@ _POST_TERMINAL_LIFECYCLE_EVENTS = frozenset(
     }
 )
 
+_RESPONSES_REASONING_EFFORT_ALIASES = {
+    "off": "none",
+    "ultra": "max",
+    "ultracode": "max",
+}
+
+logger = logging.getLogger(__name__)
+
 
 def _stringify(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def normalize_responses_reasoning_effort(value: Any) -> Any:
+    """Normalize client aliases to Responses reasoning effort values."""
+    if not isinstance(value, str):
+        return value
+    return _RESPONSES_REASONING_EFFORT_ALIASES.get(value.strip().lower(), value)
 
 
 # Client headers that carry routing/protocol intent for a native Responses
@@ -294,6 +310,10 @@ def responses_request_to_chat(request: ResponsesRequest) -> ChatCompletionReques
         instructions = _content_text(request.instructions)
         if instructions:
             messages.insert(0, ChatMessage(role=Role.SYSTEM, content=instructions))
+    responses_payload = request.provider_payload()
+    reasoning = responses_payload.get("reasoning")
+    if isinstance(reasoning, dict) and "effort" in reasoning:
+        reasoning["effort"] = normalize_responses_reasoning_effort(reasoning["effort"])
     return ChatCompletionRequest(
         model=request.model,
         messages=messages,
@@ -308,7 +328,7 @@ def responses_request_to_chat(request: ResponsesRequest) -> ChatCompletionReques
             else None
         ),
         user=request.user,
-        responses_payload=request.provider_payload(),
+        responses_payload=responses_payload,
     )
 
 
@@ -491,7 +511,7 @@ def chat_request_to_responses_payload(request: ChatCompletionRequest) -> dict[st
     }
     payload.update({key: value for key, value in optional.items() if value is not None})
     if request.reasoning_effort is not None:
-        payload["reasoning"] = {"effort": request.reasoning_effort}
+        payload["reasoning"] = {"effort": normalize_responses_reasoning_effort(request.reasoning_effort)}
     text_format = _chat_response_format_to_responses_text_format(request.response_format)
     if text_format is not None:
         payload["text"] = {"format": text_format}
@@ -732,13 +752,11 @@ def chat_response_to_responses(response: dict[str, Any]) -> dict[str, Any]:
     output_tokens = int(chat_usage.get("output_tokens") or chat_usage.get("completion_tokens") or 0)
     usage = {
         "input_tokens": input_tokens,
-        "input_tokens_details": {
-            "cached_tokens": 0,
-            **(
-                chat_usage.get("input_tokens_details")
-                or chat_usage.get("prompt_tokens_details") or {}
-            ),
-        },
+        "input_tokens_details": dict(
+            chat_usage.get("input_tokens_details")
+            or chat_usage.get("prompt_tokens_details")
+            or {"cached_tokens": 0, "cache_write_tokens": 0}
+        ),
         "output_tokens": output_tokens,
         "output_tokens_details": {
             "reasoning_tokens": 0,
@@ -1059,6 +1077,10 @@ class OpenAIResponsesAdapter(BaseAdapter):
         body["model"] = mapped_model
         body["stream"] = bool(request.stream)
         if not _supports_gpt56_prompt_cache(mapped_model):
+            logger.info(
+                "Responses upstream request body: %s",
+                json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+            )
             return body
 
         if request.responses_prompt_cache_key:
@@ -1078,6 +1100,10 @@ class OpenAIResponsesAdapter(BaseAdapter):
                         "ttl": "30m",
                     }
                     break
+        logger.info(
+            "Responses upstream request body: %s",
+            json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+        )
         return body
 
     async def convert_response(
