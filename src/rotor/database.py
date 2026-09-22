@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.engine import make_url
-from sqlalchemy.pool import AsyncAdaptedQueuePool
+from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
 from rotor.config import settings
 import rotor.observability as observability
 
@@ -78,8 +78,19 @@ def _instrument_engine(db_engine):
 def create_database_engine(database_url: str, *, echo: bool = False):
     """Create an engine with the gateway's connection settings."""
     url = make_url(database_url)
-    default_pool = url.get_dialect(_is_async=True).get_pool_class(url)
-    pool_options = {"poolclass": _MeasuredQueuePool} if issubclass(default_pool, AsyncAdaptedQueuePool) else {}
+    if url.get_backend_name() == "sqlite" and url.database not in (None, "", ":memory:"):
+        # Client disconnects cancel the ASGI task mid-checkin; the same
+        # cancellation kills SQLAlchemy's shielded aiosqlite terminate, so a
+        # queued connection never returns and the pool drains for good
+        # (observed 2026-09-20/22: QueuePool exhaustion, site-wide 500s until
+        # restart). NullPool opens a fresh connection per checkout instead:
+        # there is no pool to leak, and local-file SQLite connects are cheap.
+        # In-memory databases keep the dialect default (StaticPool) so every
+        # session still sees the same database.
+        pool_options = {"poolclass": NullPool}
+    else:
+        default_pool = url.get_dialect(_is_async=True).get_pool_class(url)
+        pool_options = {"poolclass": _MeasuredQueuePool} if issubclass(default_pool, AsyncAdaptedQueuePool) else {}
     db_engine = create_async_engine(database_url, echo=echo, future=True, **pool_options)
     # WAL allows reads alongside writes; busy_timeout lets writers queue.
     if database_url.startswith("sqlite"):
