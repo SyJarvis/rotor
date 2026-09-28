@@ -1,10 +1,8 @@
 # 三种消息协议格式与 Rotor 转换手册
 
-## 适用读者与快照边界
+## 适用读者与范围
 
-本文面向实现客户端、配置 Channel、排查 SSE 或编写适配器的开发者。它描述的是 Rotor 工作树在 2026-09-02（Asia/Shanghai）可观察到的协议子集，不是 OpenAI 或 Anthropic 的完整官方规范。代码、模型和测试是事实来源；当本文与其他说明冲突时，应以当前源码为准。
-
-代码快照 HEAD 为 `7a15ecbe8eaf58ad33c9a1847325ec1b06017540`。当前工作树存在其他既有未提交修改和未跟踪文件；本手册只描述协议相关的可见实现，不表示这些改动已经发布。
+本文面向实现客户端、配置 Channel、排查 SSE 或编写适配器的开发者。它描述 Rotor 当前实现的协议子集，不是 OpenAI 或 Anthropic 的完整官方规范。代码、模型和测试是事实来源；当本文与其他说明冲突时，应以当前源码为准。
 
 本文覆盖三个消息协议：
 
@@ -15,7 +13,7 @@
 Images 是独立的第四条请求路径（`/v1/images/generations`），不经过下文的消息协议
 转换。入口说明见[客户端 API](../reference/client-api.md)。
 
-源码快照和证据索引见[源码/测试索引](#源码与测试索引)。示例中的字段是 Rotor 当前实现会读取、生成或保留的字段；供应商可能支持更多字段，不能据此推断 Rotor 会接受或转发这些字段。
+源码和证据索引见[源码/测试索引](#源码与测试索引)。示例中的字段是 Rotor 当前实现会读取、生成或保留的字段；供应商可能支持更多字段，不能据此推断 Rotor 会接受或转发这些字段。
 
 ## 1. 两层协议模型
 
@@ -221,8 +219,36 @@ input_items、input_tokens 和 compact，路径表见[客户端 API](../referenc
 | `parallel_tool_calls` | boolean | 仅原生 payload 保留 |
 | `previous_response_id` | string | 需要原生 Responses，并绑定原 Channel |
 | `conversation`、`background` | object/string/bool | native-only 路由能力 |
-| `reasoning` | object | 当前工作树判定为 native-only；请以同版本代码为准 |
+| `reasoning` | object | 当前实现判定为 native-only；请以部署版本对应的代码为准 |
 | `text`、`store`、`truncation`、`include`、`service_tier`、`user`、`max_tool_calls` | 扩展 | 未必可跨协议表达；`store` 不触发当前 native 能力筛选 |
+
+#### `reasoning.effort` 与 Chat `reasoning_effort`
+
+Rotor 在 Chat→Responses 和 Responses→Responses 两条路径上统一处理推理强度别名：
+
+| 客户端值 | 发往 Responses 上游的值 |
+| --- | --- |
+| `off` | `none` |
+| `ultra` | `max` |
+| `ultracode` | `max` |
+| `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` | 原样保留 |
+
+Chat 客户端使用顶层 `reasoning_effort`；Responses 客户端使用
+`reasoning.effort`。Chat→Responses 会生成：
+
+```json
+{
+  "reasoning": {"effort": "max"}
+}
+```
+
+Responses→Chat 的内部规范化不会把 `reasoning` 放入 Chat 的普通字段；原始 Responses
+payload 会保存在内部请求中，并在选择原生 Responses Channel 时继续使用。当前实现对
+未知字符串不做枚举校验，而是原样传递；是否接受该值由上游决定。
+
+带有 `reasoning` 对象的 Responses 请求当前会要求 `responses_native`，因此需要原生
+Responses Channel。Chat 请求的 `reasoning_effort` 则由目标适配器映射；如果目标是
+Responses，上述别名会在发送前转换。
 
 ### 3.2 非流式响应
 
@@ -519,7 +545,7 @@ reasoning、非 message item、不可转换 block 或不可表达的 tool choice
 `store` 不参与当前 native 判定，因而在允许 cross 时仍可能丢失。原始 Responses body 和
 Anthropic body 各自仍可在对应 native channel 使用，见下一节。
 
-例外是当前工作树对 Anthropic system `cache_control` 的有限桥接：选到支持的 GPT-5.6
+例外是当前实现对 Anthropic system `cache_control` 的有限桥接：选到支持的 GPT-5.6
 Responses model 时，最多保留最近四个显式 breakpoint，并可附 `prompt_cache_key` 与
 30m implicit TTL。若该上游以 400/`invalid_parameter` 表示不支持
 `prompt_cache_breakpoint`，Responses adapter 会在同一 Channel 深拷贝请求并递归移除
@@ -545,6 +571,11 @@ Responses，`OpenAIResponsesAdapter.convert_request` 深拷贝它，只覆盖映
 中按 JSON event object 保留；创建流的客户端 framing 由网关重建为 `data:` 行。只有
 retrieve 等资源 relay 路径才可能逐字节转发上游流。
 
+Responses adapter 会在发送前完成模型映射、`stream` 和 GPT-5.6 prompt cache 处理。Rotor
+默认不会在 INFO 日志中记录完整上游请求 body；请求可能包含 prompt、工具参数和其他敏感
+字段。排查时优先使用请求状态、路由 attempt 和错误元数据，不要为了常规排障开启完整
+body 记录。
+
 ### 6.2 `anthropic_payload` 与 headers
 
 `anthropic_to_openai_request` 将 `model_dump(exclude_none=True)` 保存到
@@ -563,8 +594,7 @@ retrieve 等资源 relay 路径才可能逐字节转发上游流。
   fallback）；
 - `conversation`、`background` 等状态或后台语义（`store` 没有跨协议等价字段，但当前
   `responses_required_capabilities` 不因 `store` 单独筛选 native）；
-- `reasoning` 选项在当前工作树会触发 `responses_native`；这是代码实现，不代表旧 HEAD
-  或所有部署版本都相同；
+- `reasoning` 选项在当前实现会触发 `responses_native`；部署版本的行为以对应代码为准；
 - hosted tools、namespace tools、非 function tool 在语义上需要 native，但当前
   `responses_required_capabilities` 并未一律强制；hosted-only 请求可能先过滤工具后
   走 Chat，存在语义丢失风险（测试覆盖可选工具 fallback）；

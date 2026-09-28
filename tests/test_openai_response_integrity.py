@@ -233,13 +233,34 @@ def test_nonstream_rejects_empty_message_or_explicit_nonassistant_role(message):
         validate_chat_response({"choices": [{"message": message, "finish_reason": "stop"}]})
 
 
-@pytest.mark.parametrize("finish", ["error", "unknown", "max_tokens", "end_turn", "", " "])
+@pytest.mark.parametrize("finish", ["error", "unknown", " "])
 def test_unknown_or_empty_finish_never_becomes_chat_or_responses_success(finish):
     with pytest.raises(UpstreamProtocolError, match="finish reason"):
         validate_chat_response(completion(finish=finish))
     state = ChatStreamIntegrity()
     with pytest.raises(UpstreamProtocolError, match="finish reason"):
         state.feed(chunk(delta={"content": "partial"}, finish=finish))
+
+
+@pytest.mark.parametrize("finish", ["max_tokens", "end_turn"])
+def test_native_finish_values_canonicalize_in_stream_but_fail_nonstream(finish):
+    with pytest.raises(UpstreamProtocolError, match="finish reason"):
+        validate_chat_response(completion(finish=finish))
+    state = ChatStreamIntegrity()
+    event = chunk(delta={"content": "partial"}, finish=finish)
+    state.feed(event)
+    assert state.choices == {0: {"max_tokens": "length", "end_turn": "stop"}[finish]}
+
+
+def test_empty_finish_reason_is_stream_noise_but_stays_invalid_nonstream():
+    with pytest.raises(UpstreamProtocolError, match="finish reason"):
+        validate_chat_response(completion(finish=""))
+    state = ChatStreamIntegrity()
+    event = chunk(delta={"content": "ok"}, finish="")
+    state.feed(event)
+    assert event["choices"][0]["finish_reason"] is None
+    with pytest.raises(UpstreamProtocolError, match="finish reasons"):
+        state.finish()
 
 
 def test_stream_all_observed_choices_must_finish_and_expected_count_is_checked():
@@ -274,7 +295,7 @@ def test_tool_arguments_are_client_validated_and_no_usage_is_fabricated():
     assert state.provider_usage is None
 
 
-@pytest.mark.parametrize("bad", [chunk(finish=""), chunk(finish=123), {"choices": [False]},
+@pytest.mark.parametrize("bad", [chunk(finish=" "), chunk(finish=123), {"choices": [False]},
                                 {"choices": [{"index": True, "delta": {}}]}, {"choices": "bad"},
                                 {"choices": [{"delta": "bad"}]},
                                 {"choices": [{"delta": {}}, {"delta": {}}]},
@@ -306,10 +327,88 @@ def test_stream_content_or_conflicting_finish_after_terminal_is_invalid(late):
         state.feed(late)
 
 
+@pytest.mark.parametrize("native,canonical", [
+    ("STOP", "stop"),
+    ("end_turn", "stop"),
+    ("stop_sequence", "stop"),
+    ("max_tokens", "length"),
+    ("safety", "content_filter"),
+    ("Refusal", "content_filter"),
+])
+def test_native_finish_reasons_map_to_canonical(native, canonical):
+    state = ChatStreamIntegrity()
+    finish = chunk(finish=native)
+    state.feed(finish)
+    assert finish["choices"][0]["finish_reason"] == canonical
+
+
+def test_unknown_finish_reason_fails_with_the_offending_value():
+    state = ChatStreamIntegrity()
+    with pytest.raises(UpstreamProtocolError, match="malformed_function_call"):
+        state.feed(chunk(finish="malformed_function_call"))
+
+
+def test_empty_finish_reason_is_treated_as_absent():
+    state = ChatStreamIntegrity()
+    state.feed(chunk(delta={"content": "ok"}, finish=""))
+    state.feed(chunk(finish="stop"))
+    state.finish()
+
+
+def test_openrouter_role_echo_after_finish_is_tolerated_and_usage_kept():
+    # Captured from api.commandcode.ai (OpenRouter): every delta repeats
+    # {"role":"assistant"}, and the usage tail lands in a final chunk whose
+    # delta repeats the role after finish_reason was already sent.
+    reasoning = chunk(delta={"content": "", "role": "assistant", "reasoning": "thinking"})
+    answer = chunk(delta={"content": "ok", "role": "assistant"})
+    finish = chunk(delta={"content": "", "role": "assistant", "reasoning": None}, finish="stop")
+    usage = {"choices": [{"index": 0, "delta": {"content": "", "role": "assistant"}, "finish_reason": "stop"}],
+             "usage": USAGE}
+    body = wire([reasoning, answer, finish, usage]) + "data: [DONE]\n\n"
+    result = asyncio.run(convert("openai", body, stream=True))
+    state = ChatStreamIntegrity(expected_choices=1, upstream_status=200)
+    for event in result:
+        state.feed(event)
+    state.finish()
+    assert state.provider_usage == USAGE
+
+
 def test_data_after_done_is_invalid_even_if_choices_finished():
     body = wire([chunk(finish="stop")]) + "data: [DONE]\n\n" + wire([chunk(finish="stop")])
     with pytest.raises(UpstreamProtocolError, match=r"after \[DONE\]"):
         asyncio.run(convert("zhipu", body, stream=True))
+
+
+@pytest.mark.parametrize("tail", [
+    'data: {"choices":[],"cost":"0"}\n\n',  # opencode-go-chat captured trailing noise
+    'data: {"type":"ping","cost":"0"}\n\n',
+    "data: [DONE]\n\n",
+])
+def test_inert_tail_after_done_is_tolerated_and_stream_stays_complete(tail):
+    first = chunk(delta={"content": "ok"})
+    finish = chunk(finish="stop")
+    usage = {"choices": [], "usage": USAGE}
+    body = wire([first, finish, usage]) + "data: [DONE]\n\n" + tail
+    result = asyncio.run(convert("zhipu", body, stream=True))
+    assert result == [first, finish, usage]
+    state = ChatStreamIntegrity(expected_choices=1, upstream_status=200)
+    for event in result:
+        state.feed(event)
+    state.finish()
+    assert state.provider_usage == USAGE
+
+
+@pytest.mark.parametrize("tail", [
+    'data: {"choices":[{"index":0,"delta":{"content":"late"},"finish_reason":null}]}\n\n',
+    'data: {"error":{"message":"boom"}}\n\n',
+    'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}\n\n',
+    "data:{broken}\n\n",
+])
+def test_meaningful_data_after_done_stays_a_protocol_error(tail):
+    body = wire([chunk(delta={"content": "ok"}, finish="stop")]) + "data: [DONE]\n\n" + tail
+    with pytest.raises(UpstreamProtocolError, match=r"after \[DONE\]") as caught:
+        asyncio.run(convert("zhipu", body, stream=True))
+    assert caught.value.upstream_status == 200
 
 
 def test_named_error_cannot_be_disguised_as_done():

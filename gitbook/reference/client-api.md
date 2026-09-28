@@ -21,6 +21,25 @@ Rotor 支持范围和原生能力差异见[协议兼容与转换](../concepts/pr
 Chat 支持非流式和 SSE 流式响应。Images 请求保留扩展字段，并使用 Channel 的
 模型映射和专用 images 路径。
 
+## OpenAI Embeddings
+
+`POST /v1/embeddings` 使用 Rotor Token，支持文本、文本数组、Token ID 数组和
+Token ID 数组的数组；支持 `dimensions`、`encoding_format`（`float` / `base64`）、
+`user` 和供应商扩展字段。响应原样返回，usage 计入 Token 配额。
+
+渠道需使用 OpenAI 兼容协议（包括配置为 Responses 的渠道），并在 `models` 或
+`model_mapping` 中配置 embedding 模型。不支持转换为 Anthropic Messages。
+如果设置了 `extra.capabilities`，须包含 `embeddings`。
+默认上游路径为 `/embeddings`，可使用 `extra.embeddings_path` 覆盖；它独立于
+Chat / Responses 的 `request_path`，与渠道的 `base_url` 拼接。
+
+```bash
+curl http://localhost:8000/v1/embeddings \
+  -H "Authorization: Bearer $ROTOR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"text-embedding-3-small","input":["你好","Rotor"],"encoding_format":"float"}'
+```
+
 ## OpenAI Responses
 
 | 方法 | 路径 | 说明 |

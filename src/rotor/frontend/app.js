@@ -8,8 +8,8 @@ import { refreshTheme } from "./charts.js?v=8";
 import { setChannelPresets, applyChannelDefaults, channelConnection } from "./channel-form.js";
 
 import * as overview from "./pages/overview.js?v=5";
-import * as channels from "./pages/channels.js";
-import { editState as channelEditState } from "./pages/channels.js";
+import * as channels from "./pages/channels.js?v=3";
+import { editState as channelEditState } from "./pages/channels.js?v=3";
 import * as tokens from "./pages/tokens.js?v=9";
 import * as usage from "./pages/usage.js?v=13";
 import * as logs from "./pages/logs.js?v=4";

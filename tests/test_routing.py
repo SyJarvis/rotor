@@ -148,6 +148,82 @@ def test_affinity_keeps_same_conversation_on_same_channel() -> None:
     ]
 
 
+def test_routing_state_snapshots_cooldown_and_probe_phase() -> None:
+    now = [100.0]
+    engine = RoutingEngine(clock=lambda: now[0])
+    channel = _channel(1)
+
+    assert engine.routing_state() == []
+
+    engine.mark_unavailable("model", channel, cooldown_seconds=45)
+    (model, channel_id, state), = engine.routing_state()
+    assert (model, channel_id) == ("model", 1)
+    assert state["phase"] == "cooldown"
+    assert state["remaining_seconds"] == 45
+    assert state["cooldown_seconds"] == 45
+
+    now[0] += 45
+    assert engine.routing_state() == [], "expired cooldown without a probe is routable"
+
+    admission = engine.admit_attempt("model", channel)
+    assert admission is not None and admission.is_probe
+    _, _, probing = engine.routing_state()[0]
+    assert probing["phase"] == "probe"
+    assert probing["remaining_seconds"] == 0
+
+    admission.provider_succeeded = True
+    engine.release_attempt(admission)
+    assert engine.routing_state() == []
+
+
+def test_routing_state_cooldown_seconds_reports_latest_failure_window() -> None:
+    now = [100.0]
+    engine = RoutingEngine(clock=lambda: now[0])
+    channel = _channel(1)
+
+    engine.mark_unavailable("model", channel, cooldown_seconds=120)
+    now[0] += 5
+    engine.mark_unavailable("model", channel, cooldown_seconds=0)
+
+    _, _, state = engine.routing_state()[0]
+    assert state["remaining_seconds"] == 115
+    assert state["cooldown_seconds"] == 120
+
+
+def test_clear_cooldown_releases_one_model_or_the_whole_channel() -> None:
+    engine = RoutingEngine()
+    channel = _channel(1)
+    other = _channel(2)
+
+    engine.mark_unavailable("alpha", channel, cooldown_seconds=60)
+    engine.mark_unavailable("beta", channel, cooldown_seconds=60)
+    engine.mark_unavailable("alpha", other, cooldown_seconds=60)
+
+    assert engine.clear_cooldown("alpha", 1) == ["alpha"]
+    assert {model for model, _, _ in engine.routing_state()} == {"beta", "alpha"}
+    assert engine.clear_cooldown(None, 1) == ["beta"]
+    assert {(model, cid) for model, cid, _ in engine.routing_state()} == {("alpha", 2)}
+    assert engine.clear_cooldown(None, 999) == []
+
+
+def test_clear_cooldown_detaches_an_inflight_probe_so_it_cannot_retrip() -> None:
+    engine = RoutingEngine()
+    channel = _channel(1)
+
+    engine.mark_unavailable("model", channel, cooldown_seconds=0)
+    admission = engine.admit_attempt("model", channel)
+    assert admission is not None and admission.is_probe
+
+    assert engine.clear_cooldown("model", 1) == ["model"]
+    assert engine.routing_state() == []
+
+    # The detached probe failing must not re-arm the cooldown an operator cleared.
+    admission.provider_succeeded = False
+    engine.release_attempt(admission)
+    assert engine.routing_state() == []
+    assert engine.admit_attempt("model", channel) is not None
+
+
 def test_affinity_preserves_priority_before_weighted_score() -> None:
     engine = RoutingEngine()
     channels = [_channel(1, priority=1), _channel(2, priority=10)]

@@ -741,6 +741,24 @@ code, pre { font-family: var(--font-mono); }
 }
 .channel-card:hover { border-color: var(--line-strong); transform: translateY(-2px); box-shadow: var(--shadow); }
 .channel-card.disabled { opacity: 0.7; }
+.channel-card.cooling { border-color: var(--warning); }
+.channel-card.cooling:hover { border-color: var(--warning); }
+
+.channel-card .cooldown-row { gap: 6px; }
+.channel-card .cooldown-row .btn-tiny { margin-left: auto; }
+.cooldown-badge { gap: 5px; font-family: var(--font-mono); }
+.cooldown-badge i { width: 12px; height: 12px; }
+
+.btn-tiny {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  border-radius: 6px;
+}
+.btn-tiny i { width: 12px; height: 12px; }
 
 .channel-card .ch-head {
   display: flex;
@@ -1422,6 +1440,7 @@ td code {
 }
 .inline-result.hidden { display: none; }
 .inline-result.error { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
+.inline-result.warning { background: var(--warning-soft); border-color: var(--warning); color: var(--warning); }
 .inline-result.success { background: var(--success-soft); border-color: var(--success); color: var(--success); }
 
 /* ===== Utilities ===== */

@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc \
 # Source checkout entry points for development are not copied into the image.
 COPY pyproject.toml README.md alembic.ini ./
 COPY ./src ./src
-RUN pip install --no-cache-dir .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --retries 10 --timeout 120 .
 
 ENV PYTHONPATH=/app/src \
     DATABASE_URL=sqlite+aiosqlite:////data/rotor.db \

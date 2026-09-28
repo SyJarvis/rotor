@@ -109,3 +109,38 @@ class ChannelListItem(BaseModel):
     total_requests: int
     success_requests: int
     failed_requests: int
+
+
+class ChannelCooldownState(BaseModel):
+    """Process-local routing cooldown for one `(model, channel)` pair."""
+
+    model: str
+    channel_id: int
+    channel_name: Optional[str] = None
+    phase: str = Field(description="cooldown or probe")
+    remaining_seconds: int = Field(ge=0)
+    cooldown_seconds: float = Field(ge=0)
+    known_channel: bool = True
+
+
+class ChannelRoutingStateResponse(BaseModel):
+    """Snapshot of in-memory recovery state, not persisted configuration."""
+
+    cooldowns: List[ChannelCooldownState]
+
+
+class ChannelCooldownResetRequest(BaseModel):
+    """Operator override: clear cooldowns for a channel.
+
+    Omitting `model` clears every model on the channel; otherwise only that
+    `(model, channel)` pair is released.
+    """
+
+    model: Optional[str] = Field(default=None, min_length=1)
+
+
+class ChannelCooldownResetResponse(BaseModel):
+    """Models whose process-local cooldown was cleared."""
+
+    channel_id: int
+    released: List[str]

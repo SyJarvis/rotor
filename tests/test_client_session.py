@@ -357,6 +357,13 @@ def test_client_identity_does_not_require_a_session() -> None:
         ("MindCode/0.5.0", "mindcode"),
         ("codex-tui/0.153.4", "codex"),
         ("Codex Desktop/0.153.4", "codex"),
+        (
+            "codex_exec/0.154.0 (Mac OS 26.2.0; arm64) "
+            "vscode/1.118.1 (codex_exec; 0.154.0)",
+            "codex",
+        ),
+        ("codex_vscode/0.154.0", "codex"),
+        ("codex_desktop/0.154.0", "codex"),
         ("claude-cli/2.1.251 (external, cli)", "claude_code"),
         ("opencode/1.18.29 ai-sdk/provider-utils/3", "opencode"),
     ):
@@ -365,6 +372,23 @@ def test_client_identity_does_not_require_a_session() -> None:
         assert context.routing_features()["client_source"] == client
         assert context.session_id is None
         assert context.affinity_key(1) is None
+
+
+def test_codex_originator_header_identifies_client() -> None:
+    for originator in ("codex_exec", "codex_cli_rs", "Codex-TUI", "codex_vscode"):
+        context = resolve_client_session({"originator": originator})
+        assert context.client_source == "codex"
+    # Near-miss originator values must not brand the client.
+    assert resolve_client_session({"originator": "codex-tui-helper"}).client_source is None
+
+
+def test_codex_identity_survives_explicit_session_override() -> None:
+    context = resolve_client_session({
+        "originator": "codex_exec",
+        "x-rotor-session-id": "explicit-session",
+    })
+    assert context.client_source == "codex"
+    assert context.session_id == "explicit-session"
 
 
 def test_mindcode_identity_survives_explicit_session_override() -> None:
@@ -381,7 +405,7 @@ def test_mindcode_identity_survives_explicit_session_override() -> None:
 def test_generic_sdk_and_near_miss_user_agents_are_not_branded_clients() -> None:
     for user_agent in (
         "AsyncOpenAI/Python 3.8.0", "OpenAI/Python 2.0.0",
-        "codex-tui-helper/1", "claude-cli-helper/1", "opencode-helper/1",
-        "pi-helper/1", "mindcode-helper/1",
+        "codex-tui-helper/1", "codex_exec-helper/1", "claude-cli-helper/1",
+        "opencode-helper/1", "pi-helper/1", "mindcode-helper/1",
     ):
         assert resolve_client_session({"User-Agent": user_agent}).client_source is None

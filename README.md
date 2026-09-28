@@ -13,7 +13,7 @@ Rotor 同时提供浏览器管理页面、管理 API、面向机器调用的只�
 ## 主要能力
 
 - **统一协议入口**：支持 `/v1/chat/completions`、`/v1/responses`、
-  `/v1/images/generations` 和 `/anthropic/v1/messages`。
+  `/v1/images/generations`、`/v1/embeddings` 和 `/anthropic/v1/messages`。
 - **跨协议转换**：在 OpenAI Chat、Responses 和 Anthropic Messages 之间转换基础
   消息、流式事件、工具调用和用量信息。
 - **多渠道路由**：按模型、协议、优先级、权重和运行状态选择 Channel，支持 fallback、
@@ -173,6 +173,7 @@ Codex、Claude Code 和 OpenCode 的配置方式见
 | 服务状态 | `GET /health`、`GET /api` |
 | OpenAI Chat | `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` 及 Response 资源端点 |
+| OpenAI Embeddings | `POST /v1/embeddings` |
 | OpenAI Images | `POST /v1/images/generations` |
 | Anthropic | `POST /anthropic/v1/messages`、`POST /anthropic/v1/messages/count_tokens`、`GET /anthropic/v1/models` |
 | 模型 | `GET /v1/models` |

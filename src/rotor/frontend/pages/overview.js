@@ -257,6 +257,7 @@ function renderEndpoints() {
   const origin = window.location.origin;
   const items = [
     { method: "POST", name: "OpenAI Chat", path: `${origin}/v1/chat/completions`, icon: "message-square" },
+    { method: "POST", name: "OpenAI Embeddings", path: `${origin}/v1/embeddings`, icon: "layers" },
     { method: "POST", name: "OpenAI Responses", path: `${origin}/v1/responses`, icon: "square-stack" },
     { method: "POST", name: "Anthropic Messages", path: `${origin}/anthropic/v1/messages`, icon: "bot" },
     { method: "GET",  name: "Models", path: `${origin}/v1/models`, icon: "boxes" },

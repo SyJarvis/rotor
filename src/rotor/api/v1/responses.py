@@ -28,6 +28,7 @@ from rotor.adapters.protocol.responses import (
 )
 from rotor.core.deps import get_available_channels, get_current_token
 from rotor.core.client_session import resolve_client_session
+from rotor.core.header_forwarding import snapshot_inbound_headers
 from rotor.application_settings import application_settings
 from rotor.core.exceptions import (
     ChannelException,
@@ -114,10 +115,10 @@ class ResponsesStreamTransform:
         if usage is not None:
             response["usage"] = {
                 **usage,
-                "input_tokens_details": {
-                    "cached_tokens": 0,
-                    **(usage.get("input_tokens_details") or {}),
-                },
+                "input_tokens_details": dict(
+                    usage.get("input_tokens_details")
+                    or {"cached_tokens": 0, "cache_write_tokens": 0}
+                ),
                 "output_tokens_details": {
                     "reasoning_tokens": 0,
                     **(usage.get("output_tokens_details") or {}),
@@ -431,6 +432,7 @@ async def create_response(
             previous_route.conversation_id if previous_route is not None else None
         ),
     )
+    chat_request.inbound_headers = snapshot_inbound_headers(http_request.headers)
     conversation_id = client_session.session_id or f"conv_{uuid.uuid4().hex[:24]}"
     client_ip = http_request.client.host if http_request.client else "unknown"
     request_origin = getattr(http_request.state, "request_origin", "client")

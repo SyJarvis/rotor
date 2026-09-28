@@ -131,3 +131,6 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local compose overrides
+docker-compose.override.yml

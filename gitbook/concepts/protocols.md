@@ -26,6 +26,13 @@ Responses 事件对象的语义字段，并由网关重建客户端 SSE framing�
 原生 Responses 渠道。仅使用文本、流式输出或函数工具的基础请求可以在兼容渠道
 间转换。
 
+Responses 创建请求会先根据请求内容计算所需能力，再生成候选 Channel；能力过滤是硬约束，
+协议亲和和优先级只在兼容候选之间生效。例如带有 `reasoning`、`previous_response_id`、
+`conversation`、`background` 或非可转换 input item 的请求会要求
+`responses_native`，不能仅因为存在一个 Chat Channel 就降级发送。Chat 客户端如果选择
+Responses Channel，则由适配器将 `reasoning_effort` 映射为 `reasoning.effort`；推理等级
+别名见[格式手册](protocol-formats.md#reasoningeffort-与-chat-reasoning_effort)。
+
 ## 原生 Anthropic
 
 `protocol=anthropic` 使用 Anthropic 的 `/messages` 请求、`x-api-key` 鉴权和

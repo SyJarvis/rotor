@@ -43,6 +43,20 @@ def _is_pi_client(
     )
 
 
+_CODEX_ORIGINATORS = frozenset({
+    "codex_cli_rs", "codex-tui", "codex_exec", "codex_vscode",
+    "codex_desktop", "codex-cli", "codex_mcp_server", "codex_sdk_ts",
+    "codex-app-server",
+})
+
+
+def _is_codex_client(headers: Mapping[str, str]) -> bool:
+    """Codex clients always send an ``originator`` header identifying the
+    surface (CLI, TUI, exec, VS Code, desktop)."""
+    originator = str(headers.get("originator") or "").strip().lower()
+    return originator in _CODEX_ORIGINATORS
+
+
 def _is_grok_client(headers: Mapping[str, str]) -> bool:
     user_agent = str(headers.get("user-agent") or "").strip().lower()
     client_identifier = (
@@ -214,9 +228,17 @@ def _resolve_client_source(
         return "pi"
     if _is_grok_client(headers):
         return "grok_build"
+    if _is_codex_client(headers):
+        return "codex"
     user_agent = str(headers.get("user-agent") or "").strip().lower()
     for client, markers in (
-        ("codex", ("codex-tui", "codex desktop", "codex_cli_rs")),
+        (
+            "codex",
+            (
+                "codex-tui", "codex desktop", "codex_cli_rs", "codex_exec",
+                "codex_vscode", "codex_desktop", "codex-cli",
+            ),
+        ),
         ("claude_code", ("claude-cli",)),
         ("opencode", ("opencode",)),
         ("mindcode", ("mindcode",)),

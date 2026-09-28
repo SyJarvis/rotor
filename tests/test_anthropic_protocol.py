@@ -721,6 +721,78 @@ def test_internal_request_round_trips_to_anthropic_provider_format() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({"max_completion_tokens": 64}, 64),
+        ({"max_tokens": 32, "max_completion_tokens": 64}, 64),
+        ({}, 4096),
+    ],
+)
+def test_chat_token_limits_prefer_max_completion_tokens(fields, expected) -> None:
+    request = ChatCompletionRequest.model_validate({
+        "model": "model",
+        "messages": [{"role": "user", "content": "hello"}],
+        **fields,
+    })
+    assert ProtocolConverter.openai_to_anthropic(request)["max_tokens"] == expected
+
+
+_LOOKUP_TOOL = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+
+
+@pytest.mark.parametrize(
+    ("tool_choice", "expected"),
+    [
+        ("auto", {"type": "auto", "disable_parallel_tool_use": True}),
+        ("required", {"type": "any", "disable_parallel_tool_use": True}),
+        (
+            {"type": "function", "function": {"name": "f"}},
+            {"type": "tool", "name": "f", "disable_parallel_tool_use": True},
+        ),
+        (None, {"type": "auto", "disable_parallel_tool_use": True}),
+        ("none", None),
+    ],
+)
+def test_parallel_tool_calls_false_disables_anthropic_parallel_tool_use(tool_choice, expected) -> None:
+    fields = {
+        "model": "model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [_LOOKUP_TOOL],
+        "parallel_tool_calls": False,
+    }
+    if tool_choice is not None:
+        fields["tool_choice"] = tool_choice
+    converted = ProtocolConverter.openai_to_anthropic(ChatCompletionRequest.model_validate(fields))
+    if expected is None:
+        assert "tool_choice" not in converted
+    else:
+        assert converted["tool_choice"] == expected
+
+
+@pytest.mark.parametrize("parallel_tool_calls", [True, None])
+def test_parallel_tool_calls_enabled_keeps_anthropic_default(parallel_tool_calls) -> None:
+    fields = {
+        "model": "model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [_LOOKUP_TOOL],
+        "tool_choice": "auto",
+    }
+    if parallel_tool_calls is not None:
+        fields["parallel_tool_calls"] = parallel_tool_calls
+    converted = ProtocolConverter.openai_to_anthropic(ChatCompletionRequest.model_validate(fields))
+    assert converted["tool_choice"] == {"type": "auto"}
+
+
+def test_parallel_tool_calls_false_without_tools_sets_no_tool_choice() -> None:
+    request = ChatCompletionRequest.model_validate({
+        "model": "model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "parallel_tool_calls": False,
+    })
+    assert "tool_choice" not in ProtocolConverter.openai_to_anthropic(request)
+
+
 def test_openai_tool_stream_emits_complete_anthropic_event_sequence() -> None:
     converter = OpenAIToAnthropicStreamConverter()
 

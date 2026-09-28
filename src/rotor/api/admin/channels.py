@@ -10,9 +10,19 @@ from sqlalchemy import case, func, select
 from rotor.database import get_db
 from rotor.adapters.factory import AdapterFactory
 from rotor.core.exceptions import format_error_message
+from rotor.gateway.routing import routing_engine
 from rotor.models.channel import Channel
 from rotor.models.log import RequestLog
-from rotor.schemas.channel import ChannelCreate, ChannelUpdate, ChannelResponse, ChannelListItem
+from rotor.schemas.channel import (
+    ChannelCooldownResetRequest,
+    ChannelCooldownResetResponse,
+    ChannelCooldownState,
+    ChannelCreate,
+    ChannelListItem,
+    ChannelResponse,
+    ChannelRoutingStateResponse,
+    ChannelUpdate,
+)
 from rotor.schemas.request import (
     ChatCompletionRequest,
     ChatMessage,
@@ -108,6 +118,33 @@ async def list_channels(
     ]
 
 
+@router.get("/routing-state", response_model=ChannelRoutingStateResponse)
+async def get_channel_routing_state(
+    db: AsyncSession = Depends(get_db),
+) -> ChannelRoutingStateResponse:
+    """Return the process-local cooldown state held by the routing engine.
+
+    The state is intentionally keyed by `(model, channel_id)` because a
+    retryable provider failure only suppresses one model on one channel.
+    """
+    result = await db.execute(select(Channel.id, Channel.name))
+    channel_names = {row.id: row.name for row in result.all()}
+    snapshot = routing_engine.routing_state()
+    cooldowns = [
+        ChannelCooldownState(
+            model=model,
+            channel_id=channel_id,
+            channel_name=channel_names.get(channel_id),
+            phase=state["phase"],
+            remaining_seconds=state["remaining_seconds"],
+            cooldown_seconds=state["cooldown_seconds"],
+            known_channel=channel_id in channel_names,
+        )
+        for model, channel_id, state in snapshot
+    ]
+    return ChannelRoutingStateResponse(cooldowns=cooldowns)
+
+
 @router.get("/presets")
 async def list_channel_presets():
     """List built-in provider defaults for the management UI and API clients."""
@@ -133,6 +170,42 @@ async def get_channel(
 
     stats = await _channel_stats(db, [channel.id])
     return _with_stats(ChannelResponse, channel, stats.get(channel.id))
+
+
+@router.post(
+    "/{channel_id}/cooldown/reset",
+    response_model=ChannelCooldownResetResponse,
+)
+async def reset_channel_cooldown(
+    channel_id: int,
+    payload: ChannelCooldownResetRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> ChannelCooldownResetResponse:
+    """Clear process-local cooldowns for a channel (operator override).
+
+    This only affects the in-memory circuit breaker: it never touches channel
+    configuration, and it cannot mark a broken upstream as healthy. Reusing the
+    channel immediately is at the operator's discretion.
+    """
+    existed = await db.scalar(
+        select(Channel.id).where(Channel.id == channel_id)
+    )
+    if existed is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Channel {channel_id} not found",
+        )
+
+    model = (payload.model or None) if payload is not None else None
+    released = routing_engine.clear_cooldown(model, channel_id)
+    if model is not None and model not in released:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"No cooldown for model '{model}' on channel {channel_id}"
+            ),
+        )
+    return ChannelCooldownResetResponse(channel_id=channel_id, released=released)
 
 
 @router.post("", response_model=ChannelResponse, status_code=status.HTTP_201_CREATED)

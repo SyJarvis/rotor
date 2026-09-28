@@ -25,7 +25,7 @@ from rotor.core.anthropic_errors import (
 )
 from rotor.core.middleware import LoggingMiddleware
 from rotor.core.logging_config import LOG_FORMAT, configure_file_logging
-from rotor.api.v1 import chat, images, models, anthropic, responses
+from rotor.api.v1 import chat, embeddings, images, models, anthropic, responses
 from rotor.api.v1 import anthropic_models
 from rotor.api.admin import (
     auth as admin_auth,
@@ -152,6 +152,7 @@ async def api_root():
         "endpoints": {
             "openai": "/v1/chat/completions",
             "responses": "/v1/responses",
+            "embeddings": "/v1/embeddings",
             "images": "/v1/images/generations",
             "anthropic": "/anthropic/v1/messages",
             "models": "/v1/models",
@@ -172,6 +173,7 @@ async def health():
             "openai_responses",
             "anthropic_messages",
             "openai_images",
+            "openai_embeddings",
         ],
     }
 
@@ -185,6 +187,7 @@ async def frontend_index():
 # Include routers
 app.include_router(chat.router, prefix=settings.API_V1_STR, tags=["chat"])
 app.include_router(responses.router, prefix=settings.API_V1_STR, tags=["responses"])
+app.include_router(embeddings.router, prefix=settings.API_V1_STR, tags=["embeddings"])
 app.include_router(images.router, prefix=settings.API_V1_STR, tags=["images"])
 app.include_router(models.router, prefix=settings.API_V1_STR, tags=["models"])
 # Anthropic-compatible endpoint

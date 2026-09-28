@@ -1,6 +1,6 @@
 [project]
 name = "rotor-gateway"
-version = "0.5.1"
+version = "0.6.0"
 description = "Self-hosted LLM gateway exposing OpenAI Chat, OpenAI Responses, and Anthropic Messages over multiple upstream channels."
 authors = [
     {name = "runkezhong",email = "jarvisshangye@gmail.com"}

@@ -9,7 +9,19 @@ const root = new URL('../', import.meta.url);
 const helperSource = await readFile(new URL('src/rotor/frontend/channel-form.js', root), 'utf8');
 const appSource = await readFile(new URL('src/rotor/frontend/app.js', root), 'utf8');
 const channelsSource = await readFile(new URL('src/rotor/frontend/pages/channels.js', root), 'utf8');
-const backend = JSON.parse(execFileSync(fileURLToPath(new URL('.venv/bin/python', root)), ['-c',
+// Prefer the project virtualenv, but fall back to any interpreter that can
+// import rotor so the test still runs where the venv was built for another OS.
+const python = [fileURLToPath(new URL('.venv/bin/python', root)), 'python3', 'python']
+  .find((candidate) => {
+    try {
+      execFileSync(candidate, ['-c', 'import rotor'], { cwd: root, stdio: 'pipe' });
+      return true;
+    } catch {
+      return false;
+    }
+  });
+if (!python) throw new Error('no Python interpreter with rotor installed was found');
+const backend = JSON.parse(execFileSync(python, ['-c',
   'import json; from rotor.channels.presets import list_provider_presets, provider_defaults; p=list_provider_presets(); print(json.dumps({"presets":p,"defaults":[[x["id"],s,provider_defaults(x["id"],s)] for x in p for s in ["openai","openai_responses","anthropic","anthropic_messages"]]}))'], { cwd: root, encoding: 'utf8' }));
 
 function element(value = '') {

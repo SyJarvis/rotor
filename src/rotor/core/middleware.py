@@ -174,6 +174,7 @@ class LoggingMiddleware:
         protocol = {
             f"{settings.API_V1_STR}/chat/completions": "chat",
             f"{settings.API_V1_STR}/responses": "responses",
+            f"{settings.API_V1_STR}/embeddings": "embeddings",
             f"{settings.API_V1_STR}/images/generations": "images",
             "/anthropic/v1/messages": "anthropic",
         }.get(path) if method == "POST" else None

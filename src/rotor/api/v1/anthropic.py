@@ -13,6 +13,7 @@ from rotor.core.client_session import (
     build_responses_prompt_cache_key,
     resolve_client_session,
 )
+from rotor.core.header_forwarding import snapshot_inbound_headers
 from rotor.core.deps import get_current_token, get_available_channels
 from rotor.application_settings import application_settings
 from rotor.schemas.request import (
@@ -717,6 +718,7 @@ async def messages(
     # Convert Anthropic request to internal format
     internal_request = anthropic_to_openai_request(request)
     internal_request.anthropic_headers = _forwarded_anthropic_headers(http_request)
+    internal_request.inbound_headers = snapshot_inbound_headers(http_request.headers)
 
     # Get available channels for the model
     channels = await get_available_channels(request.model, token, db)

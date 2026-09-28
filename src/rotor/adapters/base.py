@@ -4,6 +4,7 @@ from httpx import AsyncClient, Response, Timeout
 from rotor.models.channel import Channel
 from rotor.schemas.request import ChatCompletionRequest
 from rotor.channels.presets import channel_option, join_api_url, provider_headers
+from rotor.core.header_forwarding import select_forwarded_headers
 
 
 class BaseAdapter(ABC):
@@ -108,6 +109,14 @@ class BaseAdapter(ABC):
         """
         url = await self.get_request_url(request)
         headers = self.setup_request_headers(request)
+        # Channel-opt-in inbound header forwarding. Headers already produced
+        # by the channel (authentication, static extra.headers) always win.
+        channel_header_names = {name.lower() for name in headers}
+        for name, value in select_forwarded_headers(
+            self.channel.extra, request.inbound_headers
+        ).items():
+            if name.lower() not in channel_header_names:
+                headers[name] = value
         body = await self.convert_request(request)
         body = self.prepare_request_body(request, body)
 

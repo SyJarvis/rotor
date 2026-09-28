@@ -71,6 +71,10 @@ class ChatCompletionRequest(BaseModel):
     # an Anthropic upstream. Excluded from generic provider serialization.
     anthropic_payload: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
     anthropic_headers: Optional[Dict[str, str]] = Field(default=None, exclude=True)
+    # Denylist-stripped inbound header snapshot for channels that opt in to
+    # header forwarding (extra.forward_headers). Excluded from serialization
+    # and logging, exactly like the protocol-native payload fields above.
+    inbound_headers: Optional[Dict[str, str]] = Field(default=None, exclude=True)
     # Preserve the original Responses request for a native /responses upstream.
     # Cross-protocol adapters consume the normalized messages/tools instead.
     responses_payload: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
