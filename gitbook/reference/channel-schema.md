@@ -31,6 +31,7 @@ Channel 是路由和上游适配的主要配置对象。
 | `images_path` | 覆盖 Images 生成路径 |
 | `auth_type` | 选择 `bearer`、`x-api-key` 或 `api-key` |
 | `headers` | 添加上游请求头 |
+| `forward_headers` | 允许透传到上游的入站请求头白名单（列表） |
 | `capabilities` | 显式声明渠道能力集合，见下文 |
 | `fallback_cooldown_seconds` | 可重试失败后的冷却时间，默认 30 秒 |
 | `cache_scope` | 可能共享 provider cache 的资源范围 ID |
@@ -52,6 +53,25 @@ coding plan 路由时，可按渠道配置会话标识：
   }
 }
 ```
+
+### forward_headers 透传白名单
+
+`extra.forward_headers` 是字符串数组，声明哪些**客户端入站请求头**可以在出站请求中重复出现，
+用于需要会话亲和或客户端标识的上游（例如 Codex 的 `session-id`）：
+
+```json
+{
+  "forward_headers": ["session-id", "thread-id"]
+}
+```
+
+约束：
+
+- 凭证、逐跳和框架头（`authorization`、`cookie`、`x-api-key`、`content-type`、`host` 等）
+  永不透传，即使被列入白名单。
+- 值必须通过安全校验（无控制字符/换行、长度 ≤ 1024），否则静默丢弃。
+- 出站时如果渠道已生成同名头（认证头或 `headers` 静态配置），**渠道值优先**。
+- 未配置该字段的渠道行为不变（不透传任何入站头）。
 
 ### capabilities 可用值
 

@@ -14,7 +14,7 @@ separately authenticated read-only Control API, and an independent
 ## Key capabilities
 
 - **Unified protocol endpoints**: `/v1/chat/completions`, `/v1/responses`,
-  `/v1/images/generations`, and `/anthropic/v1/messages`.
+  `/v1/images/generations`, `/v1/embeddings`, and `/anthropic/v1/messages`.
 - **Cross-protocol conversion**: basic messages, streaming events, tool calls,
   and usage data across OpenAI Chat, Responses, and Anthropic Messages.
 - **Multi-channel routing**: channel selection by model, protocol, priority,
@@ -184,6 +184,7 @@ Claude Code, and OpenCode configuration.
 | Service status | `GET /health`, `GET /api` |
 | OpenAI Chat | `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` and Response resource endpoints |
+| OpenAI Embeddings | `POST /v1/embeddings` |
 | OpenAI Images | `POST /v1/images/generations` |
 | Anthropic | `POST /anthropic/v1/messages`, `POST /anthropic/v1/messages/count_tokens`, `GET /anthropic/v1/models` |
 | Models | `GET /v1/models` |

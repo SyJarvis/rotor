@@ -68,6 +68,29 @@ curl http://127.0.0.1:8000/v1/models \
 通过管理页检查渠道协议和能力探测结果。原生 Responses 功能需要
 `protocol=openai_responses`。
 
+Responses 错误消息通常会列出两部分事实：
+
+```text
+Required capabilities: ['function_call', 'responses_native', 'stream']
+available channels: [..., 'reasons': ['capability_mismatch'] ...]
+```
+
+按以下顺序排查：
+
+1. 确认请求是否包含 `stream`、function tool、`reasoning`、`previous_response_id`、
+   `conversation`、`background` 或非标准 input item；这些字段可能增加硬能力要求。
+2. 如果包含 `reasoning` 或状态化 Responses 字段，确认候选 Channel 的协议是
+   `openai_responses`（或等价的 `responses`），并且模型列表/映射包含客户端使用的
+   logical model。
+3. 如果只是基础文本或可转换的 function tool，检查 Channel 的
+   `extra.capabilities` 是否显式遗漏了 `stream`、`function_call` 或 `vision`。
+4. 检查当前 Rotor Token 的 `allowed_channels`，以及候选 Channel 是否处于 cooldown。
+
+不要只给 Channel 添加 `responses_native` 能力来绕过错误；这是协议路由约束，最终仍需
+由 `Channel.protocol` 提供对应的原生适配器。日志默认不含完整上游请求 body；请先检查
+路由 attempt、状态码和错误元数据。需要对照具体字段时，通过受控客户端或上游侧诊断，
+并避免暴露凭证和敏感内容。
+
 ## Claude Code 请求 `/v1/messages` 返回 404
 
 Claude Code 的 Base URL 少了 `/anthropic`。正确关系是：
