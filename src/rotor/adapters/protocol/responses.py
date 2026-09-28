@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
-import logging
 import time
 import uuid
 from typing import Any, AsyncIterator
@@ -46,8 +45,6 @@ _RESPONSES_REASONING_EFFORT_ALIASES = {
     "ultra": "max",
     "ultracode": "max",
 }
-
-logger = logging.getLogger(__name__)
 
 
 def _stringify(value: Any) -> str:
@@ -1051,10 +1048,6 @@ class OpenAIResponsesAdapter(BaseAdapter):
         body["model"] = mapped_model
         body["stream"] = bool(request.stream)
         if not _supports_gpt56_prompt_cache(mapped_model):
-            logger.info(
-                "Responses upstream request body: %s",
-                json.dumps(body, ensure_ascii=False, separators=(",", ":")),
-            )
             return body
 
         if request.responses_prompt_cache_key:
@@ -1074,10 +1067,6 @@ class OpenAIResponsesAdapter(BaseAdapter):
                         "ttl": "30m",
                     }
                     break
-        logger.info(
-            "Responses upstream request body: %s",
-            json.dumps(body, ensure_ascii=False, separators=(",", ":")),
-        )
         return body
 
     async def convert_response(

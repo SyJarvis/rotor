@@ -325,6 +325,18 @@ def test_nullable_chat_token_details_convert_and_validate_without_fabricating_co
     assert converted["usage"]["input_tokens_details"]["cached_tokens"] is None
 
 
+def test_chat_to_responses_preserves_provider_token_detail_fields():
+    converted = chat_response_to_responses({
+        "choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 12,
+            "completion_tokens": 3,
+            "prompt_tokens_details": {"cache_write_tokens": 2},
+        },
+    })
+    assert converted["usage"]["input_tokens_details"] == {"cache_write_tokens": 2}
+
+
 @pytest.mark.parametrize("fields", [{}, {"usage": None}, {"usage": {}}])
 def test_chat_to_responses_missing_usage_stays_missing(fields):
     converted = chat_response_to_responses({

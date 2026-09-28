@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 from httpx import (
@@ -91,6 +92,18 @@ def test_chat_stream_converts_to_responses_event_sequence() -> None:
     ]
     assert events[-1]["response"]["output"][0]["content"][0]["text"] == "hello"
     assert events[-1]["response"]["usage"]["total_tokens"] == 6
+
+
+def test_responses_stream_preserves_provider_token_details():
+    transform = ResponsesStreamTransform("test-model")
+    transform.feed({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+    terminal = transform.finish({
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "total_tokens": 15,
+        "input_tokens_details": {"cache_write_tokens": 2},
+    })[-1]["response"]
+    assert terminal["usage"]["input_tokens_details"] == {"cache_write_tokens": 2}
 
 
 def test_responses_function_call_and_output_convert_to_chat() -> None:
@@ -248,7 +261,10 @@ def test_responses_protocol_channel_uses_native_adapter_and_payload() -> None:
     {"reasoning_effort": None},
     *[
         {"reasoning_effort": effort}
-        for effort in ("none", "minimal", "low", "medium", "high", "xhigh", "max", "future-effort")
+        for effort in (
+            "none", "minimal", "low", "medium", "high", "xhigh", "max",
+            "off", "ultra", "ultracode", "future-effort",
+        )
     ],
 ])
 def test_chat_reasoning_effort_reaches_responses_upstream(effort_fields, stream) -> None:
@@ -300,7 +316,62 @@ def test_chat_reasoning_effort_reaches_responses_upstream(effort_fields, stream)
     if effort is None:
         assert "reasoning" not in bodies[0]
     else:
-        assert bodies[0]["reasoning"] == {"effort": effort}
+        expected = {"off": "none", "ultra": "max", "ultracode": "max"}.get(effort, effort)
+        assert bodies[0]["reasoning"] == {"effort": expected}
+
+
+@pytest.mark.parametrize("effort, expected", [
+    ("off", "none"),
+    ("ultra", "max"),
+    ("ultracode", "max"),
+    ("max", "max"),
+])
+def test_responses_reasoning_effort_aliases_reach_native_upstream(effort, expected) -> None:
+    request = responses_request_to_chat(ResponsesRequest.model_validate({
+        "model": "test-model",
+        "input": "hello",
+        "reasoning": {"effort": effort, "summary": "auto"},
+    }))
+
+    channel = SimpleNamespace(
+        id=1,
+        type="openai",
+        protocol="openai_responses",
+        base_url="https://example.com/v1",
+        key="secret",
+        extra={},
+        model_mapping={},
+    )
+    adapter = AdapterFactory.create_adapter(channel, http_client=None)
+
+    body = asyncio.run(adapter.convert_request(request))
+
+    assert body["reasoning"] == {"effort": expected, "summary": "auto"}
+
+
+def test_responses_adapter_does_not_log_complete_upstream_request(caplog) -> None:
+    sensitive_prompt = "private-prompt-content"
+    request = responses_request_to_chat(ResponsesRequest.model_validate({
+        "model": "test-model",
+        "input": sensitive_prompt,
+        "reasoning": {"effort": "ultra"},
+    }))
+    channel = SimpleNamespace(
+        id=1,
+        type="openai",
+        protocol="openai_responses",
+        base_url="https://example.com/v1",
+        key="secret",
+        extra={},
+        model_mapping={},
+    )
+    adapter = AdapterFactory.create_adapter(channel, http_client=None)
+
+    with caplog.at_level(logging.INFO, logger="rotor.adapters.protocol.responses"):
+        asyncio.run(adapter.convert_request(request))
+
+    assert "Responses upstream request body:" not in caplog.text
+    assert sensitive_prompt not in caplog.text
 
 
 @pytest.mark.parametrize("stream", [False, True])
