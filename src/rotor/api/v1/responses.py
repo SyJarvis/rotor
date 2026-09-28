@@ -20,7 +20,6 @@ from rotor.adapters.factory import AdapterFactory
 from rotor.adapters.protocol.responses import (
     OpenAIResponsesAdapter,
     chat_response_to_responses,
-    forwarded_responses_headers,
     responses_required_capabilities,
     responses_request_to_chat,
     unsupported_chat_reasoning_fields,
@@ -29,6 +28,7 @@ from rotor.adapters.protocol.responses import (
 )
 from rotor.core.deps import get_available_channels, get_current_token
 from rotor.core.client_session import resolve_client_session
+from rotor.core.header_forwarding import snapshot_inbound_headers
 from rotor.application_settings import application_settings
 from rotor.core.exceptions import (
     ChannelException,
@@ -400,7 +400,6 @@ async def create_response(
 ):
     """Minimal OpenAI Responses API-compatible endpoint."""
     chat_request = responses_request_to_chat(request)
-    chat_request.responses_headers = forwarded_responses_headers(http_request.headers)
 
     previous_route = None
     if request.previous_response_id:
@@ -433,6 +432,7 @@ async def create_response(
             previous_route.conversation_id if previous_route is not None else None
         ),
     )
+    chat_request.inbound_headers = snapshot_inbound_headers(http_request.headers)
     conversation_id = client_session.session_id or f"conv_{uuid.uuid4().hex[:24]}"
     client_ip = http_request.client.host if http_request.client else "unknown"
     request_origin = getattr(http_request.state, "request_origin", "client")
