@@ -66,6 +66,7 @@ curl -b "$ROTOR_ADMIN_COOKIE_JAR" \
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/admin/channels` | 列出渠道和统计 |
+| `GET` | `/api/admin/channels/routing-state` | 列出运行中的冷却/恢复探测状态 |
 | `GET` | `/api/admin/channels/presets` | 获取 provider 预设 |
 | `GET` | `/api/admin/channels/{id}` | 获取渠道 |
 | `POST` | `/api/admin/channels` | 创建渠道 |
@@ -75,10 +76,51 @@ curl -b "$ROTOR_ADMIN_COOKIE_JAR" \
 | `POST` | `/api/admin/channels/{id}/test` | 测试连通性或能力 |
 | `POST` | `/api/admin/channels/{id}/enable` | 启用渠道 |
 | `POST` | `/api/admin/channels/{id}/disable` | 禁用渠道 |
+| `POST` | `/api/admin/channels/{id}/cooldown/reset` | 手动解除该渠道的临时冷却 |
 
 Channel 请求字段见 [Channel 字段](channel-schema.md)。
 安全 Control API 的 Channel 响应会直接给出生效的 `cache_scope`、`capacity_scope` 和
 `billing_scope`，但仍不返回可能包含认证 Header 的完整 `extra`。
+
+### 运行时冷却状态
+
+`GET /api/admin/channels/routing-state` 返回路由引擎进程内的熔断快照。它不属于持久化
+配置，重启后清空，且只包含仍限制路由的条目（未到期冷却或恢复探针占用中）：
+
+```json
+{"cooldowns": [{
+  "model": "gpt-5.6-terra",
+  "channel_id": 1,
+  "channel_name": "openai-pro",
+  "phase": "cooldown",
+  "remaining_seconds": 17,
+  "cooldown_seconds": 30.0,
+  "known_channel": true
+}]}
+```
+
+`phase` 为 `cooldown`（等待冷却到期）或 `probe`（冷却已到期，首个请求被当作恢复探针）。
+已删除渠道残留的冷却条目会带 `channel_name: null` 与 `known_channel: false`。响应不含
+渠道密钥、Base URL 或额外 Header。
+
+### 手动解除冷却
+
+`POST /api/admin/channels/{id}/cooldown/reset` 清除该渠道的内存冷却，让它立即重新参与
+路由。请求体可省略（解除该渠道全部冷却），或指定单个模型：
+
+```json
+{"model": "gpt-5.6-terra"}
+```
+
+响应给出实际解除的模型列表：
+
+```json
+{"channel_id": 1, "released": ["gpt-5.6-terra"]}
+```
+
+指定 `model` 但没有对应冷却时返回 404；渠道不存在也返回 404。该接口只影响内存中的
+熔断状态，不修改渠道配置，也不能把故障中的上游变成健康——解除后立即重试由运维自行判断。
+正在执行的恢复探针会被摘下，其失败不会重新触发刚被清除的冷却。
 
 ## Tokens
 

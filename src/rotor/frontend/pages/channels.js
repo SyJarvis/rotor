@@ -8,9 +8,101 @@ import {
   skeletonCards, showInline, hideInline, refreshIcons, toast,
 } from "../ui.js";
 
-let state = { channels: [], filter: { q: "", provider: "", status: "" }, testResult: {}, openMenu: null };
+let state = { channels: [], filter: { q: "", provider: "", status: "" }, testResult: {}, openMenu: null, routingState: {}, routingError: null };
 
 export const editState = { id: null };
+
+const cooldownKey = (model, channelId) => `${model}\u0000${channelId}`;
+
+function routingEntries(channelId) {
+  return Object.values(state.routingState).filter((entry) => entry.channel_id === channelId);
+}
+
+function routingLabel(entry) {
+  return t(entry.phase === "probe" ? "recoveryProbeBadge" : "coolingDownBadge")
+    .replace("{{model}}", entry.model)
+    .replace("{{seconds}}", String(entry.remaining_seconds));
+}
+
+function routingBadges(channelId) {
+  const entries = routingEntries(channelId);
+  if (!entries.length) return "";
+  const order = { cooldown: 0, probe: 1 };
+  const badges = entries
+    .sort((a, b) => (order[a.phase] - order[b.phase])
+      || (b.remaining_seconds - a.remaining_seconds)
+      || a.model.localeCompare(b.model))
+    .map((entry) => {
+      const type = entry.phase === "probe" ? "info" : "warning";
+      const icon = entry.phase === "probe" ? "radar" : "hourglass";
+      return `<span class="badge ${type} cooldown-badge" title="${escapeHtml(t("coolingDownHint"))}">`
+        + `<i data-lucide="${icon}"></i>${escapeHtml(routingLabel(entry))}</span>`;
+    });
+  const action = `<button class="btn-secondary btn-tiny" data-channel-cooldown-reset="${channelId}"`
+    + ` title="${escapeHtml(t("resetCooldownHint"))}">`
+    + `<i data-lucide="zap"></i>${escapeHtml(t("resetCooldown"))}</button>`;
+  return `${badges.join("")}${action}`;
+}
+
+function hasCooldown(channelId) {
+  return routingEntries(channelId).length > 0;
+}
+
+function hasAnyCooldown() {
+  return Object.keys(state.routingState).length > 0;
+}
+
+// Cooldowns expire on a ~30s scale, so a loaded page would otherwise show stale
+// badges until the next manual refresh. Poll only while something is cooling.
+const ROUTING_POLL_MS = 5000;
+let routingTimer = null;
+let active = false;
+
+function scheduleRoutingPoll() {
+  clearTimeout(routingTimer);
+  routingTimer = null;
+  if (!active || !hasAnyCooldown()) return;
+  routingTimer = setTimeout(refreshRoutingState, ROUTING_POLL_MS);
+  routingTimer?.unref?.();
+}
+
+async function refreshRoutingState() {
+  if (!active) return;
+  try {
+    state.routingState = indexRoutingState(await api("/api/admin/channels/routing-state"));
+    state.routingError = null;
+  } catch (error) {
+    state.routingError = error;
+  } finally {
+    render();
+    scheduleRoutingPoll();
+  }
+}
+
+function indexRoutingState(routingState) {
+  return Object.fromEntries(
+    (routingState?.cooldowns || [])
+      .map((entry) => [cooldownKey(entry.model, entry.channel_id), entry]),
+  );
+}
+
+export function unload() {
+  active = false;
+  clearTimeout(routingTimer);
+  routingTimer = null;
+}
+
+function orphanRoutingNotices() {
+  const known = new Set(state.channels.map((c) => c.id));
+  const notices = Object.values(state.routingState)
+    .filter((entry) => !known.has(entry.channel_id))
+    .map((entry) => escapeHtml(
+      `${routingLabel(entry)} · ${t("coolingDownUnknownChannel").replace("{{id}}", String(entry.channel_id))}`,
+    ));
+  return notices.length
+    ? `<div class="inline-result warning">${notices.join("<br>")}</div>`
+    : "";
+}
 
 /* ---------- modal openers ---------- */
 function withForm(fn) {
@@ -78,13 +170,25 @@ function setTitle(text) {
 
 export async function load() {
   const container = document.getElementById("channels");
+  active = true;
   skeletonCards(container, 3);
+  state.routingError = null;
   try {
-    state.channels = await api("/api/admin/channels");
+    const [channels, routingState] = await Promise.all([
+      api("/api/admin/channels"),
+      api("/api/admin/channels/routing-state").catch((error) => {
+        state.routingError = error;
+        return null;
+      }),
+    ]);
+    state.channels = channels;
+    state.routingState = indexRoutingState(routingState);
     render();
   } catch (e) {
     container.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><h3>${escapeHtml(e.message)}</h3></div>`;
     refreshIcons(container);
+  } finally {
+    scheduleRoutingPoll();
   }
 }
 
@@ -103,6 +207,7 @@ export function render() {
     if (state.filter.provider && c.type !== state.filter.provider) return false;
     if (state.filter.status === "enabled" && !c.enabled) return false;
     if (state.filter.status === "disabled" && c.enabled) return false;
+    if (state.filter.status === "cooling" && !hasCooldown(c.id)) return false;
     return true;
   });
 
@@ -118,6 +223,9 @@ export function render() {
       </div>
     </div>
 
+    ${state.routingError ? `<div class="inline-result error">${escapeHtml(t("routingStateUnavailable"))} · ${escapeHtml(state.routingError.message)}</div>` : ""}
+    ${orphanRoutingNotices()}
+
     <div class="toolbar">
       <div class="search-box" style="display:flex">
         <i data-lucide="search"></i>
@@ -131,6 +239,7 @@ export function render() {
         <option value="">${t("allStatus") || "All status"}</option>
         <option value="enabled" ${state.filter.status === "enabled" ? "selected" : ""}>${t("enable")}</option>
         <option value="disabled" ${state.filter.status === "disabled" ? "selected" : ""}>${t("disable")}</option>
+        <option value="cooling" ${state.filter.status === "cooling" ? "selected" : ""}>${t("coolingDown")}</option>
       </select>
       <div class="spacer"></div>
       <span class="muted text-sm">${filtered.length} / ${state.channels.length}</span>
@@ -158,9 +267,10 @@ function renderCard(c) {
   const more = (c.models || []).length - models.length;
   const test = state.testResult[c.id];
   const menuOpen = state.openMenu === c.id;
+  const cooling = hasCooldown(c.id);
 
   return `
-    <div class="channel-card ${c.enabled ? "" : "disabled"}">
+    <div class="channel-card ${c.enabled ? "" : "disabled"}${cooling ? " cooling" : ""}">
       <div class="ch-head">
         <span class="status-dot ${c.enabled ? "on" : ""}"></span>
         <span class="ch-name">${escapeHtml(c.name)}</span>
@@ -192,6 +302,7 @@ function renderCard(c) {
         ${statusBadge(c.enabled)}
       </div>
       <div class="ch-base" title="${escapeHtml(c.base_url || "")}">${escapeHtml(c.base_url || "")}</div>
+      ${cooling ? `<div class="ch-meta cooldown-row">${routingBadges(c.id)}</div>` : ""}
       <div class="chips">
         ${models.map((m) => `<span class="chip">${escapeHtml(m)}</span>`).join("")}
         ${more > 0 ? `<span class="chip muted">+${more}</span>` : ""}
@@ -248,6 +359,12 @@ export async function onClick(target) {
     return true;
   }
 
+  const resetCooldown = target.closest("[data-channel-cooldown-reset]")?.dataset.channelCooldownReset;
+  if (resetCooldown) {
+    await resetChannelCooldown(resetCooldown);
+    return true;
+  }
+
   const test = target.dataset.channelTest;
   if (test) {
     state.openMenu = null;
@@ -299,6 +416,26 @@ if (typeof document !== "undefined") {
     state.openMenu = null;
     render();
   }, true);
+}
+
+async function resetChannelCooldown(id) {
+  if (!confirm(t("resetCooldownConfirm"))) return;
+  try {
+    const result = await api(`/api/admin/channels/${id}/cooldown/reset`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    const released = result?.released || [];
+    toast(
+      released.length
+        ? `${t("cooldownCleared")} · ${released.join(", ")}`
+        : t("cooldownNone"),
+      released.length ? "success" : "warning",
+    );
+    await refreshRoutingState();
+  } catch (error) {
+    toast(error.message, "error", 5000);
+  }
 }
 
 async function runTest(id) {

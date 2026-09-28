@@ -23,7 +23,7 @@ for (const [language, message, generic] of [
     const requests = [];
     const context = vm.createContext({ document: {
       getElementById: getElement, querySelector: () => null, addEventListener() {},
-    } });
+    }, setTimeout, clearTimeout });
     const bindings = {
       api: async (url, options = {}) => {
         requests.push([url, options.method || 'GET']);
@@ -46,6 +46,10 @@ for (const [language, message, generic] of [
     await module.namespace.load();
     assert.equal(await module.namespace.onClick({ dataset: { channelTest: '1' }, closest: () => null }), true);
     assert.ok(getElement('channels').innerHTML.includes(message));
-    assert.deepEqual(requests, [['/api/admin/channels', 'GET'], ['/api/admin/channels/1/test', 'POST']]);
+    assert.deepEqual(requests, [
+      ['/api/admin/channels', 'GET'],
+      ['/api/admin/channels/routing-state', 'GET'],
+      ['/api/admin/channels/1/test', 'POST'],
+    ]);
   });
 }

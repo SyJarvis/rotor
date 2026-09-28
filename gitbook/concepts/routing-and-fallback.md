@@ -49,6 +49,28 @@ adaptive 的在线成功率、延迟和 in-flight 负载保存在当前进程内
 流式请求通过准入响应覆盖整个响应生命周期，在流未开始消费、发送失败、断连或取消时
 释放占用。
 
+## 观察冷却状态
+
+冷却与探针状态只保存在进程内存中（`(model, channel_id)` 粒度），不会写入数据库，
+也不会随重启保留。管理控制台的模型渠道页会读取
+`GET /api/admin/channels/routing-state` 并在冷却中的渠道卡片上显示徽标：
+
+```json
+{"cooldowns": [{
+  "model": "gpt-5.6-terra", "channel_id": 1, "channel_name": "openai-pro",
+  "phase": "cooldown", "remaining_seconds": 17,
+  "cooldown_seconds": 30.0, "known_channel": true
+}]}
+```
+
+`phase` 为 `cooldown`（尚未到期）或 `probe`（冷却已到期，等一个请求作为恢复探针）。
+渠道筛选器还提供“冷却中”选项，便于快速定位当前被抑制的渠道。由于状态按模型隔离，
+同一渠道上的其他模型仍会正常路由。
+
+确认上游已恢复（例如服务商公告或自行探测成功）后，可以在渠道卡片上点“解除冷却”
+立即恢复路由，而不必等冷却到期或重启进程。这仅清除内存状态；如果上游仍不可用，
+下一次请求会再次触发冷却。
+
 ## 何时切换渠道
 
 Rotor 对网络请求错误以及以下上游 HTTP 状态执行 fallback：

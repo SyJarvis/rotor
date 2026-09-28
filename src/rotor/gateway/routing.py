@@ -43,6 +43,7 @@ class _Cooldown:
     deadline: float
     generation: int = 0
     probe: AttemptAdmission | None = None
+    cooldown_seconds: float = 30.0
 
 
 _RESPONSES_PROTOCOLS = {"responses", "openai_responses"}
@@ -243,6 +244,24 @@ class RoutingEngine:
                 # A cancelled or locally aborted probe has not proved recovery.
                 self.mark_unavailable(admission.model, admission.channel)
 
+    def routing_state(self) -> list[tuple[str, int, dict]]:
+        """Snapshot process-local cooldown entries that still restrict routing."""
+        with self._lock:
+            now = self._now()
+            return [
+                (
+                    model,
+                    channel_id,
+                    {
+                        "phase": "probe" if state.probe is not None else "cooldown",
+                        "remaining_seconds": max(0, math.ceil(state.deadline - now)),
+                        "cooldown_seconds": round(state.cooldown_seconds, 3),
+                    },
+                )
+                for (model, channel_id), state in self._cooldowns.items()
+                if state.probe is not None or state.deadline > now
+            ]
+
     def retry_after_seconds(self, model: str, channels: Iterable[Channel]) -> int:
         """Return an advisory delay; a running probe has no expiry or timeout lease."""
         with self._lock:
@@ -311,10 +330,28 @@ class RoutingEngine:
             key = (model, channel.id)
             state = self._cooldowns.get(key)
             if state is None:
-                self._cooldowns[key] = _Cooldown(self._now() + cooldown_seconds)
+                self._cooldowns[key] = _Cooldown(
+                    self._now() + cooldown_seconds,
+                    cooldown_seconds=cooldown_seconds,
+                )
             else:
-                state.deadline = max(state.deadline, self._now() + cooldown_seconds)
+                deadline = self._now() + cooldown_seconds
+                if deadline > state.deadline:
+                    state.cooldown_seconds = cooldown_seconds
+                state.deadline = max(state.deadline, deadline)
                 state.generation += 1
+
+    def clear_cooldown(self, model: str | None, channel_id: int) -> list[str]:
+        """Clear process-local cooldowns for one model or an entire channel."""
+        with self._lock:
+            keys = [
+                key
+                for key in self._cooldowns
+                if key[1] == channel_id and (model is None or key[0] == model)
+            ]
+            for key in keys:
+                self._cooldowns.pop(key)
+            return sorted(key[0] for key in keys)
 
     def diagnose(
         self,

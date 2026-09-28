@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — 渠道冷却状态可见
+
+- [路由引擎](src/rotor/gateway/routing.py) 新增 `routing_state()`：以 `(model, channel_id)` 粒度返回仍限制路由的冷却与恢复探针快照，仅包含未到期冷却或探针占用中的条目，重启即清零。
+- 新增管理接口 `GET /api/admin/channels/routing-state`（[channels.py](src/rotor/api/admin/channels.py)、[channel.py](src/rotor/schemas/channel.py)）：返回脱敏的模型、渠道名、阶段、剩余秒数与冷却窗口，不包含渠道密钥。
+- 新增 `POST /api/admin/channels/{id}/cooldown/reset`（[channels.py](src/rotor/api/admin/channels.py)）与 [路由引擎](src/rotor/gateway/routing.py) `clear_cooldown()`：运维可手动解除某渠道全部冷却或指定 `(model, channel)` 的冷却；正在执行的恢复探针会被摘下，其失败不会重新触发刚被清除的冷却。仅影响内存状态，不修改渠道配置。
+- 管理网页模型渠道页（[channels.js](src/rotor/frontend/pages/channels.js)）在冷却中的渠道卡片上显示「冷却中 / 恢复探测中」徽标，提供「解除冷却」按钮，新增「冷却中」筛选，并在页面停留期间每 5 秒轮询一次，冷却清零或离开页面即停止；已删除渠道的残留冷却单独提示。
+- 回归见 [test_routing.py](tests/test_routing.py)、[test_admin_channels_api.py](tests/test_admin_channels_api.py)、[test_channel_routing_state_frontend.mjs](tests/test_channel_routing_state_frontend.mjs)。
+
 ## 2026-09-11 — Rotor 0.5.1
 
 ### 协议完整性与错误外壳
