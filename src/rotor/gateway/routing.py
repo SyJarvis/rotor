@@ -406,6 +406,9 @@ class RoutingEngine:
             protocol not in _RESPONSES_PROTOCOLS | _ANTHROPIC_PROTOCOLS
             and provider_type != "anthropic"
         )
+        if "embeddings" in remaining:
+            if protocol in _ANTHROPIC_PROTOCOLS or provider_type == "anthropic":
+                return False
         if "stop_sequences" in remaining:
             if protocol in _RESPONSES_PROTOCOLS:
                 return False
