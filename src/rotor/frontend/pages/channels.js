@@ -11,6 +11,7 @@ import {
 let state = { channels: [], filter: { q: "", provider: "", status: "" }, testResult: {}, openMenu: null, routingState: {}, routingError: null };
 
 export const editState = { id: null };
+let editRequest = 0;
 
 const cooldownKey = (model, channelId) => `${model}\u0000${channelId}`;
 
@@ -88,6 +89,7 @@ function indexRoutingState(routingState) {
 
 export function unload() {
   active = false;
+  editRequest += 1;
   clearTimeout(routingTimer);
   routingTimer = null;
 }
@@ -112,6 +114,7 @@ function withForm(fn) {
 }
 
 export function openCreate() {
+  editRequest += 1;
   editState.id = null;
   withForm((form) => {
     form.reset();
@@ -130,8 +133,18 @@ export function openCreate() {
   refreshIcons(document.getElementById("channelModal"));
 }
 
-export function openEdit(channel) {
+export async function openEdit(channel) {
   if (!channel) return;
+  const request = ++editRequest;
+  editState.id = null;
+  document.getElementById("channelModal").classList.add("hidden");
+  try {
+    channel = await api(`/api/admin/channels/${channel.id}`);
+  } catch (error) {
+    if (request === editRequest) toast(error.message, "error");
+    return;
+  }
+  if (request !== editRequest) return;
   editState.id = channel.id;
   const extra = channel.extra || {};
   const { models_path, request_path, auth_type, ...restExtra } = extra;
@@ -383,7 +396,7 @@ export async function onClick(target) {
   const editId = target.dataset.channelEdit;
   if (editId) {
     const channel = state.channels.find((c) => String(c.id) === String(editId));
-    if (channel) openEdit(channel);
+    if (channel) await openEdit(channel);
     return true;
   }
 
