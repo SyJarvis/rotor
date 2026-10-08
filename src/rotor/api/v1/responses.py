@@ -419,6 +419,8 @@ async def create_response(
             )
         ):
             raise HTTPException(status_code=404, detail="Response not found")
+        if str(previous_channel.type or "").lower() == "openai_codex":
+            raise HTTPException(status_code=400, detail="ChatGPT OAuth does not support stored response continuation")
         channels = [previous_channel]
     else:
         channels = await get_available_channels(chat_request.model, token, db)
@@ -513,6 +515,10 @@ async def create_response(
         if routing_decision is not None and routing_decision.temporarily_unavailable:
             raise ChannelsTemporarilyUnavailable(chat_request.model, routing_decision.retry_after_seconds)
         required_capabilities = responses_required_capabilities(request)
+        if "responses_persistence" in required_capabilities and any(
+            str(channel.type or "").lower() == "openai_codex" for channel in channels
+        ):
+            raise HTTPException(status_code=400, detail="ChatGPT OAuth does not support stored or background responses")
         required = sorted(required_capabilities)
         channel_summary = routing_engine.diagnose(
             channels,
@@ -825,6 +831,7 @@ async def _resolve_response_channel(
         channel is None
         or str(channel.protocol or "").lower()
         not in {"responses", "openai_responses"}
+        or str(channel.type or "").lower() == "openai_codex"
         or (token.allowed_channels and channel.id not in token.allowed_channels)
     ):
         # Do not disclose whether another token owns a response or whether its
@@ -938,12 +945,14 @@ async def _native_collection_request(
         model=model,
         token=token,
         request_protocol="openai_responses",
-        required_capabilities={"responses_native"},
+        required_capabilities={"responses_resources"},
     )
     candidates = decision.candidates
     if not candidates:
         if decision.temporarily_unavailable:
             raise ChannelsTemporarilyUnavailable(model, decision.retry_after_seconds)
+        if any(str(channel.type or "").lower() == "openai_codex" for channel in channels):
+            raise HTTPException(status_code=400, detail="ChatGPT OAuth does not support Responses resources")
         raise ChannelException(
             f"No native Responses channel available for model '{model}'",
             status_code=503,

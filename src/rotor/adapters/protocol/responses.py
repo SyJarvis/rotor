@@ -317,6 +317,8 @@ def responses_required_capabilities(request: ResponsesRequest) -> set[str]:
     required: set[str] = set()
     if request.stream:
         required.add("stream")
+    if request.previous_response_id or request.conversation or request.background or request.store is True:
+        required.add("responses_persistence")
     if any(
         isinstance(tool, dict) and tool.get("type") == "function"
         for tool in (request.tools or [])
