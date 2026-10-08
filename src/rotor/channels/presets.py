@@ -13,6 +13,14 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "request_path": "/chat/completions",
         "auth_type": "bearer",
     },
+    "openai_codex": {
+        "label": "ChatGPT OAuth",
+        "protocol": "openai_responses",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "models_path": "/models",
+        "request_path": "/responses",
+        "auth_type": "bearer",
+    },
     "deepseek": {
         "label": "DeepSeek",
         "protocol": "openai",

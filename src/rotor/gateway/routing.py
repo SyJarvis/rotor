@@ -439,6 +439,14 @@ class RoutingEngine:
         remaining = set(required)
         protocol = str(channel.protocol or "").lower()
         provider_type = str(getattr(channel, "type", "") or "").lower()
+        if provider_type == "openai_codex" and remaining.intersection({
+            "embeddings", "image_generation", "responses_resources", "responses_persistence",
+        }):
+            return False
+        if remaining.intersection({"responses_resources", "responses_persistence"}):
+            if protocol not in _RESPONSES_PROTOCOLS:
+                return False
+            remaining.difference_update({"responses_resources", "responses_persistence"})
         chat_protocol = (
             protocol not in _RESPONSES_PROTOCOLS | _ANTHROPIC_PROTOCOLS
             and provider_type != "anthropic"

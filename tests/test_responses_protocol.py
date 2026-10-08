@@ -1220,6 +1220,7 @@ def test_native_only_responses_features_require_native_channel() -> None:
     assert responses_required_capabilities(request) == {
         "stream",
         "responses_native",
+        "responses_persistence",
         "vision",
     }
 
