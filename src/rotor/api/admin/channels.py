@@ -9,6 +9,7 @@ from sqlalchemy import case, func, select
 
 from rotor.database import get_db
 from rotor.adapters.factory import AdapterFactory
+from rotor.adapters.protocol.openai_integrity import ChatStreamIntegrity
 from rotor.core.exceptions import format_error_message
 from rotor.gateway.routing import routing_engine
 from rotor.models.channel import Channel
@@ -460,9 +461,22 @@ async def _probe_generation_capability(
         response = await adapter.make_request(request, timeout=30.0)
         if request.stream:
             try:
-                async for _ in adapter.stream_convert_response(response, request):
-                    return
-                raise RuntimeError("Provider returned an empty stream")
+                integrity = ChatStreamIntegrity(
+                    expected_choices=request.n,
+                    upstream_status=response.status_code,
+                    secret=channel.key,
+                )
+                saw_text = False
+                async for chunk in adapter.stream_convert_response(response, request):
+                    integrity.feed(chunk)
+                    for choice in chunk.get("choices") or []:
+                        content = (choice.get("delta") or {}).get("content")
+                        if isinstance(content, str) and content:
+                            saw_text = True
+                integrity.finish()
+                if not saw_text:
+                    raise RuntimeError("Provider stream contained no text content")
+                return
             finally:
                 await response.aclose()
 

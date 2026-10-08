@@ -1,15 +1,17 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, MockTransport, Response
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import rotor.api.admin.channels as channels_api
 from rotor.api.admin.channels import router
 from rotor.database import Base, get_db
 from rotor.models.channel import Channel
+from rotor.core.exceptions import UpstreamProtocolError
 
 
 def test_probe_models_error_detail_redacts_upstream_secrets(monkeypatch) -> None:
@@ -546,3 +548,159 @@ def test_channel_api_rejects_invalid_capabilities_before_saving(method, path) ->
     assert response.status_code == 422
     assert response.json()["detail"][0]["loc"] == ["body", "extra"]
     assert "extra.capabilities must be a list of strings" in response.json()["detail"][0]["msg"]
+
+
+def _mock_stream_probe(monkeypatch, chunks, error=None):
+    response = SimpleNamespace(status_code=200, close_count=0)
+    observed = []
+
+    async def close():
+        response.close_count += 1
+
+    response.aclose = close
+
+    class FakeAdapter:
+        async def make_request(self, request, timeout=None):
+            assert request.stream is True
+            return response
+
+        async def stream_convert_response(self, response, request):
+            for chunk in chunks:
+                observed.append(chunk)
+                yield chunk
+            if error is not None:
+                raise error
+
+    monkeypatch.setattr(channels_api.AdapterFactory, "create_adapter", lambda channel, client: FakeAdapter())
+    channel = SimpleNamespace(key="unused")
+
+    def run():
+        return asyncio.run(channels_api._probe_generation_capability(
+            channel=channel, model="model", capability="stream",
+        ))
+
+    return run, response, observed
+
+
+def _probe_chunk(delta=None, finish=None):
+    return {"choices": [{"index": 0, "delta": delta or {}, "finish_reason": finish}]}
+
+
+@pytest.mark.parametrize("finish", ["stop", "length"])
+def test_stream_capability_probe_consumes_complete_generation_and_closes(monkeypatch, finish) -> None:
+    chunks = [
+        _probe_chunk({"role": "assistant"}),
+        _probe_chunk({"content": "OK"}),
+        _probe_chunk(finish=finish),
+        {"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+    ]
+    run, response, observed = _mock_stream_probe(monkeypatch, chunks)
+
+    assert run() is None
+    assert observed == chunks
+    assert response.close_count == 1
+
+
+@pytest.mark.parametrize("chunks,error", [
+    ([], UpstreamProtocolError),
+    ([_probe_chunk({"role": "assistant"}), _probe_chunk(finish="stop")], RuntimeError),
+    ([_probe_chunk(finish="stop")], RuntimeError),
+    ([_probe_chunk({"content": ""}), _probe_chunk(finish="stop")], RuntimeError),
+    ([_probe_chunk({"content": "OK"})], UpstreamProtocolError),
+    ([_probe_chunk({"content": "OK"}), _probe_chunk({"content": "late"}, finish="")], UpstreamProtocolError),
+])
+def test_stream_capability_probe_rejects_empty_or_unfinished_generation(monkeypatch, chunks, error) -> None:
+    run, response, observed = _mock_stream_probe(monkeypatch, chunks)
+
+    with pytest.raises(error):
+        run()
+
+    assert observed == chunks
+    assert response.close_count == 1
+
+
+@pytest.mark.parametrize("chunks", [
+    [_probe_chunk({"role": "assistant"})],
+    [_probe_chunk({"content": "OK"})],
+    [_probe_chunk({"content": "OK"}), _probe_chunk(finish="stop")],
+])
+def test_stream_capability_probe_rejects_late_transport_errors_and_closes(monkeypatch, chunks) -> None:
+    error = RuntimeError("upstream disconnected before completion")
+    run, response, observed = _mock_stream_probe(monkeypatch, chunks, error=error)
+
+    with pytest.raises(RuntimeError, match="upstream disconnected before completion"):
+        run()
+
+    assert observed == chunks
+    assert response.close_count == 1
+
+
+def test_stream_capability_probe_rejects_late_error_payload_and_closes(monkeypatch) -> None:
+    chunks = [
+        _probe_chunk({"content": "OK"}), _probe_chunk(finish="stop"),
+        {"error": {"message": "late provider failure"}},
+    ]
+    run, response, observed = _mock_stream_probe(monkeypatch, chunks)
+
+    with pytest.raises(UpstreamProtocolError, match="late provider failure"):
+        run()
+
+    assert observed == chunks
+    assert response.close_count == 1
+
+
+@pytest.mark.parametrize("protocol", ["openai", "openai_responses", "anthropic"])
+@pytest.mark.parametrize("complete", [True, False])
+def test_stream_capability_probe_checks_real_adapter_completion(monkeypatch, protocol, complete) -> None:
+    if protocol == "openai":
+        events = [_probe_chunk({"content": "OK"}), _probe_chunk(finish="stop")]
+    elif protocol == "openai_responses":
+        events = [
+            {"type": "response.output_text.delta", "delta": "OK"},
+            {"type": "response.completed", "response": {
+                "id": "resp-probe", "object": "response", "status": "completed",
+                "model": "model", "output": [],
+            }},
+        ]
+    else:
+        events = [
+            {"type": "message_start", "message": {
+                "id": "msg-probe", "type": "message", "role": "assistant", "model": "model",
+                "content": [], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 0},
+            }},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "OK"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}},
+            {"type": "message_stop"},
+        ]
+    if not complete:
+        events = events[:-1]
+    body = "".join("data: " + json.dumps(event) + "\n\n" for event in events)
+    responses = []
+
+    def upstream(request):
+        response = Response(200, content=body, headers={"content-type": "text/event-stream"})
+        responses.append(response)
+        return response
+
+    monkeypatch.setattr(channels_api.httpx, "AsyncClient", lambda **kwargs: AsyncClient(
+        transport=MockTransport(upstream), **kwargs,
+    ))
+    channel = Channel(
+        id=1, name="mock", type="openai", protocol=protocol, key="unused",
+        base_url="https://mock.invalid/v1", models=["model"], model_mapping={}, extra={},
+    )
+
+    def run():
+        return asyncio.run(channels_api._probe_generation_capability(
+            channel=channel, model="model", capability="stream",
+        ))
+
+    if complete:
+        assert run() is None
+    else:
+        with pytest.raises(UpstreamProtocolError):
+            run()
+    assert len(responses) == 1
+    assert responses[0].is_closed
