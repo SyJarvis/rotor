@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
-    <link rel="stylesheet" href="/styles.css?v=26">
+    <link rel="stylesheet" href="/styles.css?v=32">
     <script>
       // FOUC guard — must run before body paints.
       (function () {
@@ -133,7 +133,7 @@
         <header class="modal-head">
           <div>
             <h2 id="channelModalTitle" data-i18n="addChannelTitle">新增模型渠道</h2>
-            <p data-i18n="addChannelDescription">配置一个上游 API Key 及其可用模型。</p>
+            <p data-i18n="addChannelDescription">选择 API Key 或认证登录，并配置可用模型。</p>
           </div>
           <button class="icon-btn" id="closeChannelModal" aria-label="Close">
             <i data-lucide="x"></i>
@@ -146,6 +146,19 @@
               <input name="name" placeholder="deepseek-main" required>
             </label>
             <label>
+              <span data-i18n="credentialType">渠道认证</span>
+              <select name="credential_type">
+                <option value="api_key">API Key</option>
+                <option value="oauth" data-i18n="oauthCredentialType">认证登录</option>
+              </select>
+            </label>
+            <label id="channelOAuthProviderField" class="hidden">
+              <span data-i18n="oauthProvider">登录服务</span>
+              <select name="oauth_provider">
+                <option value="chatgpt">ChatGPT OAuth</option>
+              </select>
+            </label>
+            <label id="channelProviderField">
               <span data-i18n="provider">服务商</span>
               <select name="type">
                 <option value="openai">OpenAI-compatible</option>
@@ -155,17 +168,52 @@
                 <option value="minimax">MiniMax</option>
                 <option value="zhipu">Zhipu</option>
                 <option value="kimi">Kimi</option>
+                <option value="openai_codex" hidden>ChatGPT OAuth</option>
               </select>
             </label>
-            <label class="span-2">
+            <label class="span-2" id="channelBaseUrlField">
               <span data-i18n="upstreamBaseUrl">上游 Base URL</span>
               <input name="base_url" placeholder="https://api.deepseek.com" required>
             </label>
-            <label class="span-2">
+            <label class="span-2" id="channelKeyField">
               <span data-i18n="upstreamApiKey">上游 API Key</span>
               <input name="key" type="password" placeholder="provider api key" required>
             </label>
-            <label>
+            <section id="channelOAuthPanel" class="channel-oauth-panel span-2 hidden" aria-label="ChatGPT OAuth">
+              <p class="muted text-sm" data-i18n="oauthDescription">在浏览器完成 ChatGPT 授权，再将完整回调 URL 粘贴回此处。</p>
+              <h3 data-i18n="oauthStepLink">1. 生成并打开授权链接</h3>
+              <div class="actions">
+                <button type="button" class="btn-secondary" id="channelOAuthLogin" data-i18n="oauthLogin">生成授权链接</button>
+                <button type="button" class="btn-secondary hidden" id="channelOAuthCancel" data-i18n="cancel">取消</button>
+              </div>
+              <div id="channelOAuthLink" class="channel-oauth-link hidden">
+                <span data-i18n="oauthOpenUrl">打开官方授权页面</span>
+                <a id="channelOAuthUrl" target="_blank" rel="noopener noreferrer"></a>
+                <div><button type="button" class="btn-secondary btn-tiny" data-copy-target="channelOAuthUrl" data-i18n="oauthCopyLink">复制授权链接</button></div>
+                <p class="muted text-sm" data-i18n="oauthCallbackHint">授权后，复制地址栏中完整的 http://localhost:1455/auth/callback?... URL。即使页面提示无法连接，也复制该地址；Rotor 不监听 1455 端口。</p>
+              </div>
+              <div id="channelOAuthCallbackStep" class="channel-oauth-callback hidden">
+                <h3 data-i18n="oauthStepParse">2. 粘贴并解析回调 URL</h3>
+                <label>
+                  <span data-i18n="oauthCallbackUrl">完整回调 URL</span>
+                  <textarea id="channelOAuthCallback" placeholder="http://localhost:1455/auth/callback?code=...&amp;state=..." autocomplete="off" spellcheck="false"></textarea>
+                </label>
+                <div><button type="button" class="btn-secondary" id="channelOAuthParse" data-i18n="oauthParse" disabled>解析 URL</button></div>
+                <div id="channelOAuthPreview" class="channel-oauth-preview hidden">
+                  <dl>
+                    <dt>code</dt><dd><code id="channelOAuthCode"></code></dd>
+                    <dt>state</dt><dd><code id="channelOAuthState"></code></dd>
+                    <dt>redirect_uri</dt><dd><code id="channelOAuthRedirect"></code></dd>
+                  </dl>
+                  <p class="muted text-sm" data-i18n="oauthCallbackMatched">回调地址和 state 已匹配当前会话。点击完成授权后才会交换凭证。</p>
+                </div>
+                <h3 data-i18n="oauthStepComplete">3. 完成授权</h3>
+                <div><button type="button" class="btn-primary" id="channelOAuthComplete" data-i18n="oauthComplete" disabled>完成授权</button></div>
+              </div>
+              <div id="channelOAuthStatus" class="inline-result" role="status" aria-live="polite"></div>
+              <p class="muted text-sm" data-i18n="oauthModelsHint">完成授权后可主动探测账号模型目录或手动填写；目录不代表每个模型都已通过生成验证。</p>
+            </section>
+            <label id="channelProtocolField">
               <span data-i18n="protocol">协议</span>
               <select name="protocol">
                 <option value="openai">openai</option>
@@ -173,7 +221,7 @@
                 <option value="anthropic">anthropic</option>
               </select>
             </label>
-            <label>
+            <label id="channelHeaderAuthField">
               <span data-i18n="authType">鉴权方式</span>
               <select name="auth_type">
                 <option value="bearer">Bearer Token</option>
@@ -181,11 +229,11 @@
                 <option value="api-key">api-key</option>
               </select>
             </label>
-            <label>
+            <label id="channelModelsPathField">
               <span data-i18n="modelsPath">模型列表路径</span>
               <input name="models_path" value="/models" required>
             </label>
-            <label>
+            <label id="channelRequestPathField">
               <span data-i18n="requestPath">模型调用路径</span>
               <input name="request_path" value="/chat/completions" required>
             </label>
@@ -326,7 +374,7 @@
       </div>
     </div>
 
-    <script src="/config.js?v=32"></script>
-    <script type="module" src="/auth.js?v=16"></script>
+    <script src="/config.js?v=37"></script>
+    <script type="module" src="/auth.js?v=23"></script>
   </body>
 </html>

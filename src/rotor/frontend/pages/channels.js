@@ -2,7 +2,7 @@
 
 import { api } from "../api.js?v=2";
 import { t } from "../i18n.js";
-import { channelDefaults, rememberChannelDefaults, applyChannelDefaults } from "../channel-form.js";
+import { channelDefaults, rememberChannelDefaults, applyChannelDefaults } from "../channel-form.js?v=2";
 import {
   escapeHtml, parseCsv, parseJson, badge, statusBadge,
   skeletonCards, showInline, hideInline, refreshIcons, toast,
@@ -10,8 +10,344 @@ import {
 
 let state = { channels: [], filter: { q: "", provider: "", status: "" }, testResult: {}, openMenu: null, routingState: {}, routingError: null };
 
-export const editState = { id: null };
+export const editState = { id: null, authType: "api_key", authStatus: null };
 let editRequest = 0;
+let oauthSession = null;
+let oauthGeneration = 0;
+let oauthStarting = false;
+let oauthParsing = false;
+let oauthCompleting = false;
+let oauthInputRevision = 0;
+let oauthPreview = null;
+let oauthNotice = null;
+let modelsProbing = false;
+const probingChannels = new Set();
+const OAUTH_REDIRECT_URI = "http://localhost:1455/auth/callback";
+
+const OAUTH_CONNECTION = {
+  type: "openai_codex", protocol: "openai_responses",
+  base_url: "https://chatgpt.com/backend-api/codex",
+};
+
+export function usesOAuth(form) {
+  return form?.elements.credential_type?.value === "oauth";
+}
+
+export function authGeneration() { return oauthGeneration; }
+
+export function oauthProbePath(form) {
+  if (!usesOAuth(form) || oauthStarting) return null;
+  if (oauthSession) {
+    if (Date.now() / 1000 >= oauthSession.expires_at) {
+      oauthSession.status = "expired";
+      oauthNotice = null;
+      clearOAuthPreview();
+      return null;
+    }
+    return oauthSession.status === "authorized"
+      ? `/api/admin/channels/oauth/sessions/${encodeURIComponent(oauthSession.session_id)}/probe-models`
+      : null;
+  }
+  return editState.id && editState.authType === "oauth" && ["connected", "error"].includes(editState.authStatus)
+    ? `/api/admin/channels/${editState.id}/probe-models` : null;
+}
+
+export function setModelsProbing(probing) {
+  modelsProbing = probing;
+  renderOAuth();
+}
+
+function oauthStatus(message, type = "") {
+  const result = document.getElementById("channelOAuthStatus");
+  if (result) {
+    result.textContent = message;
+    result.className = `inline-result ${type}`;
+  }
+}
+
+function renderOAuth() {
+  const form = document.getElementById("channelForm");
+  const oauth = usesOAuth(form);
+  const probe = document.getElementById("probeModels");
+  if (probe) probe.disabled = modelsProbing || (oauth && !oauthProbePath(form));
+  const login = document.getElementById("channelOAuthLogin");
+  if (login) {
+    login.disabled = oauthStarting || oauthCompleting || oauthSession?.status === "exchanging";
+    login.textContent = t(oauthStarting ? "oauthStarting" : editState.authType === "oauth" ? "oauthRelogin" : "oauthLogin");
+  }
+  const pending = oauthSession?.status === "pending";
+  const callbackVisible = pending || oauthSession?.status === "exchanging";
+  const expired = oauthSession && Date.now() / 1000 >= oauthSession.expires_at;
+  document.getElementById("channelOAuthLink")?.classList.toggle("hidden", !oauth || !callbackVisible);
+  document.getElementById("channelOAuthCallbackStep")?.classList.toggle("hidden", !oauth || !callbackVisible);
+  document.getElementById("channelOAuthPreview")?.classList.toggle("hidden", !oauthPreview);
+  const input = document.getElementById("channelOAuthCallback");
+  if (input) input.disabled = oauthCompleting;
+  const parse = document.getElementById("channelOAuthParse");
+  if (parse) parse.disabled = !pending || expired || oauthParsing || oauthCompleting || !input?.value.trim();
+  const complete = document.getElementById("channelOAuthComplete");
+  if (complete) complete.disabled = !pending || expired || oauthParsing || oauthCompleting
+    || !oauthPreview || oauthPreview.callback_url !== input?.value.trim();
+  const cancel = document.getElementById("channelOAuthCancel");
+  cancel?.classList.toggle("hidden", !oauthSession && !oauthStarting);
+  if (!oauth) return;
+  if (oauthStarting) oauthStatus(t("oauthStarting"));
+  else if (oauthCompleting) oauthStatus(t("oauthCompleting"));
+  else if (oauthParsing) oauthStatus(t("oauthParsing"));
+  else if (oauthNotice) oauthStatus(t(oauthNotice.key), oauthNotice.type);
+  else if (oauthSession) {
+    const statusKeys = {
+      pending: "oauthPending", authorized: "oauthAuthorized", failed: "oauthFailed",
+      expired: "oauthExpired", cancelled: "oauthCancelled", consumed: "oauthExpired", exchanging: "oauthCompleting",
+    };
+    const status = oauthSession.status;
+    oauthStatus(t(status === "pending" && oauthPreview ? "oauthCallbackMatched" : statusKeys[status] || "oauthFailed"),
+      status === "authorized" || (status === "pending" && oauthPreview) ? "success" : ["pending", "exchanging"].includes(status) ? "" : "error");
+  } else if (editState.authType === "oauth" && editState.authStatus === "connected") {
+    oauthStatus(t("oauthConnected"), "success");
+  } else if (editState.authType === "oauth" && editState.authStatus === "error") {
+    oauthStatus(t("oauthNeedsLogin"), "warning");
+  } else oauthStatus(t("oauthLoginRequired"));
+}
+
+export function cancelOAuthLogin({ consumed = false } = {}) {
+  const sessionId = oauthSession?.session_id;
+  oauthGeneration += 1;
+  resetSaveButton();
+  modelsProbing = false;
+  const probe = document.getElementById("probeModels");
+  if (probe) {
+    probe.innerHTML = `<i data-lucide="radar"></i><span>${t("probeModels")}</span>`;
+    refreshIcons(probe);
+  }
+  const probeResult = document.getElementById("probeResult");
+  if (probeResult) {
+    probeResult.textContent = "";
+    probeResult.className = "inline-result hidden";
+  }
+  oauthSession = null;
+  oauthStarting = false;
+  oauthParsing = false;
+  oauthCompleting = false;
+  oauthNotice = null;
+  oauthInputRevision += 1;
+  clearOAuthPreview();
+  const input = document.getElementById("channelOAuthCallback");
+  if (input) input.value = "";
+  const link = document.getElementById("channelOAuthUrl");
+  if (link) {
+    link.textContent = "";
+    link.removeAttribute?.("href");
+  }
+  if (sessionId && !consumed) {
+    api(`/api/admin/channels/oauth/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" }).catch(() => {});
+  }
+  renderOAuth();
+}
+
+function clearOAuthPreview() {
+  oauthPreview = null;
+  for (const id of ["channelOAuthCode", "channelOAuthState", "channelOAuthRedirect"]) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = "";
+  }
+}
+
+export function changeOAuthCallback() {
+  oauthInputRevision += 1;
+  oauthNotice = null;
+  clearOAuthPreview();
+  renderOAuth();
+}
+
+function oauthSessionReady() {
+  if (!oauthSession || oauthSession.status !== "pending") return false;
+  if (Date.now() / 1000 >= oauthSession.expires_at) {
+    oauthSession.status = "expired";
+    oauthNotice = null;
+    clearOAuthPreview();
+    renderOAuth();
+    return false;
+  }
+  return true;
+}
+
+function resetSaveButton() {
+  const button = document.getElementById("saveChannelBtn");
+  if (button) {
+    button.disabled = false;
+    button.innerHTML = `<i data-lucide="check"></i><span>${t("saveChannel")}</span>`;
+  }
+}
+
+export function closeForm() {
+  editRequest += 1;
+  cancelOAuthLogin();
+  document.getElementById("channelModal")?.classList.add("hidden");
+}
+
+export function changeCredentialType(form, { resetConnection = true } = {}) {
+  cancelOAuthLogin();
+  const oauth = usesOAuth(form);
+  for (const [name, id] of [
+    ["type", "channelProviderField"], ["base_url", "channelBaseUrlField"],
+    ["protocol", "channelProtocolField"], ["auth_type", "channelHeaderAuthField"],
+    ["models_path", "channelModelsPathField"], ["request_path", "channelRequestPathField"],
+    ["key", "channelKeyField"],
+  ]) {
+    if (form.elements[name]) form.elements[name].disabled = oauth;
+    document.getElementById(id)?.classList.toggle("hidden", oauth);
+  }
+  document.getElementById("channelOAuthProviderField")?.classList.toggle("hidden", !oauth);
+  document.getElementById("channelOAuthPanel")?.classList.toggle("hidden", !oauth);
+  document.getElementById("probeModels")?.classList.remove("hidden");
+  const key = form.elements.key;
+  key.required = !oauth && (!editState.id || editState.authType === "oauth");
+  key.placeholder = key.required ? "provider api key" : t("keepUnchanged");
+  if (oauth) {
+    key.value = "";
+    for (const [name, value] of Object.entries(OAUTH_CONNECTION)) form.elements[name].value = value;
+    form.elements.auth_type.value = "bearer";
+    form.elements.models_path.value = "/models";
+    form.elements.request_path.value = "/responses";
+    rememberChannelDefaults(form);
+  } else if (resetConnection && form.elements.type.value === "openai_codex") {
+    form.elements.type.value = "openai";
+    form.elements.protocol.value = "openai";
+    applyChannelDefaults(form, { reset: true });
+  }
+  renderOAuth();
+}
+
+export async function startOAuthLogin() {
+  const form = document.getElementById("channelForm");
+  if (!usesOAuth(form) || oauthStarting || oauthCompleting) return;
+  cancelOAuthLogin();
+  const generation = oauthGeneration;
+  oauthStarting = true;
+  renderOAuth();
+  let startedSessionId = null;
+  try {
+    const result = await api("/api/admin/channels/oauth/sessions", {
+      method: "POST", body: JSON.stringify(editState.id ? { channel_id: editState.id } : {}),
+    });
+    if (generation !== oauthGeneration) {
+      if (result.session_id) api(`/api/admin/channels/oauth/sessions/${encodeURIComponent(result.session_id)}`, { method: "DELETE" }).catch(() => {});
+      return;
+    }
+    startedSessionId = result.session_id;
+    const uri = new URL(result.authorization_url);
+    if (uri.origin !== "https://auth.openai.com" || uri.pathname !== "/oauth/authorize"
+      || uri.username || uri.password || uri.hash || result.redirect_uri !== OAUTH_REDIRECT_URI
+      || uri.searchParams.get("redirect_uri") !== OAUTH_REDIRECT_URI || !uri.searchParams.get("state")) {
+      throw new Error("Invalid authorization URL");
+    }
+    oauthSession = {
+      session_id: result.session_id, status: result.status, expires_at: result.expires_at,
+      authorization_url: uri.href,
+    };
+    document.getElementById("channelOAuthUrl").href = uri.href;
+    document.getElementById("channelOAuthUrl").textContent = uri.href;
+  } catch {
+    if (generation !== oauthGeneration) return;
+    if (startedSessionId) api(`/api/admin/channels/oauth/sessions/${encodeURIComponent(startedSessionId)}`, { method: "DELETE" }).catch(() => {});
+    oauthSession = { status: "failed" };
+  } finally {
+    if (generation === oauthGeneration) {
+      oauthStarting = false;
+      renderOAuth();
+    }
+  }
+}
+
+export async function parseOAuthCallback() {
+  const form = document.getElementById("channelForm");
+  if (!usesOAuth(form) || oauthParsing || oauthCompleting || !oauthSessionReady()) return;
+  const callbackUrl = document.getElementById("channelOAuthCallback")?.value.trim();
+  if (!callbackUrl) return;
+  const generation = oauthGeneration;
+  const revision = oauthInputRevision;
+  clearOAuthPreview();
+  oauthNotice = null;
+  oauthParsing = true;
+  renderOAuth();
+  try {
+    const result = await api(`/api/admin/channels/oauth/sessions/${encodeURIComponent(oauthSession.session_id)}/parse`, {
+      method: "POST", body: JSON.stringify({ callback_url: callbackUrl }),
+    });
+    if (generation !== oauthGeneration || revision !== oauthInputRevision || !oauthSessionReady()) return;
+    const expectedState = new URL(oauthSession.authorization_url).searchParams.get("state");
+    if (typeof result.code !== "string" || !result.code || result.state !== expectedState
+      || result.redirect_uri !== OAUTH_REDIRECT_URI) throw new Error("Invalid callback values");
+    oauthPreview = { callback_url: callbackUrl };
+    document.getElementById("channelOAuthCode").textContent = result.code;
+    document.getElementById("channelOAuthState").textContent = result.state;
+    document.getElementById("channelOAuthRedirect").textContent = result.redirect_uri;
+  } catch {
+    if (generation === oauthGeneration && revision === oauthInputRevision) {
+      oauthNotice = { key: "oauthCallbackInvalid", type: "error" };
+    }
+  } finally {
+    if (generation === oauthGeneration) {
+      oauthParsing = false;
+      renderOAuth();
+    }
+  }
+}
+
+export async function completeOAuthLogin() {
+  const form = document.getElementById("channelForm");
+  if (!usesOAuth(form) || oauthParsing || oauthCompleting || !oauthSessionReady() || !oauthPreview) return;
+  const callbackUrl = document.getElementById("channelOAuthCallback")?.value.trim();
+  if (callbackUrl !== oauthPreview.callback_url) {
+    changeOAuthCallback();
+    return;
+  }
+  const generation = oauthGeneration;
+  const revision = oauthInputRevision;
+  oauthNotice = null;
+  oauthCompleting = true;
+  renderOAuth();
+  try {
+    const result = await api(`/api/admin/channels/oauth/sessions/${encodeURIComponent(oauthSession.session_id)}/complete`, {
+      method: "POST", body: JSON.stringify({ callback_url: callbackUrl }),
+    });
+    if (generation !== oauthGeneration || !oauthSessionReady()) return;
+    if (revision !== oauthInputRevision) {
+      oauthSession.status = "failed";
+      clearOAuthPreview();
+      oauthNotice = { key: "oauthCompleteFailed", type: "error" };
+      return;
+    }
+    oauthSession.status = result.status;
+    clearOAuthPreview();
+  } catch {
+    if (generation === oauthGeneration) {
+      oauthSession.status = "failed";
+      clearOAuthPreview();
+      oauthNotice = { key: "oauthCompleteFailed", type: "error" };
+    }
+  } finally {
+    if (generation === oauthGeneration) {
+      oauthCompleting = false;
+      renderOAuth();
+    }
+  }
+}
+
+export function oauthSaveFields(form) {
+  if (!usesOAuth(form)) return {};
+  if (oauthSession?.status === "authorized") {
+    if (Date.now() / 1000 < oauthSession.expires_at) return { oauth_session_id: oauthSession.session_id };
+    oauthSession.status = "expired";
+    renderOAuth();
+  }
+  if (!oauthSession && !oauthStarting && editState.id && editState.authType === "oauth"
+    && ["connected", "error"].includes(editState.authStatus)) return {};
+  throw new Error(t("oauthLoginRequired"));
+}
+
+export function refreshAuthLabels() { renderOAuth(); }
 
 const cooldownKey = (model, channelId) => `${model}\u0000${channelId}`;
 
@@ -107,6 +443,7 @@ export function unload() {
   clearTimeout(routingTimer);
   routingTimer = null;
   clearTimeout(renderTimer);
+  cancelOAuthLogin();
 }
 
 document.addEventListener("visibilitychange", () => {
@@ -141,6 +478,9 @@ function withForm(fn) {
 export function openCreate() {
   editRequest += 1;
   editState.id = null;
+  editState.authType = "api_key";
+  editState.authStatus = null;
+  resetSaveButton();
   withForm((form) => {
     form.reset();
     form.elements.priority.value = "1";
@@ -151,6 +491,8 @@ export function openCreate() {
     keyInput.required = true;
     keyInput.placeholder = "provider api key";
     applyChannelDefaults(form, { reset: true });
+    if (form.elements.credential_type) form.elements.credential_type.value = "api_key";
+    changeCredentialType(form);
   });
   setTitle(t("addChannelTitle"));
   document.getElementById("probeResult").className = "inline-result hidden";
@@ -162,6 +504,7 @@ export async function openEdit(channel) {
   if (!channel) return;
   const request = ++editRequest;
   editState.id = null;
+  cancelOAuthLogin();
   document.getElementById("channelModal").classList.add("hidden");
   try {
     channel = await api(`/api/admin/channels/${channel.id}`);
@@ -171,6 +514,9 @@ export async function openEdit(channel) {
   }
   if (request !== editRequest) return;
   editState.id = channel.id;
+  editState.authType = channel.auth_type || "api_key";
+  editState.authStatus = channel.auth_status;
+  resetSaveButton();
   const extra = channel.extra || {};
   const { models_path, request_path, auth_type, ...restExtra } = extra;
   withForm((form) => {
@@ -194,6 +540,8 @@ export async function openEdit(channel) {
     keyInput.required = false;
     keyInput.placeholder = t("keepUnchanged");
     rememberChannelDefaults(form);
+    if (form.elements.credential_type) form.elements.credential_type.value = editState.authType;
+    changeCredentialType(form, { resetConnection: false });
   });
   setTitle(`${t("editChannel")} · ${channel.name}`);
   document.getElementById("probeResult").className = "inline-result hidden";
@@ -328,7 +676,7 @@ function renderCard(c) {
               <i data-lucide="radar"></i>${t("probeModels")}
             </button>
             <button class="dropdown-item" data-channel-test="${c.id}">
-              <i data-lucide="activity"></i>${t("test")}
+              <i data-lucide="activity"></i>${t(c.auth_type === "oauth" ? "oauthCheck" : "test")}
             </button>
             <button class="dropdown-item" data-channel-toggle="${c.id}" data-enabled="${c.enabled}">
               <i data-lucide="${c.enabled ? "pause" : "play"}"></i>${c.enabled ? t("disable") : t("enable")}
@@ -343,6 +691,8 @@ function renderCard(c) {
       <div class="ch-meta">
         ${badge(c.type, "accent")}
         ${badge(c.protocol, "info")}
+        ${c.auth_type === "oauth" ? badge("ChatGPT OAuth", "accent") : ""}
+        ${c.auth_type === "oauth" && c.auth_status === "error" ? badge(t("oauthNeedsLogin"), "warning") : ""}
         ${statusBadge(c.enabled)}
       </div>
       <div class="ch-base" title="${escapeHtml(c.base_url || "")}">${escapeHtml(c.base_url || "")}</div>
@@ -495,7 +845,9 @@ async function runTest(id) {
     state.testResult[id] = {
       ok: result.ok,
       message: result.ok
-        ? `${t("modelCatalogReachable")} · ${result.latency_ms} ms · ${result.models.length} models`
+        ? result.check_type === "oauth"
+          ? `${t("oauthCheckPassed")} · ${result.latency_ms} ms`
+          : `${t("modelCatalogReachable")} · ${result.latency_ms} ms · ${result.models.length} models`
         : `${t("failed")} · ${result.latency_ms} ms · ${escapeHtml(result.error || result.status_code)}`,
     };
   } catch (e) {
@@ -505,6 +857,8 @@ async function runTest(id) {
 }
 
 async function probeModels(id) {
+  if (probingChannels.has(String(id))) return;
+  probingChannels.add(String(id));
   try {
     const result = await api(`/api/admin/channels/${id}/probe-models`, {
       method: "POST",
@@ -535,6 +889,9 @@ async function probeModels(id) {
     );
     await load();
   } catch (error) {
-    toast(error.message, "error", 5000);
+    const oauth = state.channels.find((c) => String(c.id) === String(id))?.auth_type === "oauth";
+    toast(oauth ? t("oauthProbeFailed") : error.message, "error", 5000);
+  } finally {
+    probingChannels.delete(String(id));
   }
 }
