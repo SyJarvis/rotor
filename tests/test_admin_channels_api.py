@@ -1,6 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -522,3 +523,26 @@ def test_probe_models_uses_saved_key_when_editing_channel(monkeypatch) -> None:
         assert captured["extra_headers"] == {"X-Provider-Account": "account-1"}
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("method,path", [("POST", "/api/admin/channels"), ("PUT", "/api/admin/channels/1")])
+def test_channel_api_rejects_invalid_capabilities_before_saving(method, path) -> None:
+    async def exercise():
+        app = FastAPI()
+        app.include_router(router, prefix="/api/admin")
+
+        async def override_db():
+            yield object()
+
+        app.dependency_overrides[get_db] = override_db
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            return await client.request(method, path, json={
+                "name": "invalid", "type": "openai", "key": "unused",
+                "base_url": "https://mock.invalid/v1", "extra": {"capabilities": 123},
+            })
+
+    response = asyncio.run(exercise())
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "extra"]
+    assert "extra.capabilities must be a list of strings" in response.json()["detail"][0]["msg"]

@@ -8,6 +8,12 @@ from rotor.core.resource_scopes import normalize_scope_config
 def _normalize_extra(value: Dict[str, Any]) -> Dict[str, Any]:
     """Validate channel-level provider overrides while preserving extensions."""
     normalized = normalize_scope_config(value)
+    capabilities = normalized.get("capabilities")
+    if capabilities is not None and (
+        not isinstance(capabilities, list)
+        or any(not isinstance(capability, str) for capability in capabilities)
+    ):
+        raise ValueError("extra.capabilities must be a list of strings")
     headers = normalized.get("headers")
     if headers is None:
         return normalized
