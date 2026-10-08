@@ -1,4 +1,7 @@
-from rotor.schemas.channel import ChannelCreate, ChannelResponse
+import pytest
+from pydantic import ValidationError
+
+from rotor.schemas.channel import ChannelCreate, ChannelResponse, ChannelUpdate
 
 
 def _channel_payload() -> dict:
@@ -39,3 +42,39 @@ def test_channel_create_still_requires_provider_key() -> None:
     channel = ChannelCreate.model_validate(payload)
 
     assert channel.key == "secret-provider-key"
+
+
+@pytest.mark.parametrize("schema", [ChannelCreate, ChannelUpdate])
+@pytest.mark.parametrize("capabilities", [123, "stream", {}, ["stream", 123], [None], [{}], [True]])
+@pytest.mark.parametrize("headers", [None, {"X-Provider-Account": "account-1"}])
+def test_channel_capabilities_reject_invalid_types(schema, capabilities, headers) -> None:
+    extra = {"capabilities": capabilities}
+    if headers is not None:
+        extra["headers"] = headers
+    payload = {**_channel_payload(), "extra": extra}
+
+    with pytest.raises(ValidationError, match="extra.capabilities must be a list of strings"):
+        schema.model_validate(payload)
+
+
+@pytest.mark.parametrize("schema", [ChannelCreate, ChannelUpdate])
+@pytest.mark.parametrize("capabilities", [None, [], ["stream", "function_call", "future-capability"]])
+def test_channel_capabilities_preserve_valid_values_and_extensions(schema, capabilities) -> None:
+    extra = {
+        "capabilities": capabilities,
+        "provider_extension": {"mode": "custom"},
+        "headers": {"X-Provider-Account": "account-1"},
+    }
+
+    channel = schema.model_validate({**_channel_payload(), "extra": extra})
+
+    assert channel.extra == extra
+
+
+@pytest.mark.parametrize("schema", [ChannelCreate, ChannelUpdate])
+def test_channel_extra_without_capabilities_remains_unchanged(schema) -> None:
+    extra = {"provider_extension": {"mode": "custom"}}
+
+    channel = schema.model_validate({**_channel_payload(), "extra": extra})
+
+    assert channel.extra == extra
