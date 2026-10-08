@@ -23,6 +23,7 @@ from rotor.models.admin_auth import (
     AdminUser,
 )
 from rotor.models.channel import Channel
+from rotor.models.channel_oauth import ChannelOAuthSession
 from rotor.models.conversation import ConversationRecord
 from rotor.models.log import RequestLog
 from rotor.models.mcp_control_key import MCPControlKey
@@ -44,6 +45,7 @@ _REGISTERED_MODELS = (
     AdminSession,
     AdminUser,
     Channel,
+    ChannelOAuthSession,
     ConversationRecord,
     MCPControlKey,
     RequestAttempt,
@@ -58,6 +60,14 @@ _REGISTERED_MODELS = (
 
 _PRE_ADMIN_REVISION = "f6a7b8c9d0e1"
 _PRE_SCHEMA_PARITY_REVISION = "b8c9d0e1f2a3"
+_PRE_OAUTH_REVISION = "c9d0e1f2a3b4"
+_PRE_CALLBACK_REVISION = "d0e1f2a3b4c5"
+_CALLBACK_SESSION_COLUMNS = frozenset({"oauth_state", "pkce_verifier"})
+_OAUTH_CHANNEL_COLUMNS = frozenset({
+    "auth_type", "oauth_access_token", "oauth_refresh_token", "oauth_expires_at",
+    "oauth_account_id", "oauth_status", "oauth_error", "oauth_refresh_owner",
+    "oauth_refresh_lock_until",
+})
 _ADMIN_TABLES = frozenset(
     {
         "admin_auth_events",
@@ -196,17 +206,52 @@ def _legacy_revision(connection: Connection) -> str:
     diff_tuples = [difference for difference in normalized if difference is not None]
     parity_signatures: list[tuple[str, str, int]] = []
     admin_additions = 0
+    oauth_columns = []
+    oauth_table_additions = 0
+    callback_columns = []
     for difference in diff_tuples:
         signature = _schema_parity_signature(difference)
         if signature is not None:
             parity_signatures.append(signature)
         elif _is_admin_addition(difference):
             admin_additions += 1
+        elif (
+            len(difference) == 4 and difference[0] == "add_column"
+            and difference[1] is None and difference[2] == "channels"
+            and getattr(difference[3], "name", None) in _OAUTH_CHANNEL_COLUMNS
+        ):
+            oauth_columns.append(difference[3].name)
+        elif difference[0] == "add_table" and getattr(difference[1], "name", None) == "channel_oauth_sessions":
+            oauth_table_additions += 1
+        elif (
+            len(difference) == 4 and difference[0] == "add_column"
+            and difference[1] is None and difference[2] == "channel_oauth_sessions"
+            and getattr(difference[3], "name", None) in _CALLBACK_SESSION_COLUMNS
+        ):
+            callback_columns.append(difference[3].name)
         else:
             raise LegacyDatabaseError(
                 "cannot safely adopt unversioned SQLite database: "
                 "its schema does not match a known Rotor release"
             )
+
+    if oauth_columns or oauth_table_additions:
+        if set(oauth_columns) != _OAUTH_CHANNEL_COLUMNS or len(oauth_columns) != len(_OAUTH_CHANNEL_COLUMNS) or oauth_table_additions != 1:
+            raise LegacyDatabaseError(
+                "cannot safely adopt unversioned SQLite database: "
+                "its schema does not match a known Rotor release"
+            )
+        if not parity_signatures and not admin_additions:
+            return _PRE_OAUTH_REVISION
+
+    if callback_columns:
+        if set(callback_columns) != _CALLBACK_SESSION_COLUMNS or len(callback_columns) != len(_CALLBACK_SESSION_COLUMNS):
+            raise LegacyDatabaseError(
+                "cannot safely adopt unversioned SQLite database: "
+                "its schema does not match a known Rotor release"
+            )
+        if not parity_signatures and not admin_additions:
+            return _PRE_CALLBACK_REVISION
 
     if parity_signatures:
         # Require the complete four-column set exactly once.  A partial set,
