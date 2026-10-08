@@ -8,8 +8,8 @@ import { refreshTheme } from "./charts.js?v=8";
 import { setChannelPresets, applyChannelDefaults, channelConnection } from "./channel-form.js";
 
 import * as overview from "./pages/overview.js?v=5";
-import * as channels from "./pages/channels.js?v=3";
-import { editState as channelEditState } from "./pages/channels.js?v=3";
+import * as channels from "./pages/channels.js?v=4";
+import { editState as channelEditState } from "./pages/channels.js?v=4";
 import * as tokens from "./pages/tokens.js?v=9";
 import * as usage from "./pages/usage.js?v=13";
 import * as logs from "./pages/logs.js?v=4";
@@ -297,7 +297,6 @@ document.getElementById("channelForm")?.addEventListener("submit", async (event)
       priority: Number(form.get("priority") || 1),
       weight: Number(form.get("weight") || 1),
       enabled: Boolean(form.get("enabled")),
-      test_only: false,
     };
     const editingId = channelEditState.id;
     const method = editingId ? "PUT" : "POST";
