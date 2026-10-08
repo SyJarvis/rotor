@@ -9,6 +9,7 @@ from alembic import context
 from rotor.config import settings
 from rotor.database import Base
 from rotor.models.channel import Channel
+from rotor.models.channel_oauth import ChannelOAuthSession
 from rotor.models.token import Token
 from rotor.models.log import RequestLog
 from rotor.models.conversation import ConversationRecord

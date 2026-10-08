@@ -1,12 +1,13 @@
 import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from httpx import HTTPStatusError, RequestError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from rotor.config import settings
@@ -30,6 +31,7 @@ from rotor.api.v1 import anthropic_models
 from rotor.api.admin import (
     auth as admin_auth,
     channels,
+    channel_oauth,
     mcp_control_keys,
     tokens,
     logs,
@@ -61,6 +63,7 @@ from rotor.models.admin_auth import (  # noqa: F401
     AdminSession,
     AdminUser,
 )
+from rotor.models.channel_oauth import ChannelOAuthSession  # noqa: F401
 
 # Configure logging
 logging.basicConfig(
@@ -118,7 +121,16 @@ app.add_middleware(LoggingMiddleware)
 # Exception handlers
 app.add_exception_handler(APIRouterException, api_router_exception_handler)
 app.add_exception_handler(StarletteHTTPException, protocol_http_exception_handler)
-app.add_exception_handler(RequestValidationError, protocol_validation_exception_handler)
+async def channel_validation_exception_handler(request, exc):
+    if request.url.path.startswith("/api/admin/channels"):
+        return JSONResponse(status_code=422, content={"detail": [
+            {name: error[name] for name in ("loc", "msg", "type") if name in error}
+            for error in exc.errors()
+        ]})
+    return await protocol_validation_exception_handler(request, exc)
+
+
+app.add_exception_handler(RequestValidationError, channel_validation_exception_handler)
 app.add_exception_handler(HTTPStatusError, protocol_upstream_exception_handler)
 app.add_exception_handler(RequestError, protocol_upstream_exception_handler)
 app.add_exception_handler(UpstreamProtocolError, protocol_upstream_exception_handler)
@@ -197,10 +209,22 @@ app.include_router(anthropic_models.router, prefix="/anthropic/v1", tags=["anthr
 # Admin routes
 app.include_router(admin_auth.router, prefix="/api/admin")
 admin_dependencies = [Depends(require_admin_access)]
+
+
+async def bind_channel_admin(request: Request, actor=Depends(require_admin_access)):
+    request.state.admin_actor = actor
+    return actor
+
+
+app.include_router(
+    channel_oauth.router,
+    prefix="/api/admin",
+    dependencies=admin_dependencies,
+)
 app.include_router(
     channels.router,
     prefix="/api/admin",
-    dependencies=admin_dependencies,
+    dependencies=[Depends(bind_channel_admin)],
 )
 app.include_router(
     tokens.router,

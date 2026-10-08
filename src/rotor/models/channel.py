@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, JSON, Boolean, DateTime, func
+from sqlalchemy import Column, Float, Integer, String, Text, JSON, Boolean, DateTime, func
 from sqlalchemy.orm import Mapped, mapped_column
 from rotor.database import Base
 from typing import Optional
@@ -18,6 +18,17 @@ class Channel(Base):
         comment="Provider type: openai, anthropic, moonshot, minimax, zhipu"
     )
     key: Mapped[str] = mapped_column(String(500), nullable=False, comment="API Key for the provider")
+    auth_type: Mapped[str] = mapped_column(
+        String(20), default="api_key", server_default="api_key", nullable=False
+    )
+    oauth_access_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    oauth_refresh_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    oauth_expires_at: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    oauth_account_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    oauth_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    oauth_error: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    oauth_refresh_owner: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    oauth_refresh_lock_until: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     base_url: Mapped[str] = mapped_column(String(500), nullable=False, comment="Base URL for the provider API")
 
     # Model configuration
@@ -71,3 +82,17 @@ class Channel(Base):
 
     def __repr__(self) -> str:
         return f"<Channel {self.name} ({self.type})>"
+
+    @property
+    def auth_status(self) -> str:
+        if self.auth_type != "oauth":
+            return "api_key"
+        return self.oauth_status or "unauthed"
+
+    @property
+    def auth_expires_at(self) -> Optional[float]:
+        return self.oauth_expires_at if self.auth_type == "oauth" else None
+
+    @property
+    def auth_error(self) -> Optional[str]:
+        return self.oauth_error if self.auth_type == "oauth" else None
