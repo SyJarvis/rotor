@@ -53,30 +53,43 @@ function hasAnyCooldown() {
   return Object.keys(state.routingState).length > 0;
 }
 
-// Cooldowns expire on a ~30s scale, so a loaded page would otherwise show stale
-// badges until the next manual refresh. Poll only while something is cooling.
+// Keep detecting new cooldowns while healthy, and refresh active cooldowns faster.
 const ROUTING_POLL_MS = 5000;
+const HEALTHY_ROUTING_POLL_MS = 15000;
 let routingTimer = null;
 let active = false;
+let loadGeneration = 0;
 
 function scheduleRoutingPoll() {
   clearTimeout(routingTimer);
   routingTimer = null;
-  if (!active || !hasAnyCooldown()) return;
-  routingTimer = setTimeout(refreshRoutingState, ROUTING_POLL_MS);
+  if (!active || document.hidden) return;
+  const generation = loadGeneration;
+  routingTimer = setTimeout(() => {
+    if (generation === loadGeneration) return refreshRoutingState();
+  }, hasAnyCooldown() ? ROUTING_POLL_MS : HEALTHY_ROUTING_POLL_MS);
   routingTimer?.unref?.();
 }
 
 async function refreshRoutingState() {
-  if (!active) return;
+  if (!active || document.hidden) return;
+  const generation = loadGeneration;
+  const previousState = JSON.stringify(state.routingState);
+  const previousError = state.routingError?.message;
   try {
-    state.routingState = indexRoutingState(await api("/api/admin/channels/routing-state"));
+    const routingState = await api("/api/admin/channels/routing-state");
+    if (!active || generation !== loadGeneration) return;
+    state.routingState = indexRoutingState(routingState);
     state.routingError = null;
   } catch (error) {
+    if (!active || generation !== loadGeneration) return;
     state.routingError = error;
   } finally {
-    render();
-    scheduleRoutingPoll();
+    if (active && generation === loadGeneration) {
+      if (previousState !== JSON.stringify(state.routingState)
+        || previousError !== state.routingError?.message) render();
+      scheduleRoutingPoll();
+    }
   }
 }
 
@@ -89,10 +102,22 @@ function indexRoutingState(routingState) {
 
 export function unload() {
   active = false;
+  loadGeneration += 1;
   editRequest += 1;
   clearTimeout(routingTimer);
   routingTimer = null;
+  clearTimeout(renderTimer);
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (!active) return;
+  if (document.hidden) {
+    clearTimeout(routingTimer);
+    routingTimer = null;
+  } else {
+    return refreshRoutingState();
+  }
+});
 
 function orphanRoutingNotices() {
   const known = new Set(state.channels.map((c) => c.id));
@@ -183,25 +208,31 @@ function setTitle(text) {
 
 export async function load() {
   const container = document.getElementById("channels");
+  const generation = ++loadGeneration;
   active = true;
+  clearTimeout(routingTimer);
+  routingTimer = null;
   skeletonCards(container, 3);
-  state.routingError = null;
+  let routingError = null;
   try {
     const [channels, routingState] = await Promise.all([
       api("/api/admin/channels"),
       api("/api/admin/channels/routing-state").catch((error) => {
-        state.routingError = error;
+        routingError = error;
         return null;
       }),
     ]);
+    if (!active || generation !== loadGeneration) return;
     state.channels = channels;
     state.routingState = indexRoutingState(routingState);
+    state.routingError = routingError;
     render();
   } catch (e) {
+    if (!active || generation !== loadGeneration) return;
     container.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><h3>${escapeHtml(e.message)}</h3></div>`;
     refreshIcons(container);
   } finally {
-    scheduleRoutingPoll();
+    if (active && generation === loadGeneration) scheduleRoutingPoll();
   }
 }
 
