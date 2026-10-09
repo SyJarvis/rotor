@@ -164,7 +164,7 @@ async function startApp(actor) {
   }
   if (!appLoaded) {
     try {
-      await import("./app.js?v=61");
+      await import("./app.js?v=62");
       appLoaded = true;
       authScreen().classList.add("hidden");
       document.body.classList.remove("auth-pending");

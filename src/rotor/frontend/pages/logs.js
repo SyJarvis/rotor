@@ -10,7 +10,7 @@ import {
   escapeHtml, badge, formatNumber, formatTimeInTimezone, skeletonRows,
   refreshIcons, toast,
 } from "../ui.js?v=12";
-import { renderStackedBar, isAvailable } from "../charts.js?v=9";
+import { renderStackedBar, isAvailable } from "../charts.js?v=10";
 import {
   TIME_RANGES, bucketKey, bucketLabel, createCustomTimeRange, createTimeRange,
   dateInTimezone, expectedRangeBuckets,

@@ -83,6 +83,7 @@ async function environment({ responses = {}, available = true, language = 'en', 
   if (autoload) await module.namespace.load();
   return { page: module.namespace, periods: periods.namespace, calls, charts, destroyed, nodes, html: () => html,
     latest: (type) => charts.filter((chart) => chart.type === type).at(-1),
+    clock(value) { now = value; },
     metric(value) { nodes.get('usageMetricSwitch').listeners.click({ target: { closest: () => ({ dataset: { metric: value } }) } }); },
     split(value) { nodes.get('usageByModel').listeners.change({ target: { checked: value } }); },
     currency(value) { nodes.get('usageCurrency').listeners.change({ target: { value } }); },
@@ -153,7 +154,8 @@ test('cost trend keeps currencies separate, unknown activity null, real zero and
   assert.equal(datasets[0].data[labels.indexOf('11:00')], 0);
   assert.equal(datasets[0].data[labels.indexOf('08:00')], 0);
   assert.equal(datasets[0].data[labels.indexOf('12:00')], 0, 'another currency is not added to USD');
-  assert.equal(labels.at(-1), '13:00', 'future hours are not drawn as zero');
+  assert.equal(labels.at(-1), '24:00');
+  assert.ok(datasets[0].data.slice(14).every((value) => value === null), 'future hours and the day boundary stay blank');
   env.split(true);
   const beta = env.latest('line').args[3].find((dataset) => dataset.label === 'beta');
   assert.equal(beta.data[labels.indexOf('10:00')], null);
@@ -250,4 +252,84 @@ test('ordinary usage reads only personal stats and profile reporting timezone wi
   assert.equal(h.calls[0].url, '/api/me'); assert.match(h.html(), /Asia\/Shanghai/);
   assert.doesNotMatch(h.html(), /usageReportScope/);
   assert.ok(h.calls.some(({ url }) => url.startsWith('/api/me/logs/stats?')));
+});
+
+
+test('Today retains the full-day axis, masks future values, and keeps one request snapshot across metric changes', async () => {
+  const env = await environment({ now: '2026-10-09T05:30:00Z', responses: { '/api/admin/logs/timeseries_by_model': [
+    ...timeline,
+    { bucket: '2026-10-09T05:00:00Z', model: 'alpha', tokens: 7, requests: 1 },
+    { bucket: '2026-10-09T06:00:00Z', model: 'alpha', tokens: 999, requests: 2 },
+  ] } });
+  const [, , labels, datasets, options] = env.latest('line').args;
+  assert.equal(labels.length, 25); assert.equal(labels[0], '00:00'); assert.equal(labels.at(-1), '24:00');
+  assert.equal(datasets[0].data[0], 0); assert.equal(datasets[0].data[13], 7);
+  assert.ok(datasets[0].data.slice(14).every((value) => value === null));
+  assert.equal(options.nowMarker.value, 13.5); assert.equal(options.nowMarker.label, 'Now');
+  assert.equal(options.xAxis.min, 0); assert.equal(options.xAxis.max, 24); assert.equal(options.xAxis.tickStep, 4);
+  assert.equal(options.tooltipCallbacks.title([{ dataIndex: 13 }]), '13:00–14:00 · In progress');
+  assert.equal(options.tooltipCallbacks.title([{ dataIndex: 12 }]), '12:00–13:00');
+  assert.equal(options.tooltipCallbacks.title([{ dataIndex: 24 }]), '');
+  const requests = env.calls.length; env.clock('2026-10-09T06:05:00Z'); env.metric('requests'); env.split(true);
+  const after = env.latest('line').args;
+  assert.equal(after[4].nowMarker.value, 13.5); assert.ok(after[3].every((dataset) => dataset.data[14] === null));
+  assert.equal(env.calls.length, requests, 'clock movement alone must not fetch data or invent a completed hour');
+  await env.page.load(); assert.equal(env.latest('line').args[4].nowMarker.value, 14 + 5 / 60);
+  assert.equal(env.latest('line').args[3].find((dataset) => dataset.label === 'alpha').data[14], 2);
+});
+
+test('Today empty success renders zero totals so far, while empty per-model/cost and failed responses remain distinct', async () => {
+  const env = await environment({ responses: { '/api/admin/logs/timeseries_by_model': [] } });
+  assert.ok(env.nodes.has('usageTrend0'));
+  const data = env.latest('line').args[3][0].data;
+  assert.equal(data.length, 25); assert.ok(data.slice(0, 14).every((value) => value === 0)); assert.ok(data.slice(14).every((value) => value === null));
+  env.metric('requests'); assert.ok(env.nodes.has('usageTrend0'));
+  env.split(true); assert.equal(env.nodes.has('usageTrend0'), false);
+  env.split(false); env.metric('cost'); assert.equal(env.nodes.has('usageTrend0'), false);
+  const failed = await environment({ responses: { '/api/admin/logs/timeseries_by_model': new Error('Timeline offline') } });
+  assert.equal(failed.nodes.has('usageTrend0'), false); assert.equal(failed.latest('line'), undefined); assert.match(failed.html(), /Timeline offline/);
+});
+
+test('Today snapshot and hour tooltips follow reporting timezone through midnight including non-hour offsets', async () => {
+  for (const [zone, now, hour, minute, day] of [
+    ['UTC', '2026-10-09T00:00:00Z', 0, 0, '2026-10-09'],
+    ['Asia/Shanghai', '2026-10-09T15:59:00Z', 23, 59, '2026-10-09'],
+    ['Asia/Shanghai', '2026-10-09T16:00:00Z', 0, 0, '2026-10-10'],
+    ['America/Los_Angeles', '2026-10-09T00:15:00Z', 17, 15, '2026-10-08'],
+    ['Asia/Kathmandu', '2026-10-09T18:14:00Z', 23, 59, '2026-10-09'],
+    ['Asia/Kathmandu', '2026-10-09T18:15:00Z', 0, 0, '2026-10-10'],
+  ]) {
+    const env = await environment({ now, language: 'zh-CN', responses: { '/api/admin/settings': { display_timezone: zone }, '/api/admin/logs/timeseries_by_model': [] } });
+    const [, , labels, datasets, options] = env.latest('line').args;
+    assert.equal(labels.at(-1), '24:00'); assert.equal(datasets[0].data[hour], 0); assert.equal(datasets[0].data[hour + 1], null);
+    assert.equal(options.nowMarker.value, hour + minute / 60); assert.equal(options.nowMarker.label, '现在');
+    assert.equal(options.tooltipCallbacks.title([{ dataIndex: hour }]), `${String(hour).padStart(2, '0')}:00–${String(hour + 1).padStart(2, '0')}:00 · 统计中`);
+    const request = env.calls.find(({ url }) => url.includes('/logs/stats?'));
+    assert.equal(new URLSearchParams(request.url.split('?')[1]).get('period_date'), day);
+  }
+});
+
+test('Today currency and model splits retain unknown gaps, real zeros and null futures consistently', async () => {
+  const env = await environment(); env.metric('cost'); env.currency('USD'); env.split(true);
+  const data = env.latest('line').args[3];
+  const alpha = data.find((dataset) => dataset.label === 'alpha'), beta = data.find((dataset) => dataset.label === 'beta');
+  assert.equal(alpha.data[9], 0.025); assert.equal(alpha.data[11], 0); assert.equal(beta.data[10], null);
+  assert.ok(data.every((dataset) => dataset.data.slice(14).every((value) => value === null)));
+  env.currency('CNY'); assert.equal(env.latest('line').args[3].find((dataset) => dataset.label === 'beta').data[12], 1.5);
+  assert.ok(env.latest('line').args[3].every((dataset) => dataset.data[24] === null));
+});
+
+test('rolling 24h, multi-day and custom ranges retain their existing labels without today axis or marker', async () => {
+  const env = await environment({ now: '2026-10-09T05:30:00Z' });
+  for (const range of ['24h', '7d', '30d']) {
+    await env.page.setRange(range);
+    const [, , labels, , options] = env.latest('line').args;
+    assert.equal(options.nowMarker, undefined); assert.equal(options.xAxis, undefined); assert.equal(options.tooltipCallbacks.title, undefined);
+    assert.notEqual(labels.at(-1), '24:00');
+    if (range === '24h') { assert.equal(labels[0], '10-08 13:00'); assert.equal(labels.at(-1), '10-09 13:00'); }
+  }
+  await env.page.setRange('today');
+  env.nodes.get('usageStartDate').listeners.change({ target: { value: '2026-10-09' } }); await flush();
+  const [, , labels, , options] = env.latest('line').args;
+  assert.equal(labels.at(-1), '13:00'); assert.equal(options.nowMarker, undefined);
 });
