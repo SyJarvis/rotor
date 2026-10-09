@@ -10,13 +10,17 @@ import {
   escapeHtml, badge, formatNumber, formatTimeInTimezone, skeletonRows,
   refreshIcons, toast,
 } from "../ui.js?v=12";
-import { renderStackedBar, isAvailable } from "../charts.js?v=10";
+import { renderStackedBar, isAvailable, destroyChart } from "../charts.js?v=10";
 import {
   TIME_RANGES, bucketKey, bucketLabel, createCustomTimeRange, createTimeRange,
   dateInTimezone, expectedRangeBuckets,
 } from "../periods.js?v=3";
 
 const PAGE_SIZE = 50;
+let generation = 0;
+let request = null;
+const isCurrent = (context) => request === context && context.generation === generation && !context.controller.signal.aborted;
+
 let state = {
   logs: [],
   total: 0,
@@ -40,36 +44,50 @@ let state = {
 };
 
 export async function load() {
+  request?.controller.abort();
+  const context = { generation: ++generation, admin: adminScope(), base: reportingBase(), controller: new AbortController(), ready: false };
+  request = context;
+  const options = { signal: context.controller.signal };
+  state.detailLoading.clear();
   const container = document.getElementById("logs");
   skeletonRows(container, 5, 8);
   try {
     if (state.channels.length === 0) {
-      state.channels = await api(adminScope() ? "/api/admin/channels" : "/api/me/logs/channels").then((rows) => rows.map((row) => ({ ...row, id: row.id ?? row.channel_id, name: row.name ?? row.channel_name }))).catch(() => []);
+      const channels = await api(context.admin ? "/api/admin/channels" : "/api/me/logs/channels", options).catch(() => []);
+      if (!isCurrent(context)) return;
+      state.channels = channels.map((row) => ({ ...row, id: row.id ?? row.channel_id, name: row.name ?? row.channel_name }));
     }
     if (!state.displayTimezone) {
-      const settings = await api(adminScope() ? "/api/admin/settings" : "/api/me").catch(() => null);
+      const settings = await api(context.admin ? "/api/admin/settings" : "/api/me", options).catch(() => null);
+      if (!isCurrent(context)) return;
       state.displayTimezone = settings?.display_timezone || "Asia/Shanghai";
     }
-    await fetchPage();
+    await fetchPage(context);
+    if (!isCurrent(context)) return;
+    context.ready = true;
     render();
+    if (state.autoRefresh && !state.timer) state.timer = setInterval(pollNew, 5000);
   } catch (e) {
+    if (!isCurrent(context)) return;
     container.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><h3>${escapeHtml(e.message)}</h3></div>`;
     refreshIcons(container);
   }
 }
 
-async function fetchPage() {
+async function fetchPage(context) {
   const range = selectedTimeRange();
   state.startDate = range.startDate;
   state.endDate = range.endDate;
   const skip = state.page * PAGE_SIZE;
   const filters = buildFilterQuery(range.query);
+  const options = { signal: context.controller.signal };
   const [logs, count, timeline, models] = await Promise.all([
-    api(`${reportingBase()}/logs?limit=${PAGE_SIZE}&skip=${skip}&${filters}`),
-    api(`${reportingBase()}/logs/count?${filters}`),
-    api(`${reportingBase()}/logs/timeseries?bucket=${range.apiBucket || range.bucket}&${filters}`).catch(() => []),
-    api(`${reportingBase()}/logs/models?limit=30&${range.query}`).catch(() => []),
+    api(`${context.base}/logs?limit=${PAGE_SIZE}&skip=${skip}&${filters}`, options),
+    api(`${context.base}/logs/count?${filters}`, options),
+    api(`${context.base}/logs/timeseries?bucket=${range.apiBucket || range.bucket}&${filters}`, options).catch(() => []),
+    api(`${context.base}/logs/models?limit=30&${range.query}`, options).catch(() => []),
   ]);
+  if (!isCurrent(context)) return;
   state.timeRange = range;
   state.logs = logs;
   state.total = count.count;
@@ -356,7 +374,8 @@ export function showFailures() {
 let renderTimer;
 function debouncedRender() {
   clearTimeout(renderTimer);
-  renderTimer = setTimeout(render, 200);
+  const context = request;
+  renderTimer = setTimeout(() => { if (context && isCurrent(context)) render(); }, 200);
 }
 
 function toggleAutoRefresh(on) {
@@ -369,9 +388,12 @@ function toggleAutoRefresh(on) {
 }
 
 async function pollNew() {
+  const context = request;
+  if (!context?.ready || !isCurrent(context)) return;
   try {
     const range = selectedTimeRange();
-    const fresh = await api(`${reportingBase()}/logs?limit=${PAGE_SIZE}&${buildFilterQuery(range.query)}`);
+    const fresh = await api(`${context.base}/logs?limit=${PAGE_SIZE}&${buildFilterQuery(range.query)}`, { signal: context.controller.signal });
+    if (!isCurrent(context)) return;
     const newOnes = fresh.filter((l) => !state.seen.has(l.id));
     state.seen = new Set(fresh.map((l) => l.id));
     if (state.page === 0) {
@@ -383,15 +405,19 @@ async function pollNew() {
 }
 
 async function loadDetail(id) {
-  if (state.detailCache[id] || state.detailLoading.has(id)) return;
+  const context = request;
+  if (!context?.ready || !isCurrent(context) || state.detailCache[id] || state.detailLoading.has(id)) return;
   state.detailLoading.add(id);
   try {
-    const detail = await api(`${reportingBase()}/logs/${id}`);
+    const detail = await api(`${context.base}/logs/${id}`, { signal: context.controller.signal });
+    if (!isCurrent(context)) return;
     state.detailCache[id] = detail;
     delete state.detailErrors[id];
   } catch (e) {
+    if (!isCurrent(context)) return;
     state.detailErrors[id] = e.message || t("logDetailFailed");
   } finally {
+    if (!isCurrent(context)) return;
     state.detailLoading.delete(id);
     if (state.expanded.has(id) && state.logs.some((log) => log.id === id)) {
       render();
@@ -436,8 +462,23 @@ export async function onClick(target) {
 document.addEventListener("change", (event) => {
   if (event.target.id !== "logsReportScope" || !isAdmin()) return;
   reportScope = event.target.value; state.channels = []; state.displayTimezone = "";
-  state.filter = { model: '', channel: '', status: '', q: '' }; state.page = 0; state.detailCache = {};
+  state.filter = { model: '', channel: '', status: '', q: '' }; state.page = 0;
+  state.detailCache = {}; state.detailErrors = {}; state.detailLoading.clear(); state.expanded.clear();
   load();
 });
-export function unload() { if (state.timer) clearInterval(state.timer); state.timer = null; }
-document.addEventListener("sessionended", () => { unload(); state.logs = []; state.channels = []; state.detailCache = {}; state.models = []; });
+export function unload() {
+  generation++;
+  request?.controller.abort();
+  request = null;
+  clearTimeout(renderTimer);
+  if (state.timer) clearInterval(state.timer);
+  state.timer = null;
+  state.detailLoading.clear();
+  destroyChart("logRequests");
+}
+document.addEventListener("sessionended", () => {
+  unload();
+  state.logs = []; state.channels = []; state.detailCache = {}; state.detailErrors = {}; state.models = [];
+  state.timeline = []; state.total = 0; state.timeRange = null; state.displayTimezone = "";
+  state.expanded.clear(); state.seen.clear();
+});
