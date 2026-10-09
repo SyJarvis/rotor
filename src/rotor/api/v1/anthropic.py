@@ -166,9 +166,10 @@ def _anthropic_system_to_responses_cache_content(
     enabled_breakpoints = set(breakpoint_indexes[-4:])
     content: list[dict] = []
     for index, block in enumerate(blocks):
+        separator = "\n" if index < len(blocks) - 1 else ""
         item = {
             "type": "input_text",
-            "text": f"{block.get('text', '')}{'\n' if index < len(blocks) - 1 else ''}",
+            "text": f"{block.get('text', '')}{separator}",
         }
         if index in enabled_breakpoints:
             item["prompt_cache_breakpoint"] = {"mode": "explicit"}
