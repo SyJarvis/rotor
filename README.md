@@ -200,7 +200,7 @@ Rotor 当前提供：
 运行时设置可通过 `GET/PUT /api/admin/settings` 查看和更新。自适应统计与渠道冷却
 保存在进程内，重启后重新学习；请求结果和路由决策会持久化。
 
-## Control API、MCP 与 MindAgent
+## Control API 与 MCP
 
 Control API 使用独立 Bearer Token，不接受普通的 `sk-` 用户 Token：
 
@@ -226,9 +226,26 @@ usage:read
 创建数据库保存的 `rck_` 凭据。完整值只在创建时显示一次；可以单独停用或删除，且不
 接受普通的 `sk-` 用户 Token。
 
-管理页面中的 MindAgent 对话由 MindAgent 库（`mindagent==0.5.3`，随 Rotor 一起安装）
-驱动，可以独立运行；加载 Rotor MCP 诊断工具还需要安装 `rotor-gateway[mcp]`、配置 MCP
-命令和 Control Token。对话记录位于管理页侧边栏，可新建、导出 JSON 或删除。
+## 管理页聊天
+
+管理页的聊天通过 OpenAI SDK 调用 Rotor 网关，沿用渠道路由、用量计量和请求日志。
+默认使用 Chat Completions，也可切换到 Responses。每个对话独立保存右侧面板中的
+模型、API 格式、System Prompt、temperature 和 max_tokens；后两项留空时使用上游默认值。
+System Prompt 最多 10 万字符。
+“连接测试”会按当前参数发起一次简短的真实文本生成请求，可能产生上游费用；它不验证
+模型的图片或文档理解能力。
+
+聊天支持文字、PNG/JPEG/WebP/GIF 图片、UTF-8 文本文档、PDF 和 DOCX。PDF/DOCX
+由后端提取文字，不保留图片、表格布局，也不执行 OCR；扫描 PDF 请先转为图片再上传。
+图片能否被理解取决于所选模型的视觉能力。附件限制为单文件 5 MB、每条消息最多
+6 个附件且合计不超过 10 MB、整个对话不超过 20 MB。其中 UTF-8 文本和代码文件最多
+500,000 字节；PDF 最多 100 页，单个 PDF/DOCX 提取的文字最多 50 万字符，超出时
+会明确提示。
+
+对话历史保存在当前浏览器本地，可新建、导出 JSON 或删除，不会自动跨浏览器同步。
+已有对话会保留；旧版本未保存的附件内容无法恢复，页面会提示重新添加。
+这与 `CONVERSATION_STORE_DIR` 中保存的网关请求记录是两套存储。管理页聊天无需
+MCP 启动命令或 Control Token；独立 Rotor MCP 服务仍按上面的方式单独配置。
 
 ## 重要配置
 
@@ -248,7 +265,6 @@ usage:read
 | `ROTOR_ADMIN_LOGIN_LOCK_SECONDS` | `900` | 达到失败上限后的锁定秒数 |
 | `ROTOR_CONTROL_API_TOKEN` | 未设置 | Control API 和 MCP 鉴权 |
 | `ROTOR_CONTROL_API_SCOPES` | 三个只读 scope | Control API 权限 |
-| `ROTOR_MINDAGENT_MCP_COMMAND` | 未设置 | MindAgent 启动独立 MCP Server 的命令 |
 
 完整配置见[运行时配置](gitbook/operations/configuration.md)。
 

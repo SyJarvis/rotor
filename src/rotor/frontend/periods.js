@@ -71,7 +71,7 @@ export function expectedRangeBuckets(range, displayTimezone) {
       (_, hour) => `${range.startDate}T${String(hour).padStart(2, "0")}:00:00`,
     );
   }
-  if (range.key === "custom") {
+  if (range.key === "custom" || range.bucket === "day") {
     const start = new Date(`${range.startDate}T00:00:00Z`);
     const end = new Date(`${range.endDate}T00:00:00Z`);
     const buckets = [];

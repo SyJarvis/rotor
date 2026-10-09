@@ -89,6 +89,8 @@ async function environment({ listedChannels = [], channelDetails = {}, detailErr
     if (specifier.includes('i18n.js')) return synthetic(['t', 'applyLocale', 'toggleLocale']);
     if (specifier.includes('ui.js')) return synthetic(['parseCsv', 'parseJson', 'refreshIcons', 'toast', 'escapeHtml', 'badge', 'statusBadge', 'skeletonCards', 'showInline', 'hideInline']);
     if (specifier.includes('theme.js')) return synthetic(['toggleTheme']);
+    if (specifier.includes('settings.js')) return synthetic(['initSettings']);
+    if (specifier.includes('sidebar.js')) return synthetic(['initSidebar', 'closeSidebar']);
     if (specifier.includes('charts.js')) return synthetic(['refreshTheme']);
     return synthetic(['load', 'unload', 'renderHistory']);
   };

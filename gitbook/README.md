@@ -30,8 +30,15 @@ Messages 兼容接口。
 | OpenAI Images | `POST /v1/images/generations` |
 | Anthropic Messages | `POST /anthropic/v1/messages` |
 
-Rotor 的管理页位于 `/`，健康检查位于 `/health`。管理页中的 MindAgent 对话记录保存在
-本地，可新建、导出 JSON 或删除；它是实验性管理页能力，不是稳定的外部 API。
+Rotor 的管理页位于 `/`，健康检查位于 `/health`。管理页聊天默认使用 Chat Completions，
+也可切换到 Responses；右侧的模型、API 格式、System Prompt、temperature 和 max_tokens 按对话
+保存。连接测试会按当前参数发起一次简短的真实文本生成请求，可能产生上游费用，
+不验证图片或文档理解能力。
+
+聊天支持文字、图片及 UTF-8 文本、PDF、DOCX 文档。PDF/DOCX 仅提取文字，不保留图片
+或表格布局，不执行 OCR；扫描 PDF 请先转为图片。对话历史保存在当前浏览器本地，可
+新建、导出 JSON 或删除，不会跨浏览器同步。它与网关请求记录的会话存储相互独立。
+附件限制见 [README 的管理页聊天说明](../README.md#管理页聊天)。
 
 ## 项目边界
 
@@ -39,4 +46,5 @@ Rotor 管理渠道、协议转换、路由、鉴权、用量与请求记录。�
 创建账号或 API Key，也不会保证跨协议转换能够保留某个供应商的全部私有扩展。
 需要原生 Responses 或 Anthropic 特性时，应配置相应的原生协议渠道。
 
-管理页的 MindAgent 对话由 MindAgent 库驱动，该库不作为稳定外部接口对外承诺。
+管理页聊天通过 OpenAI SDK 使用网关，不加载 MCP 工具。独立 Rotor MCP 服务与
+Control API 保持可用；管理页聊天接口不是稳定的外部 API。

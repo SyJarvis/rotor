@@ -9,6 +9,7 @@ from sqlalchemy import select, and_, case, func
 from rotor.config import settings
 from rotor.application_settings import application_settings
 from rotor.database import get_db
+from rotor.models.channel import Channel
 from rotor.models.log import RequestLog
 
 router = APIRouter(prefix="/logs", tags=["logs"])
@@ -446,6 +447,56 @@ async def get_log_stats(
     }
 
 
+@router.get("/channels")
+async def get_channel_usage(
+    days: int = Query(7, ge=1, le=90),
+    token_id: Optional[int] = None,
+    channel_id: Optional[int] = None,
+    model: Optional[str] = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    period: Literal["day", "week", "month"] | None = None,
+    period_date: date | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Aggregate channel requests within the selected usage window."""
+    start_time, end_time = _usage_time_window(
+        days=days, start_time=start_time, end_time=end_time,
+        start_date=start_date, end_date=end_date,
+        period=period, period_date=period_date,
+    )
+    conditions = _log_filter_conditions(
+        token_id=token_id, channel_id=channel_id, model=model,
+        start_time=start_time, end_time=end_time,
+    )
+    rows = (await db.execute(
+        select(
+            RequestLog.channel_id,
+            Channel.name.label("channel_name"),
+            func.count(RequestLog.id).label("total_requests"),
+            func.sum(case((RequestLog.success == False, 1), else_=0)).label("failed_requests"),
+        )
+        .outerjoin(Channel, RequestLog.channel_id == Channel.id)
+        .where(and_(*conditions))
+        .group_by(RequestLog.channel_id, Channel.name)
+        .order_by(func.count(RequestLog.id).desc(), RequestLog.channel_id)
+    )).all()
+    return [
+        {
+            "channel_id": row.channel_id,
+            "channel_name": row.channel_name or (
+                f"Channel #{row.channel_id}" if row.channel_id is not None else "Unknown channel"
+            ),
+            "total_requests": row.total_requests,
+            "success_requests": row.total_requests - int(row.failed_requests or 0),
+            "failed_requests": int(row.failed_requests or 0),
+        }
+        for row in rows
+    ]
+
+
 @router.get("/timeseries")
 async def get_log_timeseries(
     days: int = Query(7, ge=1, le=90),
@@ -543,7 +594,7 @@ async def get_log_timeseries_by_model(
     model: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Time-bucketed token usage broken down by model — for stacked area charts.
+    """Time-bucketed tokens, requests, and priced costs broken down by model.
 
     When today=True, start is aligned to midnight UTC of the current day
     (useful for "today 0:00 → now" views). Otherwise the window is `days` days back.
@@ -600,15 +651,39 @@ async def get_log_timeseries_by_model(
     )
     rows = result.all()
 
-    return [
-        {
+    cost_rows = []
+    if rows:
+        cost_rows = (await db.execute(
+            select(
+                bucket_expr.label("bucket"),
+                RequestLog.model,
+                RequestLog.currency,
+                func.sum(RequestLog.cost).label("total_cost"),
+                func.count(RequestLog.id).label("costed_requests"),
+            )
+            .where(and_(*conditions, RequestLog.cost_status == "calculated"))
+            .group_by(bucket_expr, RequestLog.model, RequestLog.currency)
+        )).all()
+    costs_by_bucket_model = {}
+    for cost_row in cost_rows:
+        costs_by_bucket_model.setdefault((cost_row.bucket, cost_row.model), []).append(cost_row)
+
+    timeline = []
+    for row in rows:
+        total_cost, currency, cost_totals, costed_requests = _cost_summary(
+            costs_by_bucket_model.get((row.bucket, row.model), [])
+        )
+        timeline.append({
             "bucket": row.bucket,
             "model": row.model,
             "tokens": int(row.tokens or 0),
             "requests": row.requests or 0,
-        }
-        for row in rows
-    ]
+            "total_cost": total_cost if costed_requests else None,
+            "currency": currency,
+            "cost_totals_by_currency": cost_totals,
+            "costed_requests": costed_requests,
+        })
+    return timeline
 
 
 @router.get("/models")

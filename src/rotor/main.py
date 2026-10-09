@@ -35,7 +35,7 @@ from rotor.api.admin import (
     mcp_control_keys,
     tokens,
     logs,
-    mindagent,
+    chat as admin_chat,
     monitoring,
     settings as admin_settings,
 )
@@ -252,7 +252,7 @@ app.include_router(
     dependencies=admin_dependencies,
 )
 app.include_router(
-    mindagent.router,
+    admin_chat.router,
     prefix="/api/admin",
     dependencies=admin_dependencies,
 )

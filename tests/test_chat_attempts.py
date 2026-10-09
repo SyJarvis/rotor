@@ -736,7 +736,7 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
         assert routing.unavailable == [2]
         assert http_client.closed is True
 
-    async def test_chat_completions_retries_empty_stream_for_mindagent(self) -> None:
+    async def test_chat_completions_retries_empty_stream_for_admin_chat(self) -> None:
         channel = SimpleNamespace(
             id=2,
             name="only",
@@ -780,7 +780,7 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
             http_request = Request({
                 "type": "http",
                 "method": "POST",
-                "path": "/api/admin/mindagent/chat",
+                "path": "/api/admin/chat/completions",
                 "headers": [],
                 "client": ("127.0.0.1", 1),
             })

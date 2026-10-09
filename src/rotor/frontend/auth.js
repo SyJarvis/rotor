@@ -55,6 +55,11 @@ function authScreen() {
           <button type="submit" class="btn-primary">${text.signIn}</button>
         </form>
       </section>
+      <section id="adminStartupPanel" class="hidden">
+        <h1>${text.adminAppLoadFailed}</h1>
+        <p class="auth-error" data-auth-error role="alert"></p>
+        <button type="button" class="btn-primary" id="adminReloadApp">${text.adminReloadApp}</button>
+      </section>
       <section id="adminPasswordPanel" class="hidden">
         <h1>${text.changePasswordTitle}</h1>
         <p>${text.changePasswordDescription}</p>
@@ -99,6 +104,8 @@ function authScreen() {
     ?.addEventListener("submit", submitLogin);
   screen.querySelector("#adminPasswordForm")
     ?.addEventListener("submit", submitPasswordChange);
+  screen.querySelector("#adminReloadApp")
+    ?.addEventListener("click", () => window.location.reload());
   return screen;
 }
 
@@ -113,7 +120,7 @@ function showPanel(panelId, message = "") {
   error.textContent = message;
   error.classList.toggle("hidden", !message);
   screen.classList.remove("hidden");
-  panel.querySelector("input")?.focus();
+  panel.querySelector("input, button")?.focus();
 }
 
 function showLogin(message = "") {
@@ -132,8 +139,12 @@ async function startApp(actor) {
   authScreen().classList.add("hidden");
   document.body.classList.remove("auth-pending");
   if (!appLoaded) {
-    appLoaded = true;
-    await import("./app.js?v=45");
+    try {
+      await import("./app.js?v=56");
+      appLoaded = true;
+    } catch {
+      showPanel("adminStartupPanel", labels().adminAppLoadRetry);
+    }
   }
 }
 
