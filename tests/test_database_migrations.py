@@ -102,6 +102,43 @@ def test_alembic_head_matches_model_metadata(tmp_path: Path) -> None:
     _run_alembic(database_path, "check")
 
 
+def test_startup_adopts_migrated_retry_delays_without_changing_values(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "retry-delays.db"
+    _run_alembic(database_path, "upgrade", "head")
+    engine = create_engine(f"sqlite:///{database_path}")
+    with engine.begin() as connection:
+        for attempt_index, delay in enumerate((None, 0.0, 0.125, 1.5)):
+            connection.execute(
+                Base.metadata.tables["request_attempts"].insert().values(
+                    request_id="retry-delay-request",
+                    attempt_index=attempt_index,
+                    channel_id=1,
+                    requested_model="retry-model",
+                    request_protocol="openai_chat",
+                    outcome="failed",
+                    retry_after_seconds=delay,
+                )
+            )
+        connection.execute(text("DROP TABLE alembic_version"))
+    engine.dispose()
+
+    backup_path = run_startup_migrations(_database_url(database_path))
+
+    assert backup_path is not None and backup_path.exists()
+    for path in (database_path, backup_path):
+        engine = create_engine(f"sqlite:///{path}")
+        with engine.connect() as connection:
+            delays = connection.execute(text(
+                "SELECT retry_after_seconds FROM request_attempts "
+                "WHERE request_id = 'retry-delay-request' ORDER BY attempt_index"
+            )).scalars().all()
+        engine.dispose()
+        assert delays == [None, 0.0, 0.125, 1.5]
+    _run_alembic(database_path, "check")
+
+
 def test_schema_parity_migration_accepts_legacy_startup_columns(
     tmp_path: Path,
 ) -> None:
