@@ -13,7 +13,7 @@ import time
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
-from sqlalchemy import or_, select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.database import async_session_maker
@@ -165,8 +165,10 @@ async def fetch_model_catalog(client: httpx.AsyncClient, credential: OAuthCreden
     except (httpx.HTTPError, TimeoutError, ValueError):
         raise OAuthError("ChatGPT model catalog is temporarily unavailable; try again", 503) from None
     if not response.is_success:
-        if response.status_code in (401, 403):
-            raise OAuthError("ChatGPT model catalog authorization failed; sign in again")
+        if response.status_code == 401:
+            raise OAuthError("ChatGPT model catalog authorization failed; sign in again", auth_status="reauth_required")
+        if response.status_code == 403:
+            raise OAuthError("ChatGPT model catalog access was denied; try again")
         raise OAuthError("ChatGPT model catalog is temporarily unavailable; try again", 503)
     try:
         payload = response.json()
@@ -190,6 +192,35 @@ async def fetch_model_catalog(client: httpx.AsyncClient, credential: OAuthCreden
         return models, len(entries)
     except (ValueError, TypeError, UnicodeDecodeError):
         raise OAuthError("ChatGPT returned an invalid model catalog; try again", 502) from None
+
+
+async def probe_saved_models(db: AsyncSession, client: httpx.AsyncClient, channel: Channel) -> tuple[list[str], int]:
+    rejected_credential = None
+    protected_tokens = (channel.oauth_access_token, channel.oauth_refresh_token, channel.oauth_account_id)
+    for attempt in range(2):
+        credential = await resolve_oauth_credentials(channel, client, rejected_credential=rejected_credential)
+        await db.refresh(channel)
+        refresh_token = channel.oauth_refresh_token
+        protected_tokens += (channel.oauth_access_token, refresh_token, channel.oauth_account_id)
+        try:
+            return await fetch_model_catalog(client, credential, refresh_tokens=protected_tokens)
+        except OAuthError as exc:
+            if exc.status_code != 401 or exc.auth_status != "reauth_required":
+                raise
+            if attempt == 0:
+                rejected_credential = credential
+                continue
+            # A late rejection must not invalidate a replacement login or an active refresh.
+            async with async_session_maker() as state_db:
+                await state_db.execute(update(Channel).where(
+                    Channel.id == channel.id, Channel.auth_type == "oauth",
+                    Channel.oauth_access_token == credential.access_token,
+                    Channel.oauth_refresh_token == refresh_token,
+                    Channel.oauth_expires_at == credential.expires_at,
+                    Channel.oauth_refresh_owner.is_(None),
+                ).values(oauth_status="reauth_required", oauth_error=str(exc)))
+                await state_db.commit()
+            raise
 
 
 async def probe_session_models(db: AsyncSession, client: httpx.AsyncClient, session_id: str, admin_user_id: int) -> tuple[list[str], int]:
@@ -438,13 +469,15 @@ def _stored_credential(channel: Channel) -> _TokenCredentials:
     )
 
 
-async def resolve_oauth_credentials(channel: Channel, http_client: httpx.AsyncClient) -> OAuthCredentials:
+async def resolve_oauth_credentials(channel: Channel, http_client: httpx.AsyncClient, *, rejected_credential: OAuthCredentials | None = None) -> OAuthCredentials:
     """Rotate under a DB lease, rereading tokens before and after contention."""
     if channel.id is None:
         raise OAuthError("Save and sign in to this ChatGPT channel first", auth_status="unauthed")
+    rejected_snapshot = ((rejected_credential.access_token, rejected_credential.expires_at)
+                         if rejected_credential is not None else None)
     lease = _Lease(secrets.token_hex(16))
     try:
-        return await _resolve_oauth_credentials(channel, http_client, lease)
+        return await _resolve_oauth_credentials(channel, http_client, lease, rejected_snapshot)
     finally:
         if lease.claimed:
             async def release():
@@ -456,7 +489,7 @@ async def resolve_oauth_credentials(channel: Channel, http_client: httpx.AsyncCl
             await asyncio.shield(release())
 
 
-async def _resolve_oauth_credentials(channel: Channel, http_client: httpx.AsyncClient, lease: _Lease) -> OAuthCredentials:
+async def _resolve_oauth_credentials(channel: Channel, http_client: httpx.AsyncClient, lease: _Lease, rejected_snapshot: tuple[str, float] | None) -> OAuthCredentials:
     owner = lease.owner
     deadline = time.monotonic() + LOCK_LIFETIME + HTTP_TIMEOUT
     while time.monotonic() < deadline:
@@ -467,13 +500,16 @@ async def _resolve_oauth_credentials(channel: Channel, http_client: httpx.AsyncC
             credential = _stored_credential(current)
             if current.oauth_status == "reauth_required":
                 raise OAuthError("ChatGPT authorization was rejected; sign in again", auth_status="reauth_required")
-            if credential.expires_at > time.time() + REFRESH_WINDOW:
+            snapshot = (credential.access_token, credential.expires_at)
+            if snapshot != rejected_snapshot and credential.expires_at > time.time() + REFRESH_WINDOW:
                 return OAuthCredentials(credential.access_token, credential.account_id, credential.expires_at)
             now = time.time()
             acquired = await db.execute(update(Channel).where(
                 Channel.id == channel.id, Channel.auth_type == "oauth",
                 or_(Channel.oauth_status.is_(None), Channel.oauth_status != "reauth_required"),
-                Channel.oauth_expires_at <= now + REFRESH_WINDOW,
+                or_(Channel.oauth_expires_at <= now + REFRESH_WINDOW,
+                    and_(Channel.oauth_access_token == rejected_snapshot[0],
+                         Channel.oauth_expires_at == rejected_snapshot[1]) if rejected_snapshot is not None else False),
                 or_(Channel.oauth_refresh_lock_until.is_(None), Channel.oauth_refresh_lock_until <= now),
             ).values(oauth_refresh_owner=owner, oauth_refresh_lock_until=now + LOCK_LIFETIME))
             lease.claimed = lease.claimed or bool(acquired.rowcount)
@@ -483,7 +519,8 @@ async def _resolve_oauth_credentials(channel: Channel, http_client: httpx.AsyncC
                 if current.oauth_refresh_owner != owner:
                     continue
                 credential = _stored_credential(current)
-                if credential.expires_at > time.time() + REFRESH_WINDOW:
+                snapshot = (credential.access_token, credential.expires_at)
+                if snapshot != rejected_snapshot and credential.expires_at > time.time() + REFRESH_WINDOW:
                     await db.execute(update(Channel).where(
                         Channel.id == channel.id, Channel.oauth_refresh_owner == owner,
                     ).values(oauth_refresh_owner=None, oauth_refresh_lock_until=None))

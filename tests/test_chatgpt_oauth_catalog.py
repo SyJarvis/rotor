@@ -275,7 +275,8 @@ def test_oauth_catalog_empty_errors_timeout_and_redirect_are_safe(tmp_path, monk
             async with sessions() as db:
                 assert (await db.get(Channel, channel.id)).models == ["gpt-codex"]
                 assert (await db.get(ChannelOAuthSession, session.id)).status == "authorized"
-        assert len(requests) == 1 and requests[0].url.host == "chatgpt.com"
+        assert len(requests) == (2 if target == "saved" and mode == "401" else 1)
+        assert requests[0].url.host == "chatgpt.com"
     asyncio.run(exercise())
 
 
@@ -300,5 +301,8 @@ def test_catalog_chatgpt_auth_failure_does_not_invalidate_rotor_admin_login(tmp_
                 assert response.status_code == 400
                 assert "sign in again" in response.json()["detail"]
                 assert all(secret not in response.text for secret in (jwt(), "refresh-secret", "account-1"))
-        assert len(requests) == (0 if failure in {"token_expired", "token_missing"} else 1)
+        expected_requests = 0 if failure in {"token_expired", "token_missing"} else 1
+        if target == "saved" and failure == "upstream_401":
+            expected_requests = 2
+        assert len(requests) == expected_requests
     asyncio.run(exercise())
