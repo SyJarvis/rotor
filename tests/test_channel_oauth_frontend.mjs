@@ -25,7 +25,7 @@ const savedChannel = (overrides = {}) => ({
   extra: { request_path: '/responses', auth_type: 'bearer' }, ...overrides,
 });
 
-async function environment({ language = 'en', start = session(), parses = [], completes = [], probes = [], confirmResult = true, failSave = 0, onSave = null, listed = [], check = {} } = {}) {
+async function environment({ language = 'en', start = session(), parses = [], completes = [], probes = [], confirmResult = true, failSave = 0, onSave = null, listed = [], check = {}, checks = [], details = [] } = {}) {
   const nodes = new Map();
   const timers = [];
   const calls = [];
@@ -93,6 +93,8 @@ async function environment({ language = 'en', start = session(), parses = [], co
   const pendingParses = [...parses];
   const pendingCompletes = [...completes];
   const pendingProbes = [...probes];
+  const pendingChecks = [...checks];
+  const pendingDetails = [...details];
   const bindings = {
     api: async (url, options = {}) => {
       const body = options.body ? JSON.parse(options.body) : null;
@@ -122,14 +124,22 @@ async function environment({ language = 'en', start = session(), parses = [], co
         return typeof value === 'function' ? value() : value;
       }
       if (options.method === 'DELETE') return session({ status: 'cancelled' });
-      if (url.endsWith('/test')) return { ok: true, latency_ms: 1, check_type: 'oauth', ...check };
+      if (url.endsWith('/test')) {
+        const value = pendingChecks.shift() ?? { ok: true, latency_ms: 1, check_type: 'oauth', ...check };
+        if (value instanceof Error) throw value;
+        return typeof value === 'function' ? value() : value;
+      }
       if (url.endsWith('/routing-state')) return { cooldowns: [] };
       if (options.method === 'POST' || options.method === 'PUT') {
         if (failSave-- > 0) throw new Error('Save temporarily failed');
         if (onSave) return onSave();
         return detail;
       }
-      if (/\/channels\/\d+$/.test(url)) return detail;
+      if (/\/channels\/\d+$/.test(url)) {
+        const value = pendingDetails.shift() ?? detail;
+        if (value instanceof Error) throw value;
+        return typeof value === 'function' ? value() : value;
+      }
       if (url === '/api/admin/channels') return listed;
       return {};
     },
@@ -163,6 +173,9 @@ async function environment({ language = 'en', start = session(), parses = [], co
   return {
     form, nodes, timers, calls, toasts, confirmations, locale, page: channels.namespace, getNode,
     setNow: (next) => { now = next; },
+    queueDetail: (value) => pendingDetails.push(value),
+    check: (id = '7') => channels.namespace.onClick({ dataset: { channelTest: id }, closest: () => null }),
+    checkEdited: () => getNode('channelOAuthCheck').listeners.click(),
     createOAuth() {
       channels.namespace.openCreate();
       form.elements.credential_type.value = 'oauth';
@@ -274,7 +287,7 @@ test('editing OAuth can retain its credential or bind a replacement login to the
   const env = await environment();
   await env.edit();
   assert.equal(env.form.elements.credential_type.value, 'oauth');
-  assert.match(env.getNode('channelOAuthStatus').textContent, /Connected to ChatGPT/);
+  assert.equal(env.getNode('channelOAuthStatus').textContent, env.locale.oauthSaved);
   await env.submit();
   assert.equal(env.saves()[0].url, '/api/admin/channels/7');
   assert.ok(!('oauth_session_id' in env.saves()[0].body));
@@ -711,4 +724,221 @@ test('both locales contain OAuth labels and official links open safely', async (
     assert.equal(typeof window.ROTOR_UI_CONFIG.locales[language][key], 'string', `${language}.${key}`);
   }
   assert.match(html, /id="channelOAuthUrl" target="_blank" rel="noopener noreferrer"/);
+});
+
+for (const language of ['zh-CN', 'en']) {
+  test(`saved authorization states share card and editor wording (${language})`, async () => {
+    for (const [status, key] of [
+      ['unauthed', 'oauthUnauthed'], ['connected', 'oauthSaved'],
+      ['temporary_error', 'oauthTemporaryError'], ['reauth_required', 'oauthReauthRequired'],
+      ['error', 'oauthTemporaryError'],
+    ]) {
+      const channel = savedChannel({ auth_status: status, auth_expires_at: 900, auth_error: '<unsafe>& detail' });
+      const env = await environment({ language, listed: [channel] });
+      assert.equal(typeof env.locale[key], 'string');
+      await env.page.load(); await env.edit(channel);
+      assert.ok(env.getNode('channels').innerHTML.includes(env.locale[key]));
+      assert.ok(env.getNode('channelOAuthStatus').textContent.includes(env.locale[key]));
+      assert.equal(env.getNode('channels').innerHTML.includes('<unsafe>'), false);
+      if (status !== 'unauthed') {
+        assert.ok(env.getNode('channels').innerHTML.includes(env.locale.oauthAutoRefresh));
+        assert.ok(env.getNode('channelOAuthDetails').textContent.includes(env.locale.oauthAutoRefresh));
+        assert.ok(env.getNode('channelOAuthDetails').textContent.includes(env.locale.oauthExpiry));
+      }
+      if (status === 'connected') {
+        assert.equal(env.getNode('channelOAuthStatus').textContent.includes(env.locale.oauthReauthRequired), false);
+        assert.equal(env.getNode('probeModels').disabled, false);
+      }
+      if (status === 'temporary_error' || status === 'error') {
+        assert.ok(env.getNode('channelOAuthDetails').textContent.includes(env.locale.oauthRetryCheck));
+      }
+      if (status === 'reauth_required') {
+        assert.match(env.getNode('channels').innerHTML, /data-channel-edit="7"[^>]*>[\s\S]*?log-in/);
+        assert.equal(env.getNode('probeModels').disabled, true);
+      }
+      env.page.unload();
+    }
+  });
+}
+
+test('successful authorization checks reload safe metadata, clear errors, and preserve the edit draft', async () => {
+  const old = savedChannel({ auth_status: 'temporary_error', auth_error: 'old network timeout', auth_expires_at: 900 });
+  const env = await environment({ listed: [old] });
+  await env.page.load(); await env.edit(old);
+  env.form.elements.name.value = 'my draft'; env.editModels('draft-model');
+  env.queueDetail(savedChannel({ auth_error: null, auth_expires_at: 3000, models: ['server-model'] }));
+  await env.checkEdited();
+  assert.deepEqual(env.calls.slice(-2).map(({ url, method }) => [url, method]), [
+    ['/api/admin/channels/7/test', 'POST'], ['/api/admin/channels/7', 'GET'],
+  ]);
+  assert.ok(env.getNode('channels').innerHTML.includes(env.locale.oauthSaved));
+  assert.equal(env.getNode('channels').innerHTML.includes('old network timeout'), false);
+  assert.ok(env.getNode('channelOAuthStatus').textContent.includes(env.locale.oauthSaved));
+  assert.equal(env.form.elements.name.value, 'my draft');
+  assert.equal(env.form.elements.models.value, 'draft-model');
+  env.page.unload();
+});
+
+for (const authStatus of ['temporary_error', 'reauth_required']) {
+  test(`a failed authorization check reloads ${authStatus} instead of guessing from error text`, async () => {
+    const env = await environment({ listed: [savedChannel()], checks: [new Error('some opaque failure')] });
+    await env.page.load();
+    env.queueDetail(savedChannel({ auth_status: authStatus, auth_error: 'safe refresh failure' }));
+    await env.check();
+    const key = authStatus === 'temporary_error' ? 'oauthTemporaryError' : 'oauthReauthRequired';
+    assert.ok(env.getNode('channels').innerHTML.includes(env.locale[key]));
+    assert.ok(env.getNode('channels').innerHTML.includes('safe refresh failure'));
+    env.page.unload();
+  });
+}
+
+test('a detail reload failure marks authorization status as unavailable rather than keeping a stale success badge', async () => {
+  const env = await environment({ listed: [savedChannel()] });
+  await env.page.load(); await env.edit();
+  env.queueDetail(new Error('detail request failed'));
+  await env.check();
+  assert.equal(typeof env.locale.oauthStatusUnavailable, 'string');
+  assert.ok(env.getNode('channels').innerHTML.includes(env.locale.oauthStatusUnavailable));
+  assert.equal(env.getNode('channels').innerHTML.includes(env.locale.oauthSaved), false);
+  assert.ok(env.getNode('channelOAuthStatus').textContent.includes(env.locale.oauthStatusUnavailable));
+  env.page.unload();
+});
+
+test('late authorization responses cannot overwrite a newer check', async () => {
+  let finishOld;
+  const env = await environment({ listed: [savedChannel()], checks: [
+    () => new Promise((resolve) => { finishOld = resolve; }),
+    { ok: true, check_type: 'oauth', latency_ms: 2 },
+  ] });
+  await env.page.load();
+  const old = env.check();
+  env.queueDetail(savedChannel({ auth_status: 'reauth_required' }));
+  await env.check();
+  const current = env.getNode('channels').innerHTML;
+  finishOld({ ok: true, check_type: 'oauth', latency_ms: 99 }); await old;
+  assert.equal(env.getNode('channels').innerHTML, current);
+  assert.ok(current.includes(env.locale.oauthReauthRequired));
+  env.page.unload();
+});
+
+for (const action of ['unload', 'reload']) {
+  test(`authorization metadata arriving after ${action} is discarded`, async () => {
+    let finish, entered;
+    const ready = new Promise((resolve) => { entered = resolve; });
+    const env = await environment({ listed: [savedChannel()] });
+    await env.page.load();
+    env.queueDetail(() => new Promise((resolve) => { finish = resolve; entered(); }));
+    const checking = env.check(); await ready;
+    assert.equal(typeof finish, 'function');
+    if (action === 'unload') env.page.unload(); else await env.page.load();
+    const current = env.getNode('channels').innerHTML;
+    finish(savedChannel({ auth_status: 'reauth_required' })); await checking;
+    assert.equal(env.getNode('channels').innerHTML, current);
+    env.page.unload();
+  });
+}
+
+test('late saved-state checks cannot replace a newly authorized login session', async () => {
+  let finish, entered;
+  const ready = new Promise((resolve) => { entered = resolve; });
+  const env = await environment({ listed: [savedChannel()] });
+  await env.page.load(); await env.edit();
+  env.queueDetail(() => new Promise((resolve) => { finish = resolve; entered(); }));
+  const checking = env.check(); await ready;
+  assert.equal(typeof finish, 'function');
+  await env.login(); env.paste(); await env.parse(); await env.complete();
+  finish(savedChannel({ auth_status: 'reauth_required' })); await checking;
+  assert.equal(env.getNode('channelOAuthStatus').textContent, env.locale.oauthAuthorized);
+  assert.equal(env.getNode('channelOAuthDetails').classList.contains('hidden'), true);
+  assert.equal(env.page.oauthSaveFields(env.form).oauth_session_id, 'one-time-session');
+  env.page.unload();
+});
+
+test('authorization reload updates only the requested channel', async () => {
+  const env = await environment({ listed: [savedChannel(), savedChannel({ id: 8, name: 'other', auth_status: 'temporary_error' })] });
+  await env.page.load();
+  env.queueDetail(savedChannel({ auth_status: 'reauth_required' }));
+  await env.check();
+  assert.ok(env.getNode('channels').innerHTML.includes(env.locale.oauthReauthRequired));
+  assert.ok(env.getNode('channels').innerHTML.includes(env.locale.oauthTemporaryError));
+  env.page.unload();
+});
+
+test('model probing synchronizes saved authorization even if the model update is cancelled or fails', async () => {
+  for (const probe of [{ models: ['catalog'], latency_ms: 1 }, new Error('catalog denied')]) {
+    const env = await environment({ listed: [savedChannel()], confirmResult: false, probes: [probe] });
+    await env.page.load();
+    env.queueDetail(savedChannel({ auth_status: 'temporary_error' }));
+    await env.menuProbe();
+    assert.ok(env.getNode('channels').innerHTML.includes(env.locale.oauthTemporaryError));
+    assert.equal(env.saves().length, 0);
+    env.page.unload();
+  }
+});
+
+test('saved editor probes reload auth metadata without overwriting draft models', async () => {
+  const env = await environment({ listed: [savedChannel()], probes: [new Error('catalog failed')] });
+  await env.page.load(); await env.edit();
+  env.editModels('manual-draft');
+  env.queueDetail(savedChannel({ auth_status: 'temporary_error' }));
+  await env.probe();
+  assert.equal(env.form.elements.models.value, 'manual-draft');
+  assert.ok(env.getNode('channelOAuthStatus').textContent.includes(env.locale.oauthTemporaryError));
+  env.page.unload();
+});
+
+test('API key checks keep the existing behavior and make no OAuth metadata request', async () => {
+  const env = await environment({ listed: [savedChannel({ auth_type: 'api_key', auth_status: 'api_key' })],
+    checks: [{ ok: true, models: ['key-model'], latency_ms: 1 }] });
+  await env.page.load(); await env.check();
+  assert.equal(env.calls.filter(({ url }) => url === '/api/admin/channels/7').length, 0);
+  assert.ok(env.getNode('channels').innerHTML.includes(env.locale.modelCatalogReachable));
+  assert.equal(env.getNode('channels').innerHTML.includes(env.locale.oauthAutoRefresh), false);
+  env.page.unload();
+});
+
+test('a discarded check cannot leave a reopened editor check button disabled', async () => {
+  let finish;
+  const env = await environment({ listed: [savedChannel()], checks: [() => new Promise((resolve) => { finish = resolve; })] });
+  await env.page.load(); await env.edit();
+  const old = env.checkEdited();
+  assert.equal(env.getNode('channelOAuthCheck').disabled, true);
+  env.page.closeForm(); await env.edit();
+  assert.equal(env.getNode('channelOAuthCheck').disabled, false);
+  finish({ ok: true, check_type: 'oauth', latency_ms: 1 }); await old;
+  assert.equal(env.getNode('channelOAuthCheck').disabled, false);
+  env.page.unload();
+});
+
+test('reopening the editor uses its fresh detail response after an earlier synchronization failure', async () => {
+  const env = await environment({ listed: [savedChannel()] });
+  await env.page.load(); env.queueDetail(new Error('detail unavailable')); await env.check();
+  await env.edit(savedChannel({ auth_status: 'temporary_error' }));
+  assert.ok(env.getNode('channelOAuthStatus').textContent.includes(env.locale.oauthTemporaryError));
+  assert.equal(env.getNode('channelOAuthStatus').textContent.includes(env.locale.oauthStatusUnavailable), false);
+  env.page.unload();
+});
+
+test('the sign-in-again card action opens the saved channel without starting a login automatically', async () => {
+  const channel = savedChannel({ auth_status: 'reauth_required' });
+  const env = await environment({ listed: [channel], details: [channel] });
+  await env.page.load();
+  await env.page.onClick({ dataset: { channelEdit: '7' }, closest: () => null });
+  assert.equal(env.page.editState.id, 7);
+  assert.ok(env.getNode('channelOAuthStatus').textContent.includes(env.locale.oauthReauthRequired));
+  assert.equal(env.calls.filter(({ url }) => url.endsWith('/oauth/sessions')).length, 0);
+  assert.deepEqual(Object.keys(env.page.oauthSaveFields(env.form)), []);
+  await env.login();
+  assert.equal(env.calls.filter(({ url }) => url.endsWith('/oauth/sessions')).length, 1);
+  env.page.unload();
+});
+
+test('authorization check errors render once as escaped plain text', async () => {
+  const env = await environment({ listed: [savedChannel()], checks: [{ ok: false, latency_ms: 1, error: '<img>& denied' }] });
+  await env.page.load(); await env.check();
+  const card = env.getNode('channels').innerHTML;
+  assert.ok(card.includes('&lt;img>&amp; denied'));
+  assert.equal(card.includes('&amp;lt;img>'), false);
+  assert.equal(card.includes('<img>'), false);
+  env.page.unload();
 });

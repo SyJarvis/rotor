@@ -48,11 +48,12 @@ _CHANNEL_SECRETS = dict(
 
 
 class OAuthError(httpx.HTTPStatusError):
-    def __init__(self, message: str, status_code: int = 401):
+    def __init__(self, message: str, status_code: int = 401, *, auth_status: str = "temporary_error"):
         request = httpx.Request("POST", TOKEN_URL)
         response = httpx.Response(status_code, request=request, json={"error": {"message": message}})
         super().__init__(message, request=request, response=response)
         self.status_code = status_code
+        self.auth_status = auth_status
 
 
 @dataclass(frozen=True, repr=False)
@@ -137,8 +138,19 @@ async def _token(client: httpx.AsyncClient, data: dict) -> _TokenCredentials:
     if not response.is_success:
         if response.status_code >= 500 or response.status_code == 429:
             raise OAuthError("ChatGPT authorization is temporarily unavailable; try again", 503)
-        raise OAuthError("ChatGPT authorization failed; sign in again")
-    return _credentials(_json(response))
+        try:
+            payload = response.json()
+            error = payload.get("error") if isinstance(payload, dict) else None
+            code = error.get("code") if isinstance(error, dict) else error
+        except (ValueError, UnicodeDecodeError):
+            code = None
+        if code == "invalid_grant" or (response.status_code == 401 and code != "invalid_client"):
+            raise OAuthError("ChatGPT authorization was rejected; sign in again", auth_status="reauth_required")
+        raise OAuthError("ChatGPT authorization is temporarily unavailable; try again")
+    try:
+        return _credentials(_json(response))
+    except OAuthError as exc:
+        raise OAuthError("ChatGPT authorization returned invalid credentials; try again", exc.status_code) from None
 
 
 async def fetch_model_catalog(client: httpx.AsyncClient, credential: OAuthCredentials, *, refresh_tokens: tuple[str | None, ...] = ()) -> tuple[list[str], int]:
@@ -416,6 +428,8 @@ def validate_configuration(*, auth_type: str, provider_type: str, protocol: str,
 
 
 def _stored_credential(channel: Channel) -> _TokenCredentials:
+    if channel.auth_status == "unauthed":
+        raise OAuthError("ChatGPT authorization credentials are missing; sign in again", auth_status="unauthed")
     return _TokenCredentials(
         _string(channel.oauth_access_token, "access token"),
         _string(channel.oauth_account_id, "account identifier"),
@@ -427,7 +441,7 @@ def _stored_credential(channel: Channel) -> _TokenCredentials:
 async def resolve_oauth_credentials(channel: Channel, http_client: httpx.AsyncClient) -> OAuthCredentials:
     """Rotate under a DB lease, rereading tokens before and after contention."""
     if channel.id is None:
-        raise OAuthError("Save and sign in to this ChatGPT channel first")
+        raise OAuthError("Save and sign in to this ChatGPT channel first", auth_status="unauthed")
     lease = _Lease(secrets.token_hex(16))
     try:
         return await _resolve_oauth_credentials(channel, http_client, lease)
@@ -449,13 +463,16 @@ async def _resolve_oauth_credentials(channel: Channel, http_client: httpx.AsyncC
         async with async_session_maker() as db:
             current = await db.get(Channel, channel.id)
             if current is None or current.auth_type != "oauth":
-                raise OAuthError("ChatGPT authorization is no longer available; sign in again")
+                raise OAuthError("ChatGPT authorization is no longer available; sign in again", auth_status="unauthed")
             credential = _stored_credential(current)
+            if current.oauth_status == "reauth_required":
+                raise OAuthError("ChatGPT authorization was rejected; sign in again", auth_status="reauth_required")
             if credential.expires_at > time.time() + REFRESH_WINDOW:
                 return OAuthCredentials(credential.access_token, credential.account_id, credential.expires_at)
             now = time.time()
             acquired = await db.execute(update(Channel).where(
                 Channel.id == channel.id, Channel.auth_type == "oauth",
+                or_(Channel.oauth_status.is_(None), Channel.oauth_status != "reauth_required"),
                 Channel.oauth_expires_at <= now + REFRESH_WINDOW,
                 or_(Channel.oauth_refresh_lock_until.is_(None), Channel.oauth_refresh_lock_until <= now),
             ).values(oauth_refresh_owner=owner, oauth_refresh_lock_until=now + LOCK_LIFETIME))
@@ -491,7 +508,7 @@ async def _resolve_oauth_credentials(channel: Channel, http_client: httpx.AsyncC
         async with async_session_maker() as db:
             marked = await db.execute(update(Channel).where(
                 Channel.id == channel.id, Channel.oauth_refresh_owner == owner,
-            ).values(oauth_status="error", oauth_error=str(exc)))
+            ).values(oauth_status=exc.auth_status, oauth_error=str(exc)))
             await db.commit()
         if not marked.rowcount:
             return await resolve_oauth_credentials(channel, http_client)

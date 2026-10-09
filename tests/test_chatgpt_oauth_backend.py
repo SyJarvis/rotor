@@ -755,9 +755,10 @@ def test_refresh_failure_status_and_timeout_are_safe_and_retryable(tmp_path, mon
                 assert error.value.status_code == 401
             async with sessions() as db:
                 saved = await db.get(Channel, channel.id)
-                assert saved.oauth_status == "error" and "refresh-secret" not in saved.oauth_error
+                assert saved.oauth_status == "reauth_required" and "refresh-secret" not in saved.oauth_error
                 assert saved.oauth_refresh_token == "refresh-secret"
                 assert saved.oauth_refresh_owner is None
+            channel = await seed(sessions, name="timeout-channel", oauth_expires_at=time.time() - 1)
             async def hanging(request):
                 await asyncio.sleep(10)
             monkeypatch.setattr(oauth, "HTTP_TIMEOUT", 0.03)

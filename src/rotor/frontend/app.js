@@ -8,8 +8,8 @@ import { refreshTheme } from "./charts.js?v=8";
 import { setChannelPresets, applyChannelDefaults, channelConnection } from "./channel-form.js?v=2";
 
 import * as overview from "./pages/overview.js?v=5";
-import * as channels from "./pages/channels.js?v=8";
-import { editState as channelEditState } from "./pages/channels.js?v=8";
+import * as channels from "./pages/channels.js?v=9";
+import { editState as channelEditState } from "./pages/channels.js?v=9";
 import * as tokens from "./pages/tokens.js?v=9";
 import * as usage from "./pages/usage.js?v=13";
 import * as logs from "./pages/logs.js?v=4";
@@ -162,6 +162,7 @@ const channelModal = document.getElementById("channelModal");
 document.getElementById("channelForm")?.elements.credential_type?.addEventListener("change", () => {
   channels.changeCredentialType(document.getElementById("channelForm"));
 });
+document.getElementById("channelOAuthCheck")?.addEventListener("click", channels.checkEditedOAuth);
 document.getElementById("channelOAuthLogin")?.addEventListener("click", channels.startOAuthLogin);
 document.getElementById("channelOAuthCancel")?.addEventListener("click", () => channels.cancelOAuthLogin());
 document.getElementById("channelOAuthCallback")?.addEventListener("input", channels.changeOAuthCallback);
@@ -265,6 +266,8 @@ document.getElementById("probeModels")?.addEventListener("click", async (event) 
   const button = event.currentTarget;
   if (button.disabled) return;
   const generation = channels.authGeneration();
+  const authRequest = oauth && oauthPath === `/api/admin/channels/${channelId}/probe-models`
+    ? channels.beginAuthStateRequest(channelId) : null;
   const revision = channelModelsRevision;
   const initialModels = form.elements.models.value;
   channels.setModelsProbing(true);
@@ -312,6 +315,7 @@ document.getElementById("probeModels")?.addEventListener("click", async (event) 
     probeResult.textContent = oauth ? t("oauthProbeFailed") : e.message;
     probeResult.className = "inline-result error";
   } finally {
+    if (authRequest) await channels.finishAuthStateRequest(authRequest);
     if (generation === channels.authGeneration()) {
       channels.setModelsProbing(false);
       button.innerHTML = original;

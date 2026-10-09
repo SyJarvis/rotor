@@ -184,6 +184,7 @@
               <h3 data-i18n="oauthStepLink">1. 生成并打开授权链接</h3>
               <div class="actions">
                 <button type="button" class="btn-secondary" id="channelOAuthLogin" data-i18n="oauthLogin">生成授权链接</button>
+                <button type="button" class="btn-secondary hidden" id="channelOAuthCheck" data-i18n="oauthCheck">检查授权</button>
                 <button type="button" class="btn-secondary hidden" id="channelOAuthCancel" data-i18n="cancel">取消</button>
               </div>
               <div id="channelOAuthLink" class="channel-oauth-link hidden">
@@ -211,6 +212,7 @@
                 <div><button type="button" class="btn-primary" id="channelOAuthComplete" data-i18n="oauthComplete" disabled>完成授权</button></div>
               </div>
               <div id="channelOAuthStatus" class="inline-result" role="status" aria-live="polite"></div>
+              <p id="channelOAuthDetails" class="muted text-sm hidden"></p>
               <p class="muted text-sm" data-i18n="oauthModelsHint">完成授权后可主动探测账号模型目录或手动填写；目录不代表每个模型都已通过生成验证。</p>
             </section>
             <label id="channelProtocolField">
@@ -374,7 +376,7 @@
       </div>
     </div>
 
-    <script src="/config.js?v=37"></script>
-    <script type="module" src="/auth.js?v=23"></script>
+    <script src="/config.js?v=38"></script>
+    <script type="module" src="/auth.js?v=24"></script>
   </body>
 </html>

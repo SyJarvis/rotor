@@ -3,6 +3,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from rotor.database import Base
 from typing import Optional
 from datetime import datetime
+import math
 
 
 class Channel(Base):
@@ -87,7 +88,21 @@ class Channel(Base):
     def auth_status(self) -> str:
         if self.auth_type != "oauth":
             return "api_key"
-        return self.oauth_status or "unauthed"
+        if not all(isinstance(value, str) and value.strip() for value in (
+            self.oauth_access_token, self.oauth_refresh_token, self.oauth_account_id,
+        )):
+            return "unauthed"
+        try:
+            valid_expiry = (isinstance(self.oauth_expires_at, (int, float))
+                            and not isinstance(self.oauth_expires_at, bool)
+                            and math.isfinite(self.oauth_expires_at) and self.oauth_expires_at > 0)
+        except OverflowError:
+            valid_expiry = False
+        if not valid_expiry:
+            return "unauthed"
+        if self.oauth_status == "error":
+            return "temporary_error"
+        return self.oauth_status or "connected"
 
     @property
     def auth_expires_at(self) -> Optional[float]:
