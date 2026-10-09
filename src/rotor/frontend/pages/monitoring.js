@@ -1,6 +1,6 @@
 // Monitoring Sources page — today's Coding Agent overview.
 
-import { api } from "../api.js?v=2";
+import { api } from "../api.js?v=3";
 import { t } from "../i18n.js";
 import {
   escapeHtml, formatRequestCount, formatTimeInTimezone, refreshIcons,

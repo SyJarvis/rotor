@@ -2,17 +2,27 @@ import time
 from typing import List, Literal
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, update as sql_update
 
 from rotor.database import get_db
 from rotor.adapters.factory import AdapterFactory
+from rotor.adapters.protocol.openai_integrity import ChatStreamIntegrity
 from rotor.core.exceptions import format_error_message
 from rotor.gateway.routing import routing_engine
 from rotor.models.channel import Channel
 from rotor.models.log import RequestLog
+from rotor.services.chatgpt_oauth import (
+    OAuthError,
+    clear_credential_values,
+    consume_session,
+    credential_values,
+    probe_saved_models,
+    resolve_oauth_credentials,
+    validate_configuration,
+)
 from rotor.schemas.channel import (
     ChannelCooldownResetRequest,
     ChannelCooldownResetResponse,
@@ -22,6 +32,7 @@ from rotor.schemas.channel import (
     ChannelResponse,
     ChannelRoutingStateResponse,
     ChannelUpdate,
+    ProbeModelsResponse,
 )
 from rotor.schemas.request import (
     ChatCompletionRequest,
@@ -41,16 +52,11 @@ from rotor.channels.presets import (
 router = APIRouter(prefix="/channels", tags=["channels"])
 
 
-class ProbeModelsResponse(BaseModel):
-    models: List[str]
-    latency_ms: int
-    raw_count: int = 0
-
-
 class ProbeModelsRequest(BaseModel):
     """Channel config as typed into the create/edit form, before saving."""
     base_url: str = Field(..., min_length=1)
-    key: str = Field(..., min_length=1)
+    key: str | None = Field(None, min_length=1)
+    auth_type: Literal["api_key", "oauth"] = "api_key"
     type: str = Field(..., min_length=1)
     protocol: str = Field(default="openai")
     extra: dict = Field(default_factory=dict)
@@ -66,6 +72,7 @@ class SavedProbeModelsRequest(BaseModel):
 
 class ChannelTestResponse(BaseModel):
     ok: bool
+    check_type: Literal["model_catalog", "oauth", "generation"] = "model_catalog"
     latency_ms: int
     status_code: int | None = None
     models: List[str] = Field(default_factory=list)
@@ -95,6 +102,20 @@ def _safe_upstream_error_text(
     if redact_key:
         text = text.replace(redact_key, "[redacted]")
     return text[:limit]
+
+
+def _oauth_admin_id(request: Request) -> int:
+    actor = getattr(request.state, "admin_actor", None)
+    if actor is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Administrator login required")
+    return actor.admin_user_id
+
+
+def _validate_channel_auth(**kwargs) -> None:
+    try:
+        validate_configuration(**kwargs)
+    except OAuthError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from None
 
 
 @router.get("", response_model=List[ChannelListItem])
@@ -211,6 +232,7 @@ async def reset_channel_cooldown(
 @router.post("", response_model=ChannelResponse, status_code=status.HTTP_201_CREATED)
 async def create_channel(
     channel: ChannelCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new channel."""
@@ -224,7 +246,23 @@ async def create_channel(
             detail=f"Channel with name '{channel.name}' already exists"
         )
 
-    channel_data = channel.model_dump()
+    _validate_channel_auth(
+        auth_type=channel.auth_type, provider_type=channel.type, protocol=channel.protocol,
+        base_url=channel.base_url, key=channel.key, extra=channel.extra,
+    )
+    channel_data = channel.model_dump(exclude={"oauth_session_id"})
+    if channel.auth_type == "oauth":
+        if not channel.oauth_session_id:
+            raise HTTPException(400, "Complete ChatGPT login before saving this channel")
+        try:
+            credential = await consume_session(
+                db, channel.oauth_session_id, admin_user_id=_oauth_admin_id(request), channel_id=None,
+            )
+        except OAuthError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from None
+        channel_data.update(credential_values(credential))
+    elif channel.oauth_session_id:
+        raise HTTPException(400, "OAuth login is only valid for OAuth channels")
     defaults = provider_defaults(channel.type, channel.protocol)
     channel_data["extra"] = {
         "models_path": defaults["models_path"],
@@ -244,6 +282,10 @@ async def create_channel(
 async def probe_models_unsaved(payload: ProbeModelsRequest):
     """Probe model list from form input before the channel is saved."""
     start = time.perf_counter()
+    if payload.auth_type == "oauth" or payload.type == "openai_codex":
+        raise HTTPException(400, "Complete ChatGPT login before probing models")
+    if not payload.key:
+        raise HTTPException(400, "An API key is required")
     try:
         models = await _fetch_model_list(
             base_url=payload.base_url,
@@ -292,6 +334,18 @@ async def probe_models(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Channel {channel_id} not found",
+        )
+
+    if channel.auth_type == "oauth":
+        start = time.perf_counter()
+        try:
+            # OAuth catalogs always use the fixed Codex endpoint, ignoring form overrides.
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                models, raw_count = await probe_saved_models(db, client, channel)
+        except OAuthError as exc:
+            raise HTTPException(400 if exc.status_code == 401 else exc.status_code, str(exc)) from None
+        return ProbeModelsResponse(
+            models=models, latency_ms=int((time.perf_counter() - start) * 1000), raw_count=raw_count,
         )
 
     overrides = payload.model_dump(exclude_none=True) if payload else {}
@@ -357,25 +411,30 @@ async def test_channel(
 
     start = time.perf_counter()
     try:
-        models = await _fetch_model_list(
-            base_url=channel.base_url,
-            key=channel.key,
-            provider_type=channel.type,
-            protocol=channel.protocol,
-            models_path=channel_option(
-                provider=channel.type,
+        if channel.auth_type == "oauth":
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                await resolve_oauth_credentials(channel, client)
+            models = list(channel.models or [])
+        else:
+            models = await _fetch_model_list(
+                base_url=channel.base_url,
+                key=channel.key,
+                provider_type=channel.type,
                 protocol=channel.protocol,
-                extra=channel.extra,
-                name="models_path",
-            ),
-            auth_type=channel_option(
-                provider=channel.type,
-                protocol=channel.protocol,
-                extra=channel.extra,
-                name="auth_type",
-            ),
-            extra_headers=(channel.extra or {}).get("headers"),
-        )
+                models_path=channel_option(
+                    provider=channel.type,
+                    protocol=channel.protocol,
+                    extra=channel.extra,
+                    name="models_path",
+                ),
+                auth_type=channel_option(
+                    provider=channel.type,
+                    protocol=channel.protocol,
+                    extra=channel.extra,
+                    name="auth_type",
+                ),
+                extra_headers=(channel.extra or {}).get("headers"),
+            )
         latency_ms = int((time.perf_counter() - start) * 1000)
         probe_model = test_model or next(iter(channel.models or []), None) or next(
             iter(models), None
@@ -391,6 +450,7 @@ async def test_channel(
             latency_ms = int((time.perf_counter() - start) * 1000)
         return ChannelTestResponse(
             ok=True,
+            check_type="generation" if capability else "oauth" if channel.auth_type == "oauth" else "model_catalog",
             latency_ms=latency_ms,
             status_code=200,
             models=models[:20],
@@ -403,6 +463,7 @@ async def test_channel(
         latency_ms = int((time.perf_counter() - start) * 1000)
         return ChannelTestResponse(
             ok=False,
+            check_type="generation" if capability else "oauth" if channel.auth_type == "oauth" else "model_catalog",
             latency_ms=latency_ms,
             status_code=exc.response.status_code,
             protocol=channel.protocol,
@@ -414,6 +475,7 @@ async def test_channel(
         latency_ms = int((time.perf_counter() - start) * 1000)
         return ChannelTestResponse(
             ok=False,
+            check_type="generation" if capability else "oauth" if channel.auth_type == "oauth" else "model_catalog",
             latency_ms=latency_ms,
             protocol=channel.protocol,
             capability=capability,
@@ -460,9 +522,22 @@ async def _probe_generation_capability(
         response = await adapter.make_request(request, timeout=30.0)
         if request.stream:
             try:
-                async for _ in adapter.stream_convert_response(response, request):
-                    return
-                raise RuntimeError("Provider returned an empty stream")
+                integrity = ChatStreamIntegrity(
+                    expected_choices=request.n,
+                    upstream_status=response.status_code,
+                    secret=channel.key,
+                )
+                saw_text = False
+                async for chunk in adapter.stream_convert_response(response, request):
+                    integrity.feed(chunk)
+                    for choice in chunk.get("choices") or []:
+                        content = (choice.get("delta") or {}).get("content")
+                        if isinstance(content, str) and content:
+                            saw_text = True
+                integrity.finish()
+                if not saw_text:
+                    raise RuntimeError("Provider stream contained no text content")
+                return
             finally:
                 await response.aclose()
 
@@ -482,6 +557,7 @@ async def _probe_generation_capability(
 async def update_channel(
     channel_id: int,
     update: ChannelUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Update a channel."""
@@ -510,7 +586,31 @@ async def update_channel(
             )
 
     # Update fields
-    update_data = update.model_dump(exclude_unset=True)
+    update_data = update.model_dump(exclude_unset=True, exclude={"oauth_session_id"})
+    auth_type = update_data.get("auth_type", channel.auth_type)
+    provider_type = update_data.get("type", channel.type)
+    protocol = update_data.get("protocol", channel.protocol)
+    base_url = update_data.get("base_url", channel.base_url)
+    key = update_data.get("key", channel.key if channel.auth_type == "api_key" else None)
+    _validate_channel_auth(
+        auth_type=auth_type, provider_type=provider_type, protocol=protocol,
+        base_url=base_url, key=key, extra=update_data.get("extra", channel.extra) or {},
+    )
+    if auth_type == "oauth":
+        if channel.auth_type != "oauth" and not update.oauth_session_id:
+            raise HTTPException(400, "Complete ChatGPT login before saving this channel")
+        if update.oauth_session_id:
+            try:
+                credential = await consume_session(
+                    db, update.oauth_session_id, admin_user_id=_oauth_admin_id(request), channel_id=channel_id,
+                )
+            except OAuthError as exc:
+                raise HTTPException(exc.status_code, str(exc)) from None
+            update_data.update(credential_values(credential))
+    elif update.oauth_session_id:
+        raise HTTPException(400, "OAuth login is only valid for OAuth channels")
+    elif channel.auth_type == "oauth":
+        update_data.update(clear_credential_values())
     if (
         "extra" not in update_data
         and ({"type", "protocol"} & update_data.keys())
@@ -524,8 +624,10 @@ async def update_channel(
             if not migrated_extra.get(name) or migrated_extra.get(name) == old_defaults[name]:
                 migrated_extra[name] = new_defaults[name]
         update_data["extra"] = migrated_extra
-    for field, value in update_data.items():
-        setattr(channel, field, value)
+    # Explicit values also clear a refresh lease claimed after the ORM read.
+    # ORM dirty tracking would omit an unchanged None and leave that lease live.
+    if update_data:
+        await db.execute(sql_update(Channel).where(Channel.id == channel_id).values(**update_data))
 
     await db.commit()
     await db.refresh(channel)

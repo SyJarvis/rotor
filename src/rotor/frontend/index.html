@@ -6,8 +6,8 @@
     <title>Rotor 管理控制台</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
-    <link rel="stylesheet" href="/styles.css?v=26">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap">
+    <link rel="stylesheet" href="/styles.css?v=45">
     <script>
       // FOUC guard — must run before body paints.
       (function () {
@@ -45,7 +45,7 @@
           <button class="nav-item active" data-tab="overview">
             <i data-lucide="layout-dashboard"></i><span data-i18n="overview">接入信息</span>
           </button>
-          <button class="nav-item" data-tab="channels">
+          <button class="nav-item" data-tab="channels" data-admin-only>
             <i data-lucide="layers"></i><span data-i18n="channels">模型渠道</span>
           </button>
           <button class="nav-item" data-tab="tokens">
@@ -57,27 +57,13 @@
           <button class="nav-item" data-tab="logs">
             <i data-lucide="scroll-text"></i><span data-i18n="logs">请求日志</span>
           </button>
-          <button class="nav-item" data-tab="monitoring">
+          <button class="nav-item" data-tab="monitoring" data-admin-only>
             <i data-lucide="radio-tower"></i><span data-i18n="monitoringTitle">监控</span>
           </button>
-          <button class="nav-item" data-tab="mindagent">
-            <i data-lucide="bot"></i><span data-i18n="mindagentChat">MindAgent 对话</span>
+          <button class="nav-item" data-tab="chat">
+            <i data-lucide="messages-square"></i><span data-i18n="chatChat">对话</span>
           </button>
-          <section class="sidebar-conversations" id="mindagentHistory" aria-label="最近对话">
-            <div class="sidebar-conversations-head">
-              <span data-i18n="recentConversations">最近对话</span>
-              <button
-                class="sidebar-conversations-new"
-                type="button"
-                data-agent-action="new"
-                title="新对话"
-                aria-label="新对话"
-              >
-                <i data-lucide="square-pen"></i>
-              </button>
-            </div>
-            <div class="agent-thread-list" id="agentThreadList"></div>
-          </section>
+          <button class="nav-item" data-tab="users" data-admin-only><i data-lucide="users"></i><span data-i18n="usersTitle">用户管理</span></button>
         </nav>
         <div class="sidebar-footer">
           <button class="nav-item" id="openSettings" type="button">
@@ -89,7 +75,11 @@
 
       <div class="main">
         <header class="topbar">
-          <button class="icon-btn menu-toggle" id="menuToggle" aria-label="Menu">
+          <button class="icon-btn sidebar-collapse-toggle" id="sidebarCollapseToggle" type="button" aria-label="收起侧栏" aria-expanded="true" aria-controls="sidebar">
+            <i class="sidebar-collapse-icon" data-lucide="panel-left-close"></i>
+            <i class="sidebar-expand-icon" data-lucide="panel-left-open"></i>
+          </button>
+          <button class="icon-btn menu-toggle" id="menuToggle" type="button" aria-label="打开导航" aria-expanded="false" aria-controls="sidebar">
             <i data-lucide="menu"></i>
           </button>
           <h1 class="page-title" id="pageTitle">接入信息</h1>
@@ -98,15 +88,6 @@
               <i data-lucide="search"></i>
               <input id="searchInput" placeholder="搜索..." data-i18n-placeholder="search">
             </div>
-            <button class="icon-btn" id="refreshBtn" title="刷新">
-              <i data-lucide="refresh-cw"></i>
-            </button>
-            <button class="icon-btn" id="themeToggle" title="切换主题">
-              <i data-lucide="sun-moon"></i>
-            </button>
-            <button class="icon-btn" id="localeToggle" title="Language">
-              <span id="localeLabel">EN</span>
-            </button>
             <button class="icon-btn" id="logoutBtn" title="退出登录" data-i18n-title="signOut">
               <i data-lucide="log-out"></i>
             </button>
@@ -120,10 +101,13 @@
           <section id="usage" class="panel"></section>
           <section id="logs" class="panel"></section>
           <section id="monitoring" class="panel"></section>
-          <section id="mindagent" class="panel"></section>
+          <section id="chat" class="panel"></section>
+          <section id="users" class="panel"></section>
         </main>
       </div>
     </div>
+
+    <div class="sidebar-tooltip" id="sidebarTooltip" role="tooltip" hidden></div>
 
     <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
@@ -133,7 +117,7 @@
         <header class="modal-head">
           <div>
             <h2 id="channelModalTitle" data-i18n="addChannelTitle">新增模型渠道</h2>
-            <p data-i18n="addChannelDescription">配置一个上游 API Key 及其可用模型。</p>
+            <p data-i18n="addChannelDescription">选择 API Key 或认证登录，并配置可用模型。</p>
           </div>
           <button class="icon-btn" id="closeChannelModal" aria-label="Close">
             <i data-lucide="x"></i>
@@ -146,6 +130,19 @@
               <input name="name" placeholder="deepseek-main" required>
             </label>
             <label>
+              <span data-i18n="credentialType">渠道认证</span>
+              <select name="credential_type">
+                <option value="api_key">API Key</option>
+                <option value="oauth" data-i18n="oauthCredentialType">认证登录</option>
+              </select>
+            </label>
+            <label id="channelOAuthProviderField" class="hidden">
+              <span data-i18n="oauthProvider">登录服务</span>
+              <select name="oauth_provider">
+                <option value="chatgpt">ChatGPT OAuth</option>
+              </select>
+            </label>
+            <label id="channelProviderField">
               <span data-i18n="provider">服务商</span>
               <select name="type">
                 <option value="openai">OpenAI-compatible</option>
@@ -155,17 +152,54 @@
                 <option value="minimax">MiniMax</option>
                 <option value="zhipu">Zhipu</option>
                 <option value="kimi">Kimi</option>
+                <option value="openai_codex" hidden>ChatGPT OAuth</option>
               </select>
             </label>
-            <label class="span-2">
+            <label class="span-2" id="channelBaseUrlField">
               <span data-i18n="upstreamBaseUrl">上游 Base URL</span>
               <input name="base_url" placeholder="https://api.deepseek.com" required>
             </label>
-            <label class="span-2">
+            <label class="span-2" id="channelKeyField">
               <span data-i18n="upstreamApiKey">上游 API Key</span>
               <input name="key" type="password" placeholder="provider api key" required>
             </label>
-            <label>
+            <section id="channelOAuthPanel" class="channel-oauth-panel span-2 hidden" aria-label="ChatGPT OAuth">
+              <p class="muted text-sm" data-i18n="oauthDescription">在浏览器完成 ChatGPT 授权，再将完整回调 URL 粘贴回此处。</p>
+              <h3 data-i18n="oauthStepLink">1. 生成并打开授权链接</h3>
+              <div class="actions">
+                <button type="button" class="btn-secondary" id="channelOAuthLogin" data-i18n="oauthLogin">生成授权链接</button>
+                <button type="button" class="btn-secondary hidden" id="channelOAuthCheck" data-i18n="oauthCheck">检查授权</button>
+                <button type="button" class="btn-secondary hidden" id="channelOAuthCancel" data-i18n="cancel">取消</button>
+              </div>
+              <div id="channelOAuthLink" class="channel-oauth-link hidden">
+                <span data-i18n="oauthOpenUrl">打开官方授权页面</span>
+                <a id="channelOAuthUrl" target="_blank" rel="noopener noreferrer"></a>
+                <div><button type="button" class="btn-secondary btn-tiny" data-copy-target="channelOAuthUrl" data-i18n="oauthCopyLink">复制授权链接</button></div>
+                <p class="muted text-sm" data-i18n="oauthCallbackHint">授权后，复制地址栏中完整的 http://localhost:1455/auth/callback?... URL。即使页面提示无法连接，也复制该地址；Rotor 不监听 1455 端口。</p>
+              </div>
+              <div id="channelOAuthCallbackStep" class="channel-oauth-callback hidden">
+                <h3 data-i18n="oauthStepParse">2. 粘贴并解析回调 URL</h3>
+                <label>
+                  <span data-i18n="oauthCallbackUrl">完整回调 URL</span>
+                  <textarea id="channelOAuthCallback" placeholder="http://localhost:1455/auth/callback?code=...&amp;state=..." autocomplete="off" spellcheck="false"></textarea>
+                </label>
+                <div><button type="button" class="btn-secondary" id="channelOAuthParse" data-i18n="oauthParse" disabled>解析 URL</button></div>
+                <div id="channelOAuthPreview" class="channel-oauth-preview hidden">
+                  <dl>
+                    <dt>code</dt><dd><code id="channelOAuthCode"></code></dd>
+                    <dt>state</dt><dd><code id="channelOAuthState"></code></dd>
+                    <dt>redirect_uri</dt><dd><code id="channelOAuthRedirect"></code></dd>
+                  </dl>
+                  <p class="muted text-sm" data-i18n="oauthCallbackMatched">回调地址和 state 已匹配当前会话。点击完成授权后才会交换凭证。</p>
+                </div>
+                <h3 data-i18n="oauthStepComplete">3. 完成授权</h3>
+                <div><button type="button" class="btn-primary" id="channelOAuthComplete" data-i18n="oauthComplete" disabled>完成授权</button></div>
+              </div>
+              <div id="channelOAuthStatus" class="inline-result" role="status" aria-live="polite"></div>
+              <p id="channelOAuthDetails" class="muted text-sm hidden"></p>
+              <p class="muted text-sm" data-i18n="oauthModelsHint">完成授权后可主动探测账号模型目录或手动填写；目录不代表每个模型都已通过生成验证。</p>
+            </section>
+            <label id="channelProtocolField">
               <span data-i18n="protocol">协议</span>
               <select name="protocol">
                 <option value="openai">openai</option>
@@ -173,7 +207,7 @@
                 <option value="anthropic">anthropic</option>
               </select>
             </label>
-            <label>
+            <label id="channelHeaderAuthField">
               <span data-i18n="authType">鉴权方式</span>
               <select name="auth_type">
                 <option value="bearer">Bearer Token</option>
@@ -181,11 +215,11 @@
                 <option value="api-key">api-key</option>
               </select>
             </label>
-            <label>
+            <label id="channelModelsPathField">
               <span data-i18n="modelsPath">模型列表路径</span>
               <input name="models_path" value="/models" required>
             </label>
-            <label>
+            <label id="channelRequestPathField">
               <span data-i18n="requestPath">模型调用路径</span>
               <input name="request_path" value="/chat/completions" required>
             </label>
@@ -228,25 +262,80 @@
     </div>
 
     <div class="modal hidden" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
-      <div class="modal-backdrop" data-close-modal></div>
-      <div class="modal-panel settings-modal-panel">
+      <div class="modal-backdrop" data-settings-close></div>
+      <div class="modal-panel settings-modal-panel" tabindex="-1">
         <header class="modal-head">
           <div>
             <h2 id="settingsModalTitle" data-i18n="settings">设置</h2>
-            <p data-i18n="settingsDescription">配置 Rotor 的运行参数。</p>
+            <p data-i18n="settingsDescription">管理外观、语言与运行参数。</p>
           </div>
-          <button class="icon-btn" data-close-modal aria-label="Close">
+          <button type="button" class="icon-btn" id="settingsClose" data-settings-close data-i18n-title="close" title="关闭" aria-label="关闭">
             <i data-lucide="x"></i>
           </button>
         </header>
-        <form id="settingsForm">
+        <form id="settingsForm" novalidate>
           <div class="settings-layout">
-            <nav class="settings-nav" aria-label="Settings sections">
-              <button type="button" class="settings-nav-item active">
-                <i data-lucide="route"></i><span data-i18n="routingSettings">路由设置</span>
+            <nav class="settings-nav" role="tablist" aria-label="设置分类">
+              <button type="button" id="settingsTabGeneral" class="settings-nav-item active" role="tab" aria-selected="true" aria-controls="settingsGeneral" data-settings-tab="general">
+                <i data-lucide="sliders-horizontal"></i><span data-i18n="generalSettings">通用</span>
               </button>
+              <button type="button" data-admin-setting id="settingsTabRouting" class="settings-nav-item" role="tab" aria-selected="false" aria-controls="settingsRouting" data-settings-tab="routing" tabindex="-1">
+                <i data-lucide="route"></i><span data-i18n="routingSettings">路由</span>
+              </button>
+              <button type="button" id="settingsTabAccount" class="settings-nav-item" role="tab" aria-selected="false" aria-controls="settingsAccount" data-settings-tab="account" tabindex="-1"><i data-lucide="user-round"></i><span data-i18n="accountSettings">账户</span></button>
             </nav>
             <div class="settings-content">
+              <div data-admin-setting id="settingsLoadNotice" class="settings-load-notice hidden" role="status">
+                <span id="settingsLoadMessage"></span>
+                <button type="button" class="btn-secondary" id="settingsRetry" data-i18n="retrySettings">重试加载</button>
+              </div>
+              <section id="settingsGeneral" role="tabpanel" aria-labelledby="settingsTabGeneral" data-settings-panel="general">
+                <h3 data-i18n="generalSettings">通用</h3>
+                <p id="settingsGeneralDescription" class="settings-section-description" data-i18n="generalSettingsDescription">调整此浏览器的显示偏好与服务端时区。</p>
+                <div class="settings-fields">
+                  <div class="settings-preference">
+                    <span id="settingsThemeLabel" data-i18n="appearanceSetting">外观</span>
+                    <div class="settings-theme-options" role="group" aria-labelledby="settingsThemeLabel">
+                      <button type="button" id="settingsThemeLight" class="btn-secondary settings-theme-choice" data-settings-theme="light" aria-pressed="false" data-i18n="lightTheme">浅色</button>
+                      <button type="button" id="settingsThemeDark" class="btn-secondary settings-theme-choice" data-settings-theme="dark" aria-pressed="false" data-i18n="darkTheme">深色</button>
+                    </div>
+                  </div>
+                  <label>
+                    <span data-i18n="languageSetting">语言</span>
+                    <select id="settingsLocale">
+                      <option value="zh-CN">简体中文</option>
+                      <option value="en">English</option>
+                    </select>
+                  </label>
+                  <label class="settings-server-row" data-admin-setting>
+                    <span data-i18n="displayTimezone">日期与时间</span>
+                    <small data-i18n="displayTimezoneDescription">用于用量和请求日志的自然日边界与日期范围。</small>
+                    <input name="display_timezone" list="displayTimezoneOptions" data-server-setting disabled required>
+                    <small data-i18n="settingsSaveRequired">保存设置后生效。</small>
+                    <datalist id="displayTimezoneOptions">
+                      <option value="Asia/Shanghai"></option><option value="UTC"></option>
+                      <option value="Asia/Tokyo"></option><option value="America/Los_Angeles"></option>
+                      <option value="America/New_York"></option><option value="Europe/London"></option>
+                    </datalist>
+                  </label>
+                </div>
+              </section>
+              <section id="settingsAccount" role="tabpanel" aria-labelledby="settingsTabAccount" data-settings-panel="account" hidden>
+                <h3 data-i18n="accountSettings">账户</h3>
+                <div class="settings-fields">
+                  <label><span data-i18n="adminUsername">用户名</span><output id="accountUsername" class="account-identity"></output></label>
+                  <span class="badge" id="accountRole"></span>
+                  <label><span data-i18n="displayName">显示名称</span><input id="accountDisplayName" maxlength="100"></label>
+                  <button type="button" class="btn-secondary" id="accountSave" data-i18n="saveProfile">保存资料</button>
+                  <label><span data-i18n="currentPassword">当前密码</span><input id="accountCurrentPassword" type="password" autocomplete="current-password"></label>
+                  <label><span data-i18n="newPassword">新密码</span><input id="accountNewPassword" type="password" autocomplete="new-password" minlength="6"></label>
+                  <label><span data-i18n="confirmPassword">确认密码</span><input id="accountConfirmPassword" type="password" autocomplete="new-password" minlength="6"></label>
+                  <button type="button" class="btn-secondary" id="accountPasswordSave" data-i18n="savePassword">保存新密码</button>
+                  <p id="accountStatus" role="status"></p>
+                  <button type="button" class="btn-secondary" id="accountLogout" data-i18n="signOut">退出登录</button>
+                </div>
+              </section>
+              <section id="settingsRouting" role="tabpanel" aria-labelledby="settingsTabRouting" data-settings-panel="routing" hidden>
               <h3 data-i18n="routingSettings">路由设置</h3>
               <p class="settings-section-description" data-i18n="routingSettingsDescription">
                 控制多个渠道之间的选择方式和会话粘性。
@@ -254,9 +343,10 @@
               <div class="settings-fields">
                 <label>
                   <span data-i18n="routingStrategy">路由策略</span>
-                  <select name="strategy">
+                  <select name="strategy" data-server-setting disabled>
                     <option value="priority_weighted" data-i18n="strategyPriorityWeighted">优先级 + 权重分摊</option>
                     <option value="fallback_order" data-i18n="strategyFallbackOrder">固定主备顺序</option>
+                    <option value="adaptive" data-i18n="strategyAdaptive">自适应</option>
                     <option value="weighted" data-i18n="strategyWeighted">全局权重分摊</option>
                   </select>
                 </label>
@@ -265,60 +355,50 @@
                     <strong data-i18n="affinityEnabled">启用会话亲和</strong>
                     <small data-i18n="affinityDescription">为尚无租约的会话提供稳定分配；关闭后 Session Lease 也停用。</small>
                   </span>
-                  <input name="affinity_enabled" type="checkbox">
+                  <input data-server-setting disabled name="affinity_enabled" type="checkbox">
                 </label>
                 <label class="setting-toggle">
                   <span>
                     <strong data-i18n="sessionLeaseEnabled">启用 Session Lease</strong>
                     <small data-i18n="sessionLeaseDescription">将活跃会话固定在最后成功的渠道，fallback 成功后迁移；关闭会话亲和时同时失效。</small>
                   </span>
-                  <input name="session_lease_enabled" type="checkbox">
+                  <input data-server-setting disabled name="session_lease_enabled" type="checkbox">
                 </label>
                 <label>
                   <span data-i18n="sessionLeaseIdleTtl">Session Lease 空闲 TTL（秒）</span>
                   <small data-i18n="sessionLeaseIdleTtlDescription">租约在最后一次成功请求后保持的时间；可在 Channel extra 中按渠道或模型覆盖。</small>
-                  <input name="session_lease_idle_ttl_seconds" type="number" min="60" max="86400" step="1" value="1800" required>
-                </label>
-                <label>
-                  <span data-i18n="displayTimezone">日期与时间</span>
-                  <small data-i18n="displayTimezoneDescription">用于用量和请求日志的自然日、周和月边界。</small>
-                  <input name="display_timezone" list="displayTimezoneOptions" value="Asia/Shanghai" required>
-                  <datalist id="displayTimezoneOptions">
-                    <option value="Asia/Shanghai">Asia/Shanghai (UTC+08:00)</option>
-                    <option value="UTC">UTC (UTC+00:00)</option>
-                    <option value="Asia/Tokyo">Asia/Tokyo (UTC+09:00)</option>
-                    <option value="America/Los_Angeles">America/Los_Angeles</option>
-                    <option value="America/New_York">America/New_York</option>
-                    <option value="Europe/London">Europe/London</option>
-                  </datalist>
+                  <input data-server-setting disabled name="session_lease_idle_ttl_seconds" type="number" min="60" max="86400" step="1" value="1800" required>
                 </label>
                 <div class="settings-file">
                   <span data-i18n="settingsFile">配置文件</span>
-                  <code id="settingsPath">~/.rotor/settings.json</code>
+                  <code id="settingsPath">—</code>
                 </div>
               </div>
+              </section>
             </div>
           </div>
-          <footer class="modal-actions">
-            <button type="button" class="btn-secondary" data-close-modal data-i18n="cancel">取消</button>
-            <button type="submit" class="btn-primary">
-              <i data-lucide="save"></i><span data-i18n="saveSettings">保存设置</span>
-            </button>
+          <footer class="modal-actions settings-actions" id="settingsFooter">
+            <span id="settingsStatus" role="status" aria-live="polite"></span>
+            <div class="settings-action-buttons">
+              <button type="submit" class="btn-primary" id="settingsSave" disabled>
+                <i data-lucide="save"></i><span data-i18n="saveSettings">保存设置</span>
+              </button>
+            </div>
           </footer>
         </form>
       </div>
     </div>
 
-    <div class="modal hidden" id="mindagentDeleteModal" role="dialog" aria-modal="true" aria-labelledby="mindagentDeleteModalTitle">
+    <div class="modal hidden" id="chatDeleteModal" role="dialog" aria-modal="true" aria-labelledby="chatDeleteModalTitle">
       <div class="modal-backdrop" data-agent-action="cancel-delete"></div>
-      <div class="modal-panel mindagent-delete-modal">
+      <div class="modal-panel chat-delete-modal">
         <header class="modal-head">
           <div>
-            <h2 id="mindagentDeleteModalTitle" data-i18n="deleteConversation">删除对话</h2>
+            <h2 id="chatDeleteModalTitle" data-i18n="deleteConversation">删除对话</h2>
             <p data-i18n="confirmDeleteConversation">确定删除这条本地对话记录吗？</p>
           </div>
         </header>
-        <p class="mindagent-delete-name" id="mindagentDeleteConversationName"></p>
+        <p class="chat-delete-name" id="chatDeleteConversationName"></p>
         <footer class="modal-actions">
           <button type="button" class="btn-secondary" data-agent-action="cancel-delete" data-i18n="cancel">取消</button>
           <button type="button" class="btn-danger" data-agent-action="confirm-delete" data-i18n="confirmDelete">确认删除</button>
@@ -326,7 +406,7 @@
       </div>
     </div>
 
-    <script src="/config.js?v=32"></script>
-    <script type="module" src="/auth.js?v=14"></script>
+    <script src="/config.js?v=53"></script>
+    <script type="module" src="/auth.js?v=43"></script>
   </body>
 </html>

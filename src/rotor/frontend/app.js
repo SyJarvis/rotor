@@ -1,22 +1,25 @@
 // App entry — router, sidebar/topbar wiring, modal, theme/locale listeners.
 
-import { t, applyLocale, toggleLocale } from "./i18n.js";
-import { toggleTheme } from "./theme.js";
-import { api, copyText } from "./api.js?v=2";
+import { t, applyLocale } from "./i18n.js";
+import { initSettings } from "./settings.js?v=4";
+import { isAdmin } from "./session.js?v=1";
+import * as users from "./pages/users.js?v=3";
+import { initSidebar, closeSidebar } from "./sidebar.js?v=1";
+import { api, copyText } from "./api.js?v=3";
 import { parseCsv, parseJson, refreshIcons, toast } from "./ui.js?v=12";
-import { refreshTheme } from "./charts.js?v=8";
-import { setChannelPresets, applyChannelDefaults, channelConnection } from "./channel-form.js";
+import { refreshTheme } from "./charts.js?v=10";
+import { setChannelPresets, applyChannelDefaults, channelConnection } from "./channel-form.js?v=2";
 
-import * as overview from "./pages/overview.js?v=5";
-import * as channels from "./pages/channels.js?v=3";
-import { editState as channelEditState } from "./pages/channels.js?v=3";
-import * as tokens from "./pages/tokens.js?v=9";
-import * as usage from "./pages/usage.js?v=13";
-import * as logs from "./pages/logs.js?v=4";
-import * as monitoring from "./pages/monitoring.js?v=6";
-import * as mindagent from "./pages/mindagent.js?v=15";
+import * as overview from "./pages/overview.js?v=8";
+import * as channels from "./pages/channels.js?v=10";
+import { editState as channelEditState } from "./pages/channels.js?v=10";
+import * as tokens from "./pages/tokens.js?v=10";
+import * as usage from "./pages/usage.js?v=16";
+import * as logs from "./pages/logs.js?v=8";
+import * as monitoring from "./pages/monitoring.js?v=7";
+import * as chat from "./pages/chat.js?v=7";
 
-const PAGES = { overview, channels, tokens, usage, logs, monitoring, mindagent };
+const PAGES = { overview, channels, tokens, usage, logs, monitoring, chat, users };
 const TITLES = {
   overview: () => t("overview"),
   channels: () => t("channels"),
@@ -24,10 +27,11 @@ const TITLES = {
   usage: () => t("usage"),
   logs: () => t("logs"),
   monitoring: () => t("monitoringTitle"),
-  mindagent: () => t("mindagentChat"),
+  chat: () => t("chatChat"),
+  users: () => t("usersTitle"),
 };
 
-let current = "overview";
+let current = isAdmin() ? "overview" : "chat";
 let initialized = false;
 let channelPresets = [];
 
@@ -38,7 +42,7 @@ async function loadChannelPresets() {
   if (!select) return;
   const selected = select.value;
   select.innerHTML = channelPresets.map((preset) =>
-    `<option value="${preset.id}">${preset.label}</option>`
+    `<option value="${preset.id}"${preset.id === "openai_codex" ? " hidden" : ""}>${preset.label}</option>`
   ).join("");
   select.value = channelPresets.some((preset) => preset.id === selected)
     ? selected
@@ -50,6 +54,7 @@ function applyChannelPreset(provider, reset = false) {
   const preset = channelPresets.find((item) => item.id === provider);
   const form = document.getElementById("channelForm");
   if (!preset || !form) return;
+  if (channels.usesOAuth(form)) return;
   applyChannelDefaults(form, { providerChanged: true, reset });
 }
 
@@ -62,11 +67,14 @@ export async function refreshActive() {
 }
 
 function switchTab(tab) {
+  if (!PAGES[tab] || (!isAdmin() && !["overview", "chat", "tokens", "usage", "logs"].includes(tab))) return;
   if (current === tab) return refreshActive();
   PAGES[current]?.unload?.();
   current = tab;
-  document.getElementById("content")?.classList.toggle("mindagent-content", tab === "mindagent");
-  document.querySelectorAll(".nav-item").forEach((el) => {
+  document.getElementById("content")?.classList.toggle("chat-content", tab === "chat");
+  document.querySelector(".main")?.classList.toggle("chat-main", tab === "chat");
+  document.querySelector(".app-shell")?.classList.toggle("chat-app", tab === "chat");
+  document.querySelectorAll(".nav-item[data-tab]").forEach((el) => {
     el.classList.toggle("active", el.dataset.tab === tab);
   });
   document.querySelectorAll(".panel").forEach((el) => {
@@ -75,44 +83,21 @@ function switchTab(tab) {
   const titleEl = document.getElementById("pageTitle");
   if (titleEl) titleEl.textContent = TITLES[tab]?.() || tab;
   document.title = `${TITLES[tab]?.()} · Rotor`;
+  closeSidebar();
   return refreshActive();
 }
 
 /* ---------- navigation ---------- */
-document.querySelectorAll(".nav-item").forEach((el) => {
+document.querySelectorAll(".nav-item[data-tab]").forEach((el) => {
   el.addEventListener("click", () => switchTab(el.dataset.tab));
 });
-document.addEventListener("mindagentconversationopen", () => switchTab("mindagent"));
-document.addEventListener("logsopen", async (event) => {
-  if (event.detail?.failedOnly) logs.showFailures?.();
-  await switchTab("logs");
+document.addEventListener("chatconversationopen", () => switchTab("chat"));
+document.addEventListener("overviewnavigate", (event) => {
+  if (["tokens", "usage"].includes(event.detail?.tab)) switchTab(event.detail.tab);
 });
 
-document.getElementById("themeToggle")?.addEventListener("click", () => {
-  toggleTheme();
-});
-document.getElementById("localeToggle")?.addEventListener("click", toggleLocale);
-document.getElementById("refreshBtn")?.addEventListener("click", () => refreshActive());
-
-/* ---------- mobile sidebar ---------- */
-const sidebar = document.getElementById("sidebar");
-const menuToggle = document.getElementById("menuToggle");
-let overlay = null;
-function openSidebar() {
-  sidebar?.classList.add("open");
-  overlay = document.createElement("div");
-  overlay.className = "sidebar-overlay";
-  overlay.addEventListener("click", closeSidebar);
-  document.body.appendChild(overlay);
-}
-function closeSidebar() {
-  sidebar?.classList.remove("open");
-  overlay?.remove();
-  overlay = null;
-}
-menuToggle?.addEventListener("click", () => {
-  sidebar?.classList.contains("open") ? closeSidebar() : openSidebar();
-});
+/* ---------- sidebar ---------- */
+initSidebar();
 
 /* ---------- global click delegation ---------- */
 document.addEventListener("click", async (event) => {
@@ -142,18 +127,33 @@ document.addEventListener("click", async (event) => {
   // modal close
   const modalClose = target.closest("[data-close-modal]");
   if (modalClose) {
+    if (modalClose.closest(".modal")?.id === "channelModal") {
+      channels.closeForm();
+      return;
+    }
     modalClose.closest(".modal")?.classList.add("hidden");
     return;
   }
 
   // page-specific handlers
   for (const page of Object.values(PAGES)) {
-    if (page.onClick && await page.onClick(target)) return;
+    try { if (page.onClick && await page.onClick(target)) return; } catch (error) { toast(error.message, "error"); return; }
   }
 });
 
 /* ---------- channel modal ---------- */
 const channelModal = document.getElementById("channelModal");
+document.getElementById("channelForm")?.elements.credential_type?.addEventListener("change", () => {
+  channels.changeCredentialType(document.getElementById("channelForm"));
+});
+document.getElementById("channelOAuthCheck")?.addEventListener("click", channels.checkEditedOAuth);
+document.getElementById("channelOAuthLogin")?.addEventListener("click", channels.startOAuthLogin);
+document.getElementById("channelOAuthCancel")?.addEventListener("click", () => channels.cancelOAuthLogin());
+document.getElementById("channelOAuthCallback")?.addEventListener("input", channels.changeOAuthCallback);
+document.getElementById("channelOAuthParse")?.addEventListener("click", channels.parseOAuthCallback);
+document.getElementById("channelOAuthComplete")?.addEventListener("click", channels.completeOAuthLogin);
+let channelModelsRevision = 0;
+document.getElementById("channelForm")?.elements.models.addEventListener("input", () => { channelModelsRevision += 1; });
 document.getElementById("channelForm")?.elements.type.addEventListener("change", (event) => {
   applyChannelPreset(event.target.value);
 });
@@ -164,115 +164,92 @@ document.getElementById("channelForm")?.elements.protocol.addEventListener("chan
   applyChannelDefaults(form);
 });
 document.getElementById("closeChannelModal")?.addEventListener("click", () => {
-  channelModal.classList.add("hidden");
+  channels.closeForm();
 });
 
 /* ---------- settings modal ---------- */
-const settingsModal = document.getElementById("settingsModal");
-const settingsForm = document.getElementById("settingsForm");
-let currentApplicationSettings = null;
-
-async function openSettings() {
-  settingsModal.classList.remove("hidden");
-  closeSidebar();
-  try {
-    const currentSettings = await api("/api/admin/settings");
-    currentApplicationSettings = currentSettings;
-    settingsForm.elements.strategy.value = currentSettings.routing.strategy;
-    settingsForm.elements.affinity_enabled.checked =
-      currentSettings.routing.affinity_enabled;
-    settingsForm.elements.session_lease_enabled.checked =
-      currentSettings.routing.session_lease_enabled;
-    settingsForm.elements.session_lease_idle_ttl_seconds.value =
-      currentSettings.routing.session_lease_idle_ttl_seconds;
-    settingsForm.elements.display_timezone.value =
-      currentSettings.display_timezone;
-    document.getElementById("settingsPath").textContent =
-      currentSettings.settings_path;
-  } catch (error) {
-    settingsModal.classList.add("hidden");
-    toast(error.message, "error");
-  }
-}
-
-document.getElementById("openSettings")?.addEventListener("click", openSettings);
-settingsForm?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const submitBtn = event.currentTarget.querySelector('button[type="submit"]');
-  if (submitBtn.disabled) return;
-  submitBtn.disabled = true;
-  try {
-    const savedSettings = await api("/api/admin/settings", {
-      method: "PUT",
-      body: JSON.stringify({
-        routing: {
-          ...(currentApplicationSettings?.routing || {}),
-          strategy: settingsForm.elements.strategy.value,
-          affinity_enabled: settingsForm.elements.affinity_enabled.checked,
-          session_lease_enabled:
-            settingsForm.elements.session_lease_enabled.checked,
-          session_lease_idle_ttl_seconds: Number(
-            settingsForm.elements.session_lease_idle_ttl_seconds.value,
-          ),
-        },
-        display_timezone: settingsForm.elements.display_timezone.value,
-      }),
-    });
+initSettings({
+  onSaved(savedSettings) {
     for (const page of Object.values(PAGES)) {
       page.setDisplayTimezone?.(savedSettings.display_timezone);
     }
-    currentApplicationSettings = savedSettings;
-    settingsModal.classList.add("hidden");
-    toast(t("settingsSaved"), "success");
     refreshActive();
-  } catch (error) {
-    toast(error.message, "error");
-  } finally {
-    submitBtn.disabled = false;
-  }
+  },
 });
 
 document.getElementById("probeModels")?.addEventListener("click", async (event) => {
   const form = document.getElementById("channelForm");
+  const oauth = channels.usesOAuth(form);
+  const oauthPath = oauth ? channels.oauthProbePath(form) : null;
+  const probeResult = document.getElementById("probeResult");
+  if (oauth && !oauthPath) {
+    channels.refreshAuthLabels();
+    probeResult.textContent = t("oauthLoginRequired");
+    probeResult.className = "inline-result error";
+    return;
+  }
   const keyInput = form?.elements.key?.value?.trim();
   const channelId = channelEditState.id;
   // Editing a saved channel with a blank key field → probe with the stored key.
   const useSaved = channelId && !keyInput;
   const button = event.currentTarget;
   if (button.disabled) return;
-  button.disabled = true;
+  const generation = channels.authGeneration();
+  const authRequest = oauth && oauthPath === `/api/admin/channels/${channelId}/probe-models`
+    ? channels.beginAuthStateRequest(channelId) : null;
+  const revision = channelModelsRevision;
+  const initialModels = form.elements.models.value;
+  channels.setModelsProbing(true);
   const original = button.innerHTML;
   button.innerHTML = `<i data-lucide="loader-2" class="spin"></i>${t("probing") || "..."}`;
   refreshIcons(button);
   try {
-    const draft = channelConnection(form, parseJson(form.elements.extra.value, {}));
     let result;
-    if (useSaved) {
-      result = await api(`/api/admin/channels/${channelId}/probe-models`, {
-        method: "POST",
-        body: JSON.stringify(draft),
-      });
+    if (oauth) {
+      result = await api(oauthPath, { method: "POST" });
     } else {
-      result = await api("/api/admin/channels/probe-models", {
-        method: "POST",
-        body: JSON.stringify({
-          ...draft,
-          key: keyInput,
-        }),
-      });
+      const draft = channelConnection(form, parseJson(form.elements.extra.value, {}));
+      if (useSaved) {
+        result = await api(`/api/admin/channels/${channelId}/probe-models`, {
+          method: "POST",
+          body: JSON.stringify(draft),
+        });
+      } else {
+        result = await api("/api/admin/channels/probe-models", {
+          method: "POST",
+          body: JSON.stringify({
+            ...draft,
+            key: keyInput,
+          }),
+        });
+      }
+    }
+    if (generation !== channels.authGeneration()) return;
+    if (oauth && channels.oauthProbePath(form) !== oauthPath) {
+      channels.refreshAuthLabels();
+      probeResult.textContent = t("oauthLoginRequired");
+      probeResult.className = "inline-result error";
+      return;
+    }
+    if (revision !== channelModelsRevision || initialModels !== form.elements.models.value) {
+      probeResult.textContent = t("probeModelsInputChanged");
+      probeResult.className = "inline-result warning";
+      return;
     }
     form.elements.models.value = result.models.join(", ");
-    const probeResult = document.getElementById("probeResult");
     probeResult.textContent = `${result.models.length} ${t("foundModels")} ${result.latency_ms} ms`;
     probeResult.className = "inline-result success";
   } catch (e) {
-    const probeResult = document.getElementById("probeResult");
-    probeResult.textContent = e.message;
+    if (generation !== channels.authGeneration()) return;
+    probeResult.textContent = oauth ? t("oauthProbeFailed") : e.message;
     probeResult.className = "inline-result error";
   } finally {
-    button.disabled = false;
-    button.innerHTML = original;
-    refreshIcons(button);
+    if (authRequest) await channels.finishAuthStateRequest(authRequest);
+    if (generation === channels.authGeneration()) {
+      channels.setModelsProbing(false);
+      button.innerHTML = original;
+      refreshIcons(button);
+    }
   }
 });
 
@@ -282,39 +259,54 @@ document.getElementById("channelForm")?.addEventListener("submit", async (event)
   const submitBtn = formElement.querySelector('button[type="submit"]');
   if (submitBtn.disabled) return;
   submitBtn.disabled = true;
+  const generation = channels.authGeneration();
+  let finishGeneration = generation;
   const original = submitBtn.innerHTML;
   submitBtn.innerHTML = `<i data-lucide="loader-2" class="spin"></i>${t("saving")}`;
   refreshIcons(submitBtn);
   try {
     const form = new FormData(formElement);
     const extra = parseJson(form.get("extra"), {});
+    const oauth = channels.usesOAuth(formElement);
+    if (!oauth && channelEditState.authType === "oauth" && !form.get("key")?.trim()) {
+      throw new Error(t("apiKeyRequired"));
+    }
     const payload = {
       ...channelConnection(formElement, extra),
+      ...channels.oauthSaveFields(formElement),
       name: form.get("name"),
-      key: form.get("key") || undefined,
+      key: oauth ? undefined : form.get("key") || undefined,
       models: parseCsv(form.get("models")),
       model_mapping: parseJson(form.get("model_mapping"), {}),
       priority: Number(form.get("priority") || 1),
       weight: Number(form.get("weight") || 1),
       enabled: Boolean(form.get("enabled")),
-      test_only: false,
     };
     const editingId = channelEditState.id;
     const method = editingId ? "PUT" : "POST";
     const url = editingId ? `/api/admin/channels/${editingId}` : "/api/admin/channels";
     await api(url, { method, body: JSON.stringify(payload) });
+    if (generation !== channels.authGeneration()) return;
+    channels.cancelOAuthLogin({ consumed: true });
     formElement.reset();
     applyChannelPreset(formElement.elements.type.value, true);
     channelModal.classList.add("hidden");
     toast(`${t("channels")} "${payload.name}" ${editingId ? t("updated") : t("created")}`, "success");
     channelEditState.id = null;
+    channelEditState.authType = "api_key";
+    channelEditState.authStatus = null;
+    channels.changeCredentialType(formElement);
+    finishGeneration = channels.authGeneration();
     if (current === "channels") await channels.load();
   } catch (e) {
+    if (generation !== channels.authGeneration()) return;
     toast(e.message, "error");
   } finally {
-    submitBtn.disabled = false;
-    submitBtn.innerHTML = original;
-    refreshIcons(submitBtn);
+    if (finishGeneration === channels.authGeneration()) {
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = original;
+      refreshIcons(submitBtn);
+    }
   }
 });
 
@@ -325,9 +317,10 @@ document.addEventListener("themechange", () => {
 document.addEventListener("localechange", () => {
   // refresh icons that may have been swapped
   refreshIcons(document);
+  channels.refreshAuthLabels();
   // re-render current page to apply new labels
   refreshActive();
-  mindagent.renderHistory();
+  chat.renderHistory();
   const titleEl = document.getElementById("pageTitle");
   if (titleEl) titleEl.textContent = TITLES[current]?.() || current;
 });
@@ -335,11 +328,24 @@ document.addEventListener("localechange", () => {
 /* ---------- keyboard ---------- */
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    if (!channelModal.classList.contains("hidden")) channelModal.classList.add("hidden");
-    if (!settingsModal.classList.contains("hidden")) settingsModal.classList.add("hidden");
-    document.getElementById("mindagentDeleteModal")?.classList.add("hidden");
+    if (!channelModal.classList.contains("hidden")) channels.closeForm();
+    document.getElementById("chatDeleteModal")?.classList.add("hidden");
     closeSidebar();
   }
+});
+
+document.querySelectorAll("[data-admin-only]").forEach((element) => { element.hidden = !isAdmin(); });
+document.querySelectorAll(".panel").forEach((element) => element.classList.toggle("active", element.id === current));
+document.querySelectorAll(".nav-item[data-tab]").forEach((element) => element.classList.toggle("active", element.dataset.tab === current));
+document.getElementById("content")?.classList.toggle("chat-content", current === "chat");
+document.querySelector(".main")?.classList.toggle("chat-main", current === "chat");
+document.querySelector(".app-shell")?.classList.toggle("chat-app", current === "chat");
+document.getElementById("pageTitle").textContent = TITLES[current]();
+document.addEventListener("sessionended", () => {
+  for (const page of Object.values(PAGES)) page.unload?.();
+  chat.resetSession();
+  document.querySelectorAll(".panel").forEach((element) => { element.innerHTML = ""; });
+  document.querySelectorAll("[data-admin-only]").forEach((element) => { element.hidden = true; });
 });
 
 /* ---------- bootstrap ---------- */
@@ -367,8 +373,8 @@ async function loadServerVersion() {
 
 initIcons();
 applyLocale();
-mindagent.renderHistory();
+chat.renderHistory();
 loadServerVersion();
-loadChannelPresets().catch((error) => toast(error.message, "error"));
+(isAdmin() ? loadChannelPresets() : Promise.resolve()).catch((error) => toast(error.message, "error"));
 refreshActive();
 initialized = true;

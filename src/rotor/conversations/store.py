@@ -213,6 +213,7 @@ class ConversationStore:
                         "conversation_id": conversation_id,
                         "request_id": request_id,
                         "user_id": token.user_id,
+                        "owner_id": getattr(token, "owner_id", None),
                         "token_id": token.id,
                         "model": request.model,
                         "protocol": protocol,

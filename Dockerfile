@@ -16,10 +16,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 ENV PYTHONPATH=/app/src \
     DATABASE_URL=sqlite+aiosqlite:////data/rotor.db \
     CONVERSATION_STORE_DIR=/data/conversations \
+    CHAT_STORE_DIR=/data/chats \
     ROTOR_LOG_DIR=/data/logs
 
-# Persist the SQLite database, logs, and conversation store through one mount.
-RUN mkdir -p /data/conversations /data/logs
+# Persist the database, gateway records, user chats, attachments, and logs through one mount.
+RUN mkdir -p /data/conversations /data/chats /data/logs
 VOLUME ["/data"]
 
 # Expose port

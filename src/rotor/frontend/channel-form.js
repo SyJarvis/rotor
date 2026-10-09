@@ -38,6 +38,7 @@ export function channelConnection(form, extra = {}) {
   const fields = form.elements;
   const defaults = channelDefaults(fields.type.value, fields.protocol.value);
   return {
+    auth_type: fields.credential_type?.value === "oauth" ? "oauth" : "api_key",
     base_url: fields.base_url.value.trim(),
     type: fields.type.value,
     protocol: fields.protocol.value,

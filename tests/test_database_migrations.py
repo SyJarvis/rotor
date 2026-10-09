@@ -17,7 +17,7 @@ import rotor.main  # noqa: F401  # Register every model in Base.metadata.
 
 ROOT = Path(__file__).resolve().parents[1]
 PREVIOUS_REVISION = "b8c9d0e1f2a3"
-HEAD_REVISION = "c9d0e1f2a3b4"
+HEAD_REVISION = "f2a3b4c5d6e7"
 ADMIN_TABLES = {
     "admin_auth_events",
     "admin_login_throttles",
@@ -99,6 +99,43 @@ def test_alembic_head_matches_model_metadata(tmp_path: Path) -> None:
     database_path = tmp_path / "fresh.db"
 
     _run_alembic(database_path, "upgrade", "head")
+    _run_alembic(database_path, "check")
+
+
+def test_startup_adopts_migrated_retry_delays_without_changing_values(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "retry-delays.db"
+    _run_alembic(database_path, "upgrade", "head")
+    engine = create_engine(f"sqlite:///{database_path}")
+    with engine.begin() as connection:
+        for attempt_index, delay in enumerate((None, 0.0, 0.125, 1.5)):
+            connection.execute(
+                Base.metadata.tables["request_attempts"].insert().values(
+                    request_id="retry-delay-request",
+                    attempt_index=attempt_index,
+                    channel_id=1,
+                    requested_model="retry-model",
+                    request_protocol="openai_chat",
+                    outcome="failed",
+                    retry_after_seconds=delay,
+                )
+            )
+        connection.execute(text("DROP TABLE alembic_version"))
+    engine.dispose()
+
+    backup_path = run_startup_migrations(_database_url(database_path))
+
+    assert backup_path is not None and backup_path.exists()
+    for path in (database_path, backup_path):
+        engine = create_engine(f"sqlite:///{path}")
+        with engine.connect() as connection:
+            delays = connection.execute(text(
+                "SELECT retry_after_seconds FROM request_attempts "
+                "WHERE request_id = 'retry-delay-request' ORDER BY attempt_index"
+            )).scalars().all()
+        engine.dispose()
+        assert delays == [None, 0.0, 0.125, 1.5]
     _run_alembic(database_path, "check")
 
 
@@ -279,15 +316,16 @@ def test_startup_migrations_adopt_pre_admin_legacy_database(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "legacy-current.db"
-    legacy_metadata = MetaData()
-    for table in Base.metadata.sorted_tables:
-        if table.name not in ADMIN_TABLES:
-            table.to_metadata(legacy_metadata)
+    # Build the real pre-account schema, then remove the four administrator
+    # tables as in the historical unversioned deployment. Cloning today's
+    # metadata would include account ownership foreign keys that did not exist.
+    _run_alembic(database_path, "upgrade", "e1f2a3b4c5d6")
     engine = create_engine(f"sqlite:///{database_path}")
-    legacy_metadata.create_all(engine)
     with engine.begin() as connection:
+        for table_name in ("admin_auth_events", "admin_sessions", "admin_login_throttles", "admin_users", "alembic_version"):
+            connection.execute(text(f'DROP TABLE "{table_name}"'))
         connection.execute(
-            legacy_metadata.tables["usage_ledger"].insert().values(
+            Base.metadata.tables["usage_ledger"].insert().values(
                 request_id="preserved-request",
                 model="legacy-model",
                 request_protocol="openai_chat",

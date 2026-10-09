@@ -9,6 +9,7 @@ from rotor.adapters.providers.moonshot import MoonshotAdapter
 from rotor.adapters.providers.minimax import MiniMaxAdapter
 from rotor.adapters.providers.zhipu import ZhipuAdapter
 from rotor.adapters.providers.kimi import KimiAdapter
+from rotor.adapters.providers.openai_codex import OpenAICodexAdapter
 from rotor.models.channel import Channel
 
 
@@ -18,6 +19,7 @@ class AdapterFactory:
     # Registry of adapter classes
     _adapters: dict[str, Type[BaseAdapter]] = {
         "openai": OpenAIAdapter,
+        "openai_codex": OpenAICodexAdapter,
         "deepseek": OpenAIAdapter,
         "azure": AzureOpenAIAdapter,
         "anthropic": AnthropicAdapter,
@@ -58,6 +60,9 @@ class AdapterFactory:
             ValueError: If the provider type is not supported
         """
         provider_type = channel.type.lower()
+
+        if provider_type == "openai_codex":
+            return OpenAICodexAdapter(channel, http_client)
 
         provider_protocol = str(getattr(channel, "protocol", "") or "").lower()
         if provider_protocol in {"responses", "openai_responses"}:

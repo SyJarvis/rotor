@@ -19,20 +19,28 @@ async function mount({
   language, routingResponses, routingError = null, timers = [],
   failReset = null, confirmResult = true,
 }) {
-  const container = { innerHTML: '' };
+  let html = '';
+  let renders = 0;
+  const container = {
+    get innerHTML() { return html; },
+    set innerHTML(value) { html = value; renders += 1; },
+  };
   const window = {};
   vm.runInNewContext(translations, { window });
   const pending = [...routingResponses];
+  const listeners = {};
+  const document = {
+    hidden: false,
+    getElementById: (id) => (id === 'channels' ? container : null),
+    querySelectorAll: () => [],
+    addEventListener(name, fn) { listeners[name] = fn; },
+  };
   const context = vm.createContext({
-    document: {
-      getElementById: (id) => (id === 'channels' ? container : null),
-      querySelectorAll: () => [],
-      addEventListener() {},
-    },
+    document,
     window: {},
     Element: class {},
     setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
-    clearTimeout: () => {},
+    clearTimeout: (id) => { if (timers[id - 1]) timers[id - 1].cancelled = true; },
     confirm: () => confirmResult,
     setImmediate,
   });
@@ -43,7 +51,9 @@ async function mount({
       requests.push(url);
       if (url.endsWith('/routing-state')) {
         if (routingError) throw new Error(routingError);
-        return pending.length > 1 ? pending.shift() : pending[0] ?? { cooldowns: [] };
+        const response = pending.length > 1 ? pending.shift() : pending[0] ?? { cooldowns: [] };
+        if (response instanceof Error) throw response;
+        return typeof response === 'function' ? response() : response;
       }
       if (url.endsWith('/cooldown/reset')) {
         if (failReset) throw new Error(failReset);
@@ -71,7 +81,11 @@ async function mount({
     }, { context });
   });
   await module.evaluate();
-  return { namespace: module.namespace, container, requests, timers, toasts };
+  return {
+    namespace: module.namespace, container, requests, timers, toasts,
+    get renders() { return renders; },
+    setHidden(value) { document.hidden = value; return listeners.visibilitychange?.(); },
+  };
 }
 
 async function render(language, cooldowns, options = {}) {
@@ -215,7 +229,7 @@ test('cooldown entries for deleted channels are surfaced separately', async () =
   assert.doesNotMatch(html, /channel-card [^"]*cooling/);
 });
 
-test('active cooldowns are polled until they clear', async () => {
+test('active cooldowns switch to slower polling once they clear', async () => {
   const timers = [];
   const page = await mount({
     language: 'en',
@@ -230,7 +244,8 @@ test('active cooldowns are polled until they clear', async () => {
   // The poll replaces stale badges once the backend reports the channel healthy.
   await timers[0].fn();
   assert.doesNotMatch(page.container.innerHTML, /cooldown-badge/);
-  assert.equal(timers.length, 1, 'polling stops once nothing is cooling');
+  assert.equal(timers.length, 2);
+  assert.equal(timers[1].ms, 15000, 'healthy channels continue polling at a slower rate');
   page.namespace.unload();
 });
 
@@ -263,11 +278,89 @@ test('cooldowns are keyed by model and channel, not by channel alone', async () 
   page.namespace.unload();
 });
 
-test('a routing-state failure does not schedule polling', async () => {
+test('a routing-state failure schedules another read and recovers', async () => {
   const timers = [];
-  const page = await mount({ language: 'en', routingResponses: [], routingError: 'down', timers });
+  const page = await mount({
+    language: 'en', routingResponses: [new Error('down'), { cooldowns: [cooldown()] }], timers,
+  });
   await page.namespace.load();
-  assert.equal(timers.length, 0);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 15000);
   assert.match(page.container.innerHTML, /Could not read runtime cooldown state/);
+  await timers[0].fn();
+  assert.doesNotMatch(page.container.innerHTML, /Could not read runtime cooldown state/);
+  assert.match(page.container.innerHTML, /cooldown-badge/);
+  assert.equal(timers[1].ms, 5000);
   page.namespace.unload();
+});
+
+test('an initially healthy page discovers a later cooldown', async () => {
+  const page = await mount({
+    language: 'en', routingResponses: [{ cooldowns: [] }, { cooldowns: [cooldown()] }],
+  });
+  await page.namespace.load();
+  assert.doesNotMatch(page.container.innerHTML, /cooldown-badge/);
+  assert.equal(page.timers[0]?.ms, 15000);
+  await page.timers[0].fn();
+  assert.match(page.container.innerHTML, /cooldown-badge/);
+  assert.equal(page.timers[1].ms, 5000);
+  page.namespace.unload();
+});
+
+test('unchanged routing snapshots keep the existing toolbar in place', async () => {
+  const page = await mount({ language: 'en', routingResponses: [{ cooldowns: [cooldown()] }] });
+  await page.namespace.load();
+  const before = page.renders;
+  await page.timers[0].fn();
+  assert.equal(page.renders, before, 'unchanged polling must not replace the search input');
+  page.namespace.unload();
+});
+
+test('a polling response received after unload does not render or restart polling', async () => {
+  let resolve;
+  const response = new Promise((done) => { resolve = done; });
+  const page = await mount({
+    language: 'en', routingResponses: [{ cooldowns: [cooldown()] }, () => response],
+  });
+  await page.namespace.load();
+  const request = page.timers[0].fn();
+  page.namespace.unload();
+  const before = page.renders;
+  resolve({ cooldowns: [] });
+  await request;
+  assert.equal(page.renders, before);
+  assert.equal(page.timers.length, 1);
+  assert.match(page.container.innerHTML, /cooldown-badge/);
+});
+
+test('an initial routing response received after unload does not render or schedule polling', async () => {
+  let resolve;
+  const response = new Promise((done) => { resolve = done; });
+  const page = await mount({ language: 'en', routingResponses: [() => response] });
+  const loading = page.namespace.load();
+  page.namespace.unload();
+  const before = page.renders;
+  resolve({ cooldowns: [cooldown()] });
+  await loading;
+  assert.equal(page.renders, before);
+  assert.equal(page.timers.length, 0);
+});
+
+test('hidden pages pause polling and refresh when visible again', async () => {
+  const page = await mount({
+    language: 'en', routingResponses: [{ cooldowns: [cooldown()] }, { cooldowns: [] }],
+  });
+  await page.namespace.load();
+  await page.setHidden(true);
+  assert.equal(page.timers[0].cancelled, true);
+  const before = page.requests.length;
+  await page.timers[0].fn();
+  assert.equal(page.requests.length, before);
+  await page.setHidden(false);
+  assert.doesNotMatch(page.container.innerHTML, /cooldown-badge/);
+  assert.equal(page.timers[1].ms, 15000);
+  page.namespace.unload();
+  await page.setHidden(true);
+  await page.setHidden(false);
+  assert.equal(page.requests.length, before + 1, 'visibility events do not restart an unloaded page');
 });

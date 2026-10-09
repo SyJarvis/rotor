@@ -27,6 +27,7 @@ from rotor.adapters.protocol.responses import (
     validate_responses_response,
 )
 from rotor.core.deps import get_available_channels, get_current_token
+from rotor.core.user_access import effective_permissions
 from rotor.core.client_session import resolve_client_session
 from rotor.core.header_forwarding import snapshot_inbound_headers
 from rotor.application_settings import application_settings
@@ -409,16 +410,20 @@ async def create_response(
         if previous_route is None:
             raise HTTPException(status_code=404, detail="Response not found")
         previous_channel = await db.get(Channel, previous_route.channel_id)
+        channel_ids, model_ids = await effective_permissions(token, db)
         if (
             previous_channel is None
+            or (model_ids is not None and request.model not in model_ids)
             or str(previous_channel.protocol or "").lower()
             not in {"responses", "openai_responses"}
             or (
-                token.allowed_channels
-                and previous_channel.id not in token.allowed_channels
+                channel_ids is not None
+                and previous_channel.id not in channel_ids
             )
         ):
             raise HTTPException(status_code=404, detail="Response not found")
+        if str(previous_channel.type or "").lower() == "openai_codex":
+            raise HTTPException(status_code=400, detail="ChatGPT OAuth does not support stored response continuation")
         channels = [previous_channel]
     else:
         channels = await get_available_channels(chat_request.model, token, db)
@@ -513,6 +518,10 @@ async def create_response(
         if routing_decision is not None and routing_decision.temporarily_unavailable:
             raise ChannelsTemporarilyUnavailable(chat_request.model, routing_decision.retry_after_seconds)
         required_capabilities = responses_required_capabilities(request)
+        if "responses_persistence" in required_capabilities and any(
+            str(channel.type or "").lower() == "openai_codex" for channel in channels
+        ):
+            raise HTTPException(status_code=400, detail="ChatGPT OAuth does not support stored or background responses")
         required = sorted(required_capabilities)
         channel_summary = routing_engine.diagnose(
             channels,
@@ -821,11 +830,14 @@ async def _resolve_response_channel(
     if route is None:
         raise HTTPException(status_code=404, detail="Response not found")
     channel = await db.get(Channel, route.channel_id)
+    channel_ids, model_ids = await effective_permissions(token, db)
     if (
         channel is None
         or str(channel.protocol or "").lower()
         not in {"responses", "openai_responses"}
-        or (token.allowed_channels and channel.id not in token.allowed_channels)
+        or str(channel.type or "").lower() == "openai_codex"
+        or (channel_ids is not None and channel.id not in channel_ids)
+        or (model_ids is not None and route.model not in model_ids)
     ):
         # Do not disclose whether another token owns a response or whether its
         # original channel has since been removed from this token's access.
@@ -938,12 +950,14 @@ async def _native_collection_request(
         model=model,
         token=token,
         request_protocol="openai_responses",
-        required_capabilities={"responses_native"},
+        required_capabilities={"responses_resources"},
     )
     candidates = decision.candidates
     if not candidates:
         if decision.temporarily_unavailable:
             raise ChannelsTemporarilyUnavailable(model, decision.retry_after_seconds)
+        if any(str(channel.type or "").lower() == "openai_codex" for channel in channels):
+            raise HTTPException(status_code=400, detail="ChatGPT OAuth does not support Responses resources")
         raise ChannelException(
             f"No native Responses channel available for model '{model}'",
             status_code=503,

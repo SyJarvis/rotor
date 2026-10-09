@@ -9,6 +9,7 @@ from rotor.core.resource_scopes import ResourceScopes, resolve_resource_scopes
 from rotor.models.channel import Channel
 from rotor.models.log import RequestLog
 from rotor.models.token import Token
+from rotor.models.admin_auth import AdminUser
 from rotor.models.usage import UsageLedger
 from rotor.models.routing_decision import RoutingDecisionRecord
 from rotor.gateway.pricing import UsageCost, calculate_usage_cost
@@ -169,6 +170,7 @@ class AccountingService:
         self._add_request_log(
             db,
             token_id=token.id,
+            owner_id=getattr(token, "owner_id", None),
             channel_id=channel.id,
             model=model,
             usage=usage,
@@ -184,6 +186,7 @@ class AccountingService:
                 request_id=request_id,
                 conversation_id=conversation_id,
                 user_id=token.user_id,
+                owner_id=getattr(token, "owner_id", None),
                 token_id=token.id,
                 channel_id=channel.id,
                 provider=channel.type,
@@ -309,6 +312,7 @@ class AccountingService:
         self._add_request_log(
             db,
             token_id=token.id if token else None,
+            owner_id=getattr(token, "owner_id", None),
             channel_id=channel.id if channel else None,
             model=model,
             usage=usage,
@@ -327,6 +331,7 @@ class AccountingService:
                 request_id=request_id,
                 conversation_id=conversation_id,
                 user_id=token.user_id if token else None,
+                owner_id=getattr(token, "owner_id", None),
                 token_id=token.id if token else None,
                 channel_id=channel.id if channel else None,
                 provider=channel.type if channel else None,
@@ -536,6 +541,10 @@ class AccountingService:
         # Requests can hold stale Token objects while waiting for upstream.
         # Increment the current database values in the accounting transaction.
         now = datetime.now(timezone.utc)
+        if getattr(token, "owner_id", None) is not None:
+            await db.execute(update(AdminUser).where(AdminUser.id == token.owner_id).values(
+                used_quota=AdminUser.used_quota + usage.total_tokens
+            ).execution_options(synchronize_session=False))
         await db.execute(
             update(Token)
             .where(Token.id == token.id)
@@ -570,6 +579,7 @@ class AccountingService:
         db: AsyncSession,
         *,
         token_id: Optional[int],
+        owner_id: Optional[int] = None,
         channel_id: Optional[int],
         model: str,
         usage: UsageData,
@@ -586,6 +596,7 @@ class AccountingService:
         db.add(
             RequestLog(
                 token_id=token_id,
+                owner_id=owner_id,
                 channel_id=channel_id,
                 model=model,
                 request_model=model,

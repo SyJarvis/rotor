@@ -4,6 +4,7 @@ from typing import Any, Optional
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     Integer,
     JSON,
     String,
@@ -75,7 +76,7 @@ class RequestAttempt(Base):
         Boolean, nullable=True
     )
     retry_after_seconds: Mapped[Optional[float]] = mapped_column(
-        nullable=True
+        Float, nullable=True
     )
     sanitized_error: Mapped[Optional[dict[str, Any]]] = mapped_column(
         JSON, nullable=True

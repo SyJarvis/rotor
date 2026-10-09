@@ -1,13 +1,35 @@
-from pydantic import BaseModel, Field, ConfigDict, field_validator
-from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
+from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime
 
 from rotor.core.resource_scopes import normalize_scope_config
 
 
+class ProbeModelsResponse(BaseModel):
+    models: List[str]
+    latency_ms: int
+    raw_count: int = 0
+
+
 def _normalize_extra(value: Dict[str, Any]) -> Dict[str, Any]:
     """Validate channel-level provider overrides while preserving extensions."""
+    forbidden = {"oauth", "oauth_credentials", "access_token", "refresh_token", "oauth_access_token", "oauth_refresh_token"}
+    def contains_credentials(item):
+        if isinstance(item, dict):
+            return bool(forbidden & item.keys()) or any(contains_credentials(child) for child in item.values())
+        if isinstance(item, list):
+            return any(contains_credentials(child) for child in item)
+        return False
+
+    if contains_credentials(value):
+        raise ValueError("OAuth credentials cannot be stored in extra")
     normalized = normalize_scope_config(value)
+    capabilities = normalized.get("capabilities")
+    if capabilities is not None and (
+        not isinstance(capabilities, list)
+        or any(not isinstance(capability, str) for capability in capabilities)
+    ):
+        raise ValueError("extra.capabilities must be a list of strings")
     headers = normalized.get("headers")
     if headers is None:
         return normalized
@@ -31,6 +53,7 @@ class ChannelBase(BaseModel):
     """Base channel schema."""
     name: str = Field(..., min_length=1, max_length=100, description="Channel name")
     type: str = Field(..., min_length=1, max_length=50, description="Provider type")
+    auth_type: Literal["api_key", "oauth"] = "api_key"
     base_url: str = Field(..., min_length=1, max_length=500, description="Base URL")
     models: List[str] = Field(default_factory=list, description="Available models")
     model_mapping: Dict[str, str] = Field(default_factory=dict, description="Model name mapping")
@@ -46,7 +69,14 @@ class ChannelBase(BaseModel):
 
 class ChannelCreate(ChannelBase):
     """Schema for creating a channel."""
-    key: str = Field(..., min_length=1, max_length=500, description="API Key")
+    key: Optional[str] = Field(None, min_length=1, max_length=500, description="API Key")
+    oauth_session_id: Optional[str] = Field(None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def require_api_key(self):
+        if self.auth_type == "api_key" and not self.key:
+            raise ValueError("An API key is required")
+        return self
 
     @field_validator("extra")
     @classmethod
@@ -58,6 +88,8 @@ class ChannelUpdate(BaseModel):
     """Schema for updating a channel."""
     name: Optional[str] = Field(None, min_length=1, max_length=100)
     type: Optional[str] = Field(None, min_length=1, max_length=50)
+    auth_type: Optional[Literal["api_key", "oauth"]] = None
+    oauth_session_id: Optional[str] = Field(None, min_length=1, max_length=64)
     key: Optional[str] = Field(None, min_length=1, max_length=500)
     base_url: Optional[str] = Field(None, min_length=1, max_length=500)
     models: Optional[List[str]] = None
@@ -70,6 +102,13 @@ class ChannelUpdate(BaseModel):
     rpm_limit: Optional[int] = None
     tpm_limit: Optional[int] = None
     extra: Optional[Dict[str, Any]] = None
+
+    @field_validator("auth_type", "key")
+    @classmethod
+    def reject_null_authentication(cls, value):
+        if value is None:
+            raise ValueError("Authentication fields cannot be null")
+        return value
 
     @field_validator("extra")
     @classmethod
@@ -85,6 +124,9 @@ class ChannelResponse(ChannelBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    auth_status: str = "api_key"
+    auth_expires_at: Optional[float] = None
+    auth_error: Optional[str] = None
     total_requests: int
     success_requests: int
     failed_requests: int
@@ -99,6 +141,10 @@ class ChannelListItem(BaseModel):
     id: int
     name: str
     type: str
+    auth_type: Literal["api_key", "oauth"] = "api_key"
+    auth_status: str = "api_key"
+    auth_expires_at: Optional[float] = None
+    auth_error: Optional[str] = None
     base_url: str
     enabled: bool
     priority: int

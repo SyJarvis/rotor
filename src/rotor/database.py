@@ -91,7 +91,7 @@ def create_database_engine(database_url: str, *, echo: bool = False):
     else:
         default_pool = url.get_dialect(_is_async=True).get_pool_class(url)
         pool_options = {"poolclass": _MeasuredQueuePool} if issubclass(default_pool, AsyncAdaptedQueuePool) else {}
-    db_engine = create_async_engine(database_url, echo=echo, future=True, **pool_options)
+    db_engine = create_async_engine(database_url, echo=echo, hide_parameters=True, future=True, **pool_options)
     # WAL allows reads alongside writes; busy_timeout lets writers queue.
     if database_url.startswith("sqlite"):
         @event.listens_for(db_engine.sync_engine, "connect")
@@ -180,6 +180,12 @@ async def init_db():
 
     async with async_session_maker() as session:
         admin = await ensure_default_admin(session)
+        from rotor.core.user_access import ensure_base_token
+        from rotor.models.admin_auth import AdminUser
+        from sqlalchemy import select
+        for account in (await session.scalars(select(AdminUser).where(AdminUser.default_token_id.is_(None)))).all():
+            await ensure_base_token(session, account)
+        await session.commit()
         if admin.must_change_password:
             logger.warning(
                 "Default administrator password must be changed before "

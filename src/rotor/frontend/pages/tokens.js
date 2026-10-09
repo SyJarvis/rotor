@@ -1,7 +1,12 @@
 // Tokens page — compact API key list with create/view/delete modals.
 
-import { api, copyText } from "../api.js?v=2";
+import { api, copyText } from "../api.js?v=3";
 import { t } from "../i18n.js";
+import { isAdmin, actor, setActor } from "../session.js?v=1";
+let scope = "mine", epoch = 0;
+const allKeys = () => isAdmin() && scope === "all";
+const endpoint = () => allKeys() ? "/api/admin/tokens" : "/api/me/tokens";
+const isDefault = (token) => !allKeys() && token.id === actor()?.default_token_id;
 import {
   escapeHtml, formatTime, skeletonRows, refreshIcons, toast,
 } from "../ui.js";
@@ -21,10 +26,11 @@ export async function load() {
   const container = document.getElementById("tokens");
   skeletonRows(container, 3, 4);
   try {
-    [state.tokens, state.controlKeys] = await Promise.all([
-      api("/api/admin/tokens"),
-      api("/api/admin/mcp-control-keys"),
-    ]);
+    const current = ++epoch;
+    const [tokens, controls, profile] = await Promise.all([api(endpoint()), allKeys() ? api("/api/admin/mcp-control-keys") : Promise.resolve([]), !allKeys() ? api("/api/me") : Promise.resolve(null)]);
+    if (current !== epoch) return;
+    state.tokens = tokens; state.controlKeys = controls;
+    if (profile) setActor({ ...actor(), default_token_id: profile.default_token_id });
     render();
   } catch (e) {
     container.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><h3>${escapeHtml(e.message)}</h3></div>`;
@@ -42,6 +48,7 @@ export function render() {
         <h2>${t("apiKeys")}</h2>
         <p>${t("keyDescription")}</p>
       </div>
+      ${isAdmin() ? `<select class="select" id="tokenScope" aria-label="${t("dataScope")}"><option value="mine" ${!allKeys() ? "selected" : ""}>${t("myKeys")}</option><option value="all" ${allKeys() ? "selected" : ""}>${t("allKeys")}</option></select>` : ""}
       <button class="btn-primary" data-token-create-open>
         <i data-lucide="key-round"></i>${t("createKey")}
       </button>
@@ -61,7 +68,7 @@ export function render() {
           </tbody>
         </table></div></div>`}
 
-    <section class="mcp-control-key-section">
+    ${allKeys() ? `<section class="mcp-control-key-section">
       <div class="section-head">
         <div>
           <h2>${t("mcpControlKeys")}</h2>
@@ -84,7 +91,7 @@ export function render() {
               ${state.controlKeys.map(renderControlKeyRow).join("")}
             </tbody>
           </table></div></div>`}
-    </section>
+    </section>` : ""}
 
     ${state.createOpen ? renderCreateModal() : ""}
     ${state.viewing ? renderViewModal(state.viewing) : ""}
@@ -94,6 +101,7 @@ export function render() {
     ${state.controlDeleting ? renderControlKeyDeleteModal(state.controlDeleting) : ""}
   `;
 
+  document.getElementById("tokenScope")?.addEventListener("change", (event) => { scope = event.target.value; state.viewing = state.deleting = null; load(); });
   document.getElementById("tokenCreateForm")?.addEventListener("submit", onCreate);
   document.getElementById("tokenDeleteForm")?.addEventListener("submit", onDelete);
   document.getElementById("controlKeyCreateForm")?.addEventListener("submit", onControlKeyCreate);
@@ -123,7 +131,7 @@ function renderControlKeyRow(key) {
 function renderRow(token) {
   return `
     <tr>
-      <td><strong>${escapeHtml(token.name)}</strong></td>
+      <td><strong>${escapeHtml(token.name)}</strong> ${isDefault(token) ? `<span class="badge">${t("defaultKey")}</span>` : ""}${!token.enabled ? `<small>${t("disable")}</small>` : ""}</td>
       <td><code class="key-cell">${escapeHtml(maskKey(token.key))}</code></td>
       <td class="text-sm">${escapeHtml(formatTime(token.created_at))}</td>
       <td>
@@ -131,7 +139,8 @@ function renderRow(token) {
           <button class="btn-secondary btn-sm" data-token-view="${token.id}" title="${t("view")}">
             <i data-lucide="eye"></i><span>${t("view")}</span>
           </button>
-          <button class="btn-danger btn-sm" data-token-delete="${token.id}" title="${t("delete")}">
+          ${!allKeys() ? `<button class="btn-secondary btn-sm" data-token-rename="${token.id}">${t("renameKey")}</button><button class="btn-secondary btn-sm" data-token-rotate="${token.id}">${t("rotateKey")}</button><button class="btn-secondary btn-sm" data-token-toggle="${token.id}">${t(token.enabled ? "disable" : "enable")}</button>${!isDefault(token) ? `<button class="btn-secondary btn-sm" data-token-default="${token.id}">${t("setDefaultKey")}</button>` : ""}` : ""}
+          <button class="btn-danger btn-sm" data-token-delete="${token.id}" ${isDefault(token) ? "disabled" : ""} title="${t("delete")}">
             <i data-lucide="trash-2"></i><span>${t("delete")}</span>
           </button>
         </div>
@@ -384,7 +393,7 @@ async function onCreate(event) {
     const formData = new FormData(form);
     const params = new URLSearchParams();
     params.set("name", formData.get("name"));
-    const token = await api(`/api/admin/tokens/generate?${params}`, { method: "POST" });
+    const token = await api(allKeys() ? `/api/admin/tokens/generate?${params}` : endpoint(), { method: "POST", ...(!allKeys() ? { body: JSON.stringify({ name: formData.get("name") }) } : {}) });
     await copyText(token.key);
     state.createOpen = false;
     state.viewing = token;
@@ -407,7 +416,8 @@ async function onDelete(event) {
   submitBtn.disabled = true;
 
   try {
-    await api(`/api/admin/tokens/${token.id}`, { method: "DELETE" });
+    if (isDefault(token)) throw new Error(t("defaultKeyDeleteHint"));
+    await api(`${endpoint()}/${token.id}`, { method: "DELETE" });
     state.deleting = null;
     state.viewing = null;
     await refreshTokens();
@@ -464,14 +474,33 @@ async function onControlKeyDelete(event) {
 }
 
 async function refreshTokens() {
-  [state.tokens, state.controlKeys] = await Promise.all([
-    api("/api/admin/tokens"),
-    api("/api/admin/mcp-control-keys"),
-  ]);
+  const current = ++epoch;
+  const [tokens, controls, profile] = await Promise.all([api(endpoint()), allKeys() ? api("/api/admin/mcp-control-keys") : Promise.resolve([]), !allKeys() ? api("/api/me") : Promise.resolve(null)]);
+  if (current !== epoch) return;
+  state.tokens = tokens; state.controlKeys = controls;
+  if (profile) setActor({ ...actor(), default_token_id: profile.default_token_id });
   render();
 }
 
 export async function onClick(target) {
+  for (const action of ["rename", "rotate", "toggle", "default"]) {
+    const button = target.closest(`[data-token-${action}]`); if (!button || allKeys()) continue;
+    const token = state.tokens.find((item) => item.id === Number(button.dataset[`token${action[0].toUpperCase()}${action.slice(1)}`]));
+    if (!token || button.disabled) return true;
+    let body;
+    if (action === "rename") { const name = window.prompt(t("keyName"), token.name); if (name === null || !name.trim()) return true; body = { name: name.trim() }; }
+    if (action === "rotate" && !window.confirm(t("rotateKeyConfirm"))) return true;
+    button.disabled = true;
+    try {
+      const result = await api(`${endpoint()}/${token.id}${action === "rotate" || action === "default" ? `/${action}` : ""}`, { method: action === "rotate" || action === "default" ? "POST" : "PATCH", ...(action === "rename" || action === "toggle" ? { body: JSON.stringify(body || { enabled: !token.enabled }) } : {}) });
+      if (action === "rotate") state.viewing = result;
+      await refreshTokens(); toast(t("updated"), "success");
+    } catch (error) { toast(error.message, "error"); }
+    finally { button.disabled = false; }
+    return true;
+  }
+  if (!allKeys() && target.closest("[data-control-key-create-open], [data-control-key-delete], [data-control-key-toggle], [data-control-key-close]")) return false;
+
   if (target.closest("[data-token-create-open]")) {
     state.createOpen = true;
     state.viewing = null;
@@ -530,7 +559,7 @@ export async function onClick(target) {
   if (deleteFromView) {
     const tokenId = Number(deleteFromView.dataset.tokenDelete);
     const token = state.tokens.find((tk) => tk.id === tokenId) || state.viewing;
-    if (token) {
+    if (token && !isDefault(token)) {
       state.deleting = token;
       state.viewing = null;
       state.createOpen = false;
@@ -559,3 +588,6 @@ export async function onClick(target) {
 
   return false;
 }
+
+export function unload() { ++epoch; state.viewing = state.deleting = state.controlViewing = state.controlDeleting = null; state.createOpen = state.controlCreateOpen = false; }
+document.addEventListener("sessionended", () => { unload(); state.tokens = []; state.controlKeys = []; scope = "mine"; });

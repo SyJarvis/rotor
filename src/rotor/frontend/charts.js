@@ -28,22 +28,33 @@ const registry = new Map();
 export function destroyChart(key) {
   const c = registry.get(key);
   if (c) { c.destroy(); registry.delete(key); }
+  snapshotStore.delete(key);
 }
 
 export function destroyAll() {
   for (const c of registry.values()) c.destroy();
   registry.clear();
+  snapshotStore.clear();
 }
 
 // Rebuild all charts on theme change (colors must follow CSS vars).
 export function refreshTheme() {
-  destroyAll();
-  for (const factory of snapshotStore.values()) factory();
+  for (const [key, { canvas, factory }] of [...snapshotStore]) {
+    const old = registry.get(key);
+    old?.destroy();
+    registry.delete(key);
+    if (!canvas.isConnected || canvas.closest(".panel")?.classList.contains("active") === false) {
+      snapshotStore.delete(key);
+      continue;
+    }
+    const chart = factory();
+    if (chart) registry.set(key, chart);
+  }
 }
 
 const snapshotStore = new Map();
-function register(key, factory) {
-  snapshotStore.set(key, factory);
+function register(key, canvas, factory) {
+  snapshotStore.set(key, { canvas, factory });
   const c = factory();
   if (c) registry.set(key, c);
 }
@@ -106,7 +117,7 @@ export function renderTimeline(key, canvas, data, opts = {}) {
     });
   };
   destroyChart(key);
-  register(key, factory);
+  register(key, canvas, factory);
 }
 
 /* ---------- grouped bar histogram (per-model token consumption) ---------- */
@@ -184,11 +195,39 @@ export function renderStackedBar(key, canvas, labels, datasets, opts = {}) {
     });
   };
   destroyChart(key);
-  register(key, factory);
+  register(key, canvas, factory);
 }
 
-/* ---------- stacked line (per-model token consumption) ---------- */
-export function renderStackedLine(key, canvas, labels, datasets, opts = {}) {
+/* ---------- usage line (total or per-model) ---------- */
+function nowMarkerPlugin(marker, colors) {
+  return {
+    id: "usageNowMarker",
+    afterDatasetsDraw(chart) {
+      const { ctx, chartArea, scales } = chart;
+      if (!chartArea || !Number.isFinite(marker.value)) return;
+      const x = scales.x.getPixelForValue(marker.value);
+      if (!Number.isFinite(x) || x < chartArea.left || x > chartArea.right) return;
+      ctx.save();
+      ctx.strokeStyle = hexA(colors.muted, 0.4);
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 4]);
+      ctx.beginPath();
+      ctx.moveTo(x, chartArea.top);
+      ctx.lineTo(x, chartArea.bottom);
+      ctx.stroke();
+      ctx.fillStyle = colors.muted;
+      ctx.font = "11px system-ui, sans-serif";
+      ctx.textBaseline = "top";
+      ctx.textAlign = "left";
+      const width = ctx.measureText(marker.label).width;
+      const labelX = Math.max(chartArea.left, Math.min(x + 4, chartArea.right - width));
+      ctx.fillText(marker.label, labelX, chartArea.top + 4);
+      ctx.restore();
+    },
+  };
+}
+
+export function renderLine(key, canvas, labels, datasets, opts = {}) {
   if (!available()) return null;
   const factory = () => {
     const ctx = canvas.getContext("2d");
@@ -196,6 +235,7 @@ export function renderStackedLine(key, canvas, labels, datasets, opts = {}) {
     const palette = [colors.accent, colors.accent2, colors.success, colors.warning, colors.info, colors.danger, "#a855f7", "#ec4899", "#84cc16", "#f97316"];
     return new window.Chart(ctx, {
       type: "line",
+      plugins: opts.nowMarker ? [nowMarkerPlugin(opts.nowMarker, colors)] : [],
       data: {
         labels,
         datasets: datasets.map((ds, i) => {
@@ -204,9 +244,11 @@ export function renderStackedLine(key, canvas, labels, datasets, opts = {}) {
             label: ds.label,
             data: ds.data,
             borderColor: c,
-            backgroundColor: hexA(c, 0.18),
-            fill: true,
-            tension: 0.35,
+            backgroundColor: hexA(c, 0.07),
+            fill: opts.fill === true,
+            cubicInterpolationMode: "monotone",
+            tension: 0.2,
+            spanGaps: false,
             pointRadius: 2,
             pointHoverRadius: 5,
             borderWidth: 2,
@@ -232,14 +274,18 @@ export function renderStackedLine(key, canvas, labels, datasets, opts = {}) {
           },
         },
         scales: {
-          x: { ticks: { color: colors.muted, maxRotation: 0, autoSkipPadding: 16 }, grid: { display: false } },
-          y: { stacked: true, ticks: { color: colors.muted, callback: (v) => formatShort(v) }, grid: { color: colors.line } },
+          x: opts.xAxis ? {
+            type: "category", min: opts.xAxis.min, max: opts.xAxis.max,
+            ticks: { color: colors.muted, maxRotation: 0, autoSkip: false, callback: (value) => value % opts.xAxis.tickStep === 0 ? labels[value] : "" },
+            grid: { display: false },
+          } : { ticks: { color: colors.muted, maxRotation: 0, autoSkipPadding: 16 }, grid: { display: false } },
+          y: { stacked: false, beginAtZero: true, min: 0, title: { display: true, text: opts.yTitle || "Tokens", color: colors.muted }, ticks: { color: colors.muted, callback: (v) => formatShort(v) }, grid: { color: colors.line } },
         },
       },
     });
   };
   destroyChart(key);
-  register(key, factory);
+  register(key, canvas, factory);
 }
 
 function formatShort(n) {
@@ -279,7 +325,7 @@ export function renderDonut(key, canvas, labels, values, opts = {}) {
     });
   };
   destroyChart(key);
-  register(key, factory);
+  register(key, canvas, factory);
 }
 
 /* ---------- horizontal bar (channel success rate) ---------- */
@@ -316,7 +362,7 @@ export function renderHBar(key, canvas, labels, values, opts = {}) {
     });
   };
   destroyChart(key);
-  register(key, factory);
+  register(key, canvas, factory);
 }
 
 /* ---------- sparkline (inline SVG, no Chart.js needed) ---------- */

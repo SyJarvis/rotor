@@ -362,6 +362,14 @@ def test_queue_full_drops_commit_without_blocking(modules, monkeypatch):
 
     async def scenario():
         store = store_mod.ConversationStore()
+        consumer_gate = asyncio.Event()
+        worker = store._worker
+
+        async def gated_worker():
+            await consumer_gate.wait()
+            await worker()
+
+        monkeypatch.setattr(store, "_worker", gated_worker)
         store.attach()
         try:
             store._queue.put_nowait(store_mod._Event(kind="db_only"))  # fill to capacity
@@ -377,6 +385,7 @@ def test_queue_full_drops_commit_without_blocking(modules, monkeypatch):
             assert store.dropped_queue_full == 1
             assert store.dropped_retry_exhausted == 0
         finally:
+            consumer_gate.set()
             await store.shutdown(timeout=2)
 
     asyncio.run(scenario())
