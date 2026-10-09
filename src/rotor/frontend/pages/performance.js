@@ -1,5 +1,5 @@
 // Process-local performance snapshots and bounded, visibility-aware polling.
-import { api } from "../api.js?v=2";
+import { api } from "../api.js?v=3";
 import { t } from "../i18n.js";
 import { escapeHtml, refreshIcons } from "../ui.js";
 

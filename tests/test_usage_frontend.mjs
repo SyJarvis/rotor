@@ -21,7 +21,7 @@ const modelRows = [{ model: 'alpha', request_count: 4, prompt_tokens: 80, comple
 function deferred() { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; }
 async function flush() { for (let i = 0; i < 20; i++) await Promise.resolve(); }
 
-async function environment({ responses = {}, available = true, language = 'en', now = '2026-10-09T05:00:00Z', autoload = true } = {}) {
+async function environment({ responses = {}, available = true, language = 'en', now = '2026-10-09T05:00:00Z', autoload = true, admin = true } = {}) {
   const nodes = new Map();
   const calls = [];
   const charts = [];
@@ -50,13 +50,14 @@ async function environment({ responses = {}, available = true, language = 'en', 
   };
   const api = async (url, options = {}) => {
     calls.push({ url, options });
-    const path = url.split('?')[0];
+    const rawPath = url.split('?')[0];
+    const path = rawPath === '/api/me' ? '/api/admin/settings' : rawPath.replace('/api/me/logs', '/api/admin/logs');
     const value = Object.hasOwn(responses, path) ? responses[path] : defaults[path];
     if (value instanceof Error) throw value;
     return typeof value === 'function' ? value(url, options) : value;
   };
   class FixedDate extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return new Date(now).getTime(); } }
-  const context = vm.createContext({ document: { getElementById: (id) => nodes.get(id) }, URLSearchParams, Intl, Date: FixedDate, AbortController });
+  const context = vm.createContext({ document: { getElementById: (id) => nodes.get(id), addEventListener() {} }, URLSearchParams, Intl, Date: FixedDate, AbortController });
   const periods = new vm.SourceTextModule(periodsSource, { context });
   await periods.link(() => {});
   await periods.evaluate();
@@ -71,6 +72,7 @@ async function environment({ responses = {}, available = true, language = 'en', 
   };
   const module = new vm.SourceTextModule(usageSource, { context });
   await module.link((specifier) => {
+    if (specifier.includes('session.js')) return new vm.SyntheticModule(['isAdmin'], function () { this.setExport('isAdmin', () => admin); }, { context });
     if (specifier.includes('periods.js')) return periods;
     const names = specifier.includes('api.js') ? ['api'] : specifier.includes('i18n.js') ? ['t', 'locale']
       : specifier.includes('charts.js') ? ['renderLine', 'renderDonut', 'renderHBar', 'destroyChart', 'isAvailable']
@@ -240,4 +242,12 @@ test('rolling day ranges retain both local boundary days and recent token totals
     assert.equal(datasets[0].data.reduce((sum, value) => sum + value, 0), 12);
     if (range === '7d') assert.equal(labels[0], '10-03');
   }
+});
+
+test('ordinary usage reads only personal stats and profile reporting timezone without any admin API', async () => {
+  const h = await environment({ admin: false });
+  assert.ok(h.calls.length > 4); assert.ok(h.calls.every(({ url }) => url.startsWith('/api/me')));
+  assert.equal(h.calls[0].url, '/api/me'); assert.match(h.html(), /Asia\/Shanghai/);
+  assert.doesNotMatch(h.html(), /usageReportScope/);
+  assert.ok(h.calls.some(({ url }) => url.startsWith('/api/me/logs/stats?')));
 });

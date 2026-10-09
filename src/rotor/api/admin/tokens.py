@@ -3,10 +3,11 @@ from typing import List
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import delete, exists, select
 
 from rotor.database import get_db
 from rotor.models.token import Token
+from rotor.models.admin_auth import AdminUser
 from rotor.schemas.token import TokenCreate, TokenUpdate, TokenResponse, TokenListItem
 from rotor.config import settings
 
@@ -156,7 +157,10 @@ async def delete_token(
             detail=f"Token {token_id} not found"
         )
 
-    await db.delete(token)
+    deleted = await db.execute(delete(Token).where(Token.id == token.id,
+        ~exists(select(AdminUser.id).where(AdminUser.default_token_id == token.id))))
+    if not deleted.rowcount:
+        raise HTTPException(409, "Select another default API Key before deleting this key")
     await db.commit()
 
     return None

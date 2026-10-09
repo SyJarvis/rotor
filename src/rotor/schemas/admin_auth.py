@@ -14,6 +14,11 @@ class AdminPasswordChangeRequest(BaseModel):
 
 
 class AdminActorResponse(BaseModel):
+    id: int | None = None
+    user_id: int | None = None
+    role: str = "admin"
+    display_name: str = ""
+    default_token_id: int | None = None
     authenticated: bool = True
     actor_id: str
     username: str

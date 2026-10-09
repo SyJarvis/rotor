@@ -10,6 +10,7 @@ from rotor.models.channel import Channel
 from rotor.core.exceptions import AuthenticationException, ModelNotFoundException
 from rotor.core.security import validate_api_key_format
 from rotor.config import settings
+from rotor.core.user_access import validate_token_access, effective_permissions
 
 security = HTTPBearer(auto_error=False)
 
@@ -53,6 +54,7 @@ async def get_current_token(
         from rotor.core.exceptions import QuotaExceededException
         raise QuotaExceededException("Token quota exceeded")
 
+    await validate_token_access(token, db)
     return token
 
 
@@ -74,9 +76,9 @@ async def get_optional_token(
     )
     token = result.scalar_one_or_none()
 
-    if not token or not token.enabled or token.expired:
-        return None
-
+    if not token:
+        raise AuthenticationException("Invalid token")
+    await validate_token_access(token, db)
     return token
 
 
@@ -90,8 +92,14 @@ async def get_available_channels(
     query = select(Channel).where(Channel.enabled.is_(True))
 
     # Filter by allowed channels if token has restrictions
-    if token and token.allowed_channels:
-        query = query.where(Channel.id.in_(token.allowed_channels))
+    if token:
+        if getattr(token, "owner_id", None) is not None:
+            await validate_token_access(token, db)
+        channel_ids, model_ids = await effective_permissions(token, db)
+        if model_ids is not None and model not in model_ids:
+            raise ModelNotFoundException(model)
+        if channel_ids is not None:
+            query = query.where(Channel.id.in_(channel_ids))
 
     # Order by priority (descending) and weight
     query = query.order_by(Channel.priority.desc(), Channel.weight.desc())
@@ -138,3 +146,7 @@ def get_client_ip(
     if x_real_ip:
         return x_real_ip
     return "unknown"
+
+
+async def get_account_channel_scope(token, db):
+    return (await effective_permissions(token, db))[0]

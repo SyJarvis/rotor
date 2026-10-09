@@ -39,6 +39,7 @@ from rotor.api.admin import (
     monitoring,
     settings as admin_settings,
 )
+from rotor.api import users, chat as user_chat
 from rotor.api.control import channels as control_channels
 from rotor.api.control import requests as control_requests
 from rotor.core.control_auth import (
@@ -208,6 +209,12 @@ app.include_router(anthropic_models.router, prefix="/anthropic/v1", tags=["anthr
 
 # Admin routes
 app.include_router(admin_auth.router, prefix="/api/admin")
+app.include_router(admin_auth.router, prefix="/api")
+app.include_router(users.auth_router, prefix="/api")
+app.include_router(users.admin_router, prefix="/api")
+app.include_router(users.me_router, prefix="/api")
+app.include_router(users.personal_logs_router, prefix="/api")
+app.include_router(user_chat.router, prefix="/api")
 admin_dependencies = [Depends(require_admin_access)]
 
 

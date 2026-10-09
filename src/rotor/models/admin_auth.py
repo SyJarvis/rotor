@@ -5,6 +5,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    JSON,
     String,
     UniqueConstraint,
     func,
@@ -23,6 +24,13 @@ class AdminUser(Base):
     username: Mapped[str] = mapped_column(
         String(100), unique=True, index=True, nullable=False
     )
+    role: Mapped[str] = mapped_column(String(20), default="user", server_default="user", nullable=False)
+    display_name: Mapped[str] = mapped_column(String(100), default="", server_default="", nullable=False)
+    quota: Mapped[int | None] = mapped_column(Integer().evaluates_none(), nullable=True, default=0)
+    used_quota: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    allowed_channels: Mapped[list | None] = mapped_column(JSON, nullable=True, default=list)
+    allowed_models: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    default_token_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     enabled: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False
@@ -138,3 +146,19 @@ class AdminAuthEvent(Base):
         nullable=False,
         index=True,
     )
+
+
+class UserInvitation(Base):
+    __tablename__ = "user_invitations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    secret_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    created_by: Mapped[int] = mapped_column(ForeignKey("admin_users.id"), nullable=False)
+    quota: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    allowed_channels: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    allowed_models: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    used_by: Mapped[int | None] = mapped_column(ForeignKey("admin_users.id"), nullable=True)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

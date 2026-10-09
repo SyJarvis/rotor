@@ -1,6 +1,10 @@
 // Logs page — filter bar + paginated table + expandable detail.
 
-import { api } from "../api.js?v=2";
+import { api } from "../api.js?v=3";
+import { isAdmin } from "../session.js?v=1";
+let reportScope = "all";
+const adminScope = () => isAdmin() && reportScope === "all";
+const reportingBase = () => adminScope() ? "/api/admin" : "/api/me";
 import { t } from "../i18n.js";
 import {
   escapeHtml, badge, formatNumber, formatTimeInTimezone, skeletonRows,
@@ -40,10 +44,10 @@ export async function load() {
   skeletonRows(container, 5, 8);
   try {
     if (state.channels.length === 0) {
-      state.channels = await api("/api/admin/channels").catch(() => []);
+      state.channels = await api(adminScope() ? "/api/admin/channels" : "/api/me/logs/channels").then((rows) => rows.map((row) => ({ ...row, id: row.id ?? row.channel_id, name: row.name ?? row.channel_name }))).catch(() => []);
     }
     if (!state.displayTimezone) {
-      const settings = await api("/api/admin/settings").catch(() => null);
+      const settings = await api(adminScope() ? "/api/admin/settings" : "/api/me").catch(() => null);
       state.displayTimezone = settings?.display_timezone || "Asia/Shanghai";
     }
     await fetchPage();
@@ -61,10 +65,10 @@ async function fetchPage() {
   const skip = state.page * PAGE_SIZE;
   const filters = buildFilterQuery(range.query);
   const [logs, count, timeline, models] = await Promise.all([
-    api(`/api/admin/logs?limit=${PAGE_SIZE}&skip=${skip}&${filters}`),
-    api(`/api/admin/logs/count?${filters}`),
-    api(`/api/admin/logs/timeseries?bucket=${range.apiBucket || range.bucket}&${filters}`).catch(() => []),
-    api(`/api/admin/logs/models?limit=30&${range.query}`).catch(() => []),
+    api(`${reportingBase()}/logs?limit=${PAGE_SIZE}&skip=${skip}&${filters}`),
+    api(`${reportingBase()}/logs/count?${filters}`),
+    api(`${reportingBase()}/logs/timeseries?bucket=${range.apiBucket || range.bucket}&${filters}`).catch(() => []),
+    api(`${reportingBase()}/logs/models?limit=30&${range.query}`).catch(() => []),
   ]);
   state.timeRange = range;
   state.logs = logs;
@@ -101,6 +105,7 @@ export function render() {
   const today = dateInTimezone(new Date(), state.displayTimezone);
 
   container.innerHTML = `
+    ${isAdmin() ? `<label class="report-scope">${t("dataScope")} <select class="select" id="logsReportScope"><option value="all" ${adminScope() ? "selected" : ""}>${t("globalScope")}</option><option value="mine" ${!adminScope() ? "selected" : ""}>${t("myScope")}</option></select></label>` : ""}
     <div class="section-head">
       <div>
         <h2>${t("logs")}</h2>
@@ -366,7 +371,7 @@ function toggleAutoRefresh(on) {
 async function pollNew() {
   try {
     const range = selectedTimeRange();
-    const fresh = await api(`/api/admin/logs?limit=${PAGE_SIZE}&${buildFilterQuery(range.query)}`);
+    const fresh = await api(`${reportingBase()}/logs?limit=${PAGE_SIZE}&${buildFilterQuery(range.query)}`);
     const newOnes = fresh.filter((l) => !state.seen.has(l.id));
     state.seen = new Set(fresh.map((l) => l.id));
     if (state.page === 0) {
@@ -381,7 +386,7 @@ async function loadDetail(id) {
   if (state.detailCache[id] || state.detailLoading.has(id)) return;
   state.detailLoading.add(id);
   try {
-    const detail = await api(`/api/admin/logs/${id}`);
+    const detail = await api(`${reportingBase()}/logs/${id}`);
     state.detailCache[id] = detail;
     delete state.detailErrors[id];
   } catch (e) {
@@ -427,3 +432,12 @@ export async function onClick(target) {
   }
   return false;
 }
+
+document.addEventListener("change", (event) => {
+  if (event.target.id !== "logsReportScope" || !isAdmin()) return;
+  reportScope = event.target.value; state.channels = []; state.displayTimezone = "";
+  state.filter = { model: '', channel: '', status: '', q: '' }; state.page = 0; state.detailCache = {};
+  load();
+});
+export function unload() { if (state.timer) clearInterval(state.timer); state.timer = null; }
+document.addEventListener("sessionended", () => { unload(); state.logs = []; state.channels = []; state.detailCache = {}; state.models = []; });

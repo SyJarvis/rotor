@@ -17,7 +17,7 @@ import rotor.main  # noqa: F401  # Register every model in Base.metadata.
 
 ROOT = Path(__file__).resolve().parents[1]
 PREVIOUS_REVISION = "b8c9d0e1f2a3"
-HEAD_REVISION = "e1f2a3b4c5d6"
+HEAD_REVISION = "f2a3b4c5d6e7"
 ADMIN_TABLES = {
     "admin_auth_events",
     "admin_login_throttles",
@@ -279,15 +279,16 @@ def test_startup_migrations_adopt_pre_admin_legacy_database(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "legacy-current.db"
-    legacy_metadata = MetaData()
-    for table in Base.metadata.sorted_tables:
-        if table.name not in ADMIN_TABLES:
-            table.to_metadata(legacy_metadata)
+    # Build the real pre-account schema, then remove the four administrator
+    # tables as in the historical unversioned deployment. Cloning today's
+    # metadata would include account ownership foreign keys that did not exist.
+    _run_alembic(database_path, "upgrade", "e1f2a3b4c5d6")
     engine = create_engine(f"sqlite:///{database_path}")
-    legacy_metadata.create_all(engine)
     with engine.begin() as connection:
+        for table_name in ("admin_auth_events", "admin_sessions", "admin_login_throttles", "admin_users", "alembic_version"):
+            connection.execute(text(f'DROP TABLE "{table_name}"'))
         connection.execute(
-            legacy_metadata.tables["usage_ledger"].insert().values(
+            Base.metadata.tables["usage_ledger"].insert().values(
                 request_id="preserved-request",
                 model="legacy-model",
                 request_protocol="openai_chat",

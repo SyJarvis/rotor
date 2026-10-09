@@ -1,6 +1,6 @@
 // Channels page — card grid with filter + actions.
 
-import { api } from "../api.js?v=2";
+import { api } from "../api.js?v=3";
 import { t } from "../i18n.js";
 import { channelDefaults, rememberChannelDefaults, applyChannelDefaults } from "../channel-form.js?v=2";
 import {

@@ -1,6 +1,10 @@
 // Usage page — shared filtered totals, usage trends, model and channel breakdowns.
 
-import { api } from "../api.js?v=2";
+import { api } from "../api.js?v=3";
+import { isAdmin } from "../session.js?v=1";
+let reportScope = "all";
+const adminScope = () => isAdmin() && reportScope === "all";
+const reportingBase = () => adminScope() ? "/api/admin" : "/api/me";
 import { t, locale } from "../i18n.js";
 import {
   escapeHtml, formatNumber, formatRequestCount, formatLatency, skeletonKpis, refreshIcons, badge, toast,
@@ -55,8 +59,8 @@ export async function load() {
   }
 
   const [settings, channels] = await Promise.allSettled([
-    state.displayTimezone ? Promise.resolve({ display_timezone: state.displayTimezone }) : api("/api/admin/settings", options),
-    state.channels ? Promise.resolve(state.channels) : api("/api/admin/channels", options),
+    state.displayTimezone ? Promise.resolve({ display_timezone: state.displayTimezone }) : api(adminScope() ? "/api/admin/settings" : "/api/me", options),
+    state.channels ? Promise.resolve(state.channels) : api(adminScope() ? "/api/admin/channels" : "/api/me/logs/channels", options).then((rows) => rows.map((row) => ({ ...row, id: row.id ?? row.channel_id, name: row.name ?? row.channel_name }))),
   ]);
   if (!active || current !== generation) return;
   if (settings.status !== "fulfilled" || !settings.value?.display_timezone) {
@@ -79,11 +83,11 @@ export async function load() {
   const query = params.toString();
   const keys = ["stats", "timeline", "modelsAgg", "channelStats"];
   const results = await Promise.allSettled([
-    api(`/api/admin/logs/stats?${query}`, options),
+    api(`${reportingBase()}/logs/stats?${query}`, options),
     // Aggregate hourly rows locally so calendar-day labels follow the display timezone.
-    api(`/api/admin/logs/timeseries_by_model?${query}&bucket=hour`, options),
-    api(`/api/admin/logs/models?${query}&limit=8`, options),
-    api(`/api/admin/logs/channels?${query}`, options),
+    api(`${reportingBase()}/logs/timeseries_by_model?${query}&bucket=hour`, options),
+    api(`${reportingBase()}/logs/models?${query}&limit=8`, options),
+    api(`${reportingBase()}/logs/channels?${query}`, options),
   ]);
   if (!active || current !== generation) return;
   results.forEach((result, index) => {
@@ -196,6 +200,7 @@ export function render() {
     channelOptions.push({ id: state.channelFilter, name: `${t("channels")} #${state.channelFilter}` });
   }
   container.innerHTML = `
+    ${isAdmin() ? `<label class="report-scope">${t("dataScope")} <select class="select" id="usageReportScope"><option value="all" ${adminScope() ? "selected" : ""}>${t("globalScope")}</option><option value="mine" ${!adminScope() ? "selected" : ""}>${t("myScope")}</option></select></label>` : ""}
     <div class="section-head">
       <div><h2>${t("usage")}</h2><p>${t("usageHint")}</p></div>
       <div class="usage-period-controls">
@@ -365,3 +370,11 @@ function renderChannelsFallback(channels) {
 }
 
 export async function onClick() { return false; }
+
+document.addEventListener("change", (event) => {
+  if (event.target.id !== "usageReportScope" || !isAdmin()) return;
+  reportScope = event.target.value; state.channels = null; state.displayTimezone = "";
+  state.modelFilter = state.channelFilter = ''; state.knownModels.clear();
+  load();
+});
+document.addEventListener("sessionended", () => { unload(); state.stats = state.timeline = state.modelsAgg = state.channelStats = null; state.channels = null; state.knownModels.clear(); state.displayTimezone = ""; });

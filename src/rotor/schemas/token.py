@@ -38,6 +38,9 @@ class TokenResponse(TokenBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    owner_id: Optional[int] = None
+    is_base: bool = False
+    allowed_models: Optional[List[str]] = None
     used_quota: int
     expired: bool
     created_at: datetime
@@ -52,6 +55,9 @@ class TokenListItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    owner_id: Optional[int] = None
+    is_base: bool = False
+    allowed_models: Optional[List[str]] = None
     key: str
     name: str
     user_id: Optional[str]
