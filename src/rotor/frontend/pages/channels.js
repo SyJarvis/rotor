@@ -8,9 +8,9 @@ import {
   skeletonCards, showInline, hideInline, refreshIcons, toast,
 } from "../ui.js";
 
-let state = { channels: [], filter: { q: "", provider: "", status: "" }, testResult: {}, openMenu: null, routingState: {}, routingError: null };
+let state = { channels: [], filter: { q: "", provider: "", status: "" }, testResult: {}, authSyncError: {}, openMenu: null, routingState: {}, routingError: null };
 
-export const editState = { id: null, authType: "api_key", authStatus: null };
+export const editState = { id: null, authType: "api_key", authStatus: null, authExpiresAt: null, authError: null, authSyncError: false };
 let editRequest = 0;
 let oauthSession = null;
 let oauthGeneration = 0;
@@ -22,6 +22,7 @@ let oauthPreview = null;
 let oauthNotice = null;
 let modelsProbing = false;
 const probingChannels = new Set();
+const authRequests = new Map();
 const OAUTH_REDIRECT_URI = "http://localhost:1455/auth/callback";
 
 const OAUTH_CONNECTION = {
@@ -48,7 +49,7 @@ export function oauthProbePath(form) {
       ? `/api/admin/channels/oauth/sessions/${encodeURIComponent(oauthSession.session_id)}/probe-models`
       : null;
   }
-  return editState.id && editState.authType === "oauth" && ["connected", "error"].includes(editState.authStatus)
+  return editState.id && editState.authType === "oauth" && ["connected", "temporary_error", "error"].includes(editState.authStatus)
     ? `/api/admin/channels/${editState.id}/probe-models` : null;
 }
 
@@ -90,6 +91,15 @@ function renderOAuth() {
     || !oauthPreview || oauthPreview.callback_url !== input?.value.trim();
   const cancel = document.getElementById("channelOAuthCancel");
   cancel?.classList.toggle("hidden", !oauthSession && !oauthStarting);
+  const check = document.getElementById("channelOAuthCheck");
+  check?.classList.toggle("hidden", !oauth || !editState.id || editState.authType !== "oauth" || !!oauthSession || oauthStarting);
+  const checking = authRequests.get(String(editState.id));
+  if (check) check.disabled = !!currentAuthStateRequest(checking) && checking.checking;
+  const details = document.getElementById("channelOAuthDetails");
+  details?.classList.toggle("hidden", !oauth || !!oauthSession || oauthStarting || editState.authType !== "oauth");
+  if (details) details.textContent = savedOAuthDetails({
+    auth_status: editState.authStatus, auth_expires_at: editState.authExpiresAt, auth_error: editState.authError,
+  }, editState.authSyncError);
   if (!oauth) return;
   if (oauthStarting) oauthStatus(t("oauthStarting"));
   else if (oauthCompleting) oauthStatus(t("oauthCompleting"));
@@ -103,11 +113,80 @@ function renderOAuth() {
     const status = oauthSession.status;
     oauthStatus(t(status === "pending" && oauthPreview ? "oauthCallbackMatched" : statusKeys[status] || "oauthFailed"),
       status === "authorized" || (status === "pending" && oauthPreview) ? "success" : ["pending", "exchanging"].includes(status) ? "" : "error");
-  } else if (editState.authType === "oauth" && editState.authStatus === "connected") {
-    oauthStatus(t("oauthConnected"), "success");
-  } else if (editState.authType === "oauth" && editState.authStatus === "error") {
-    oauthStatus(t("oauthNeedsLogin"), "warning");
+  } else if (editState.authType === "oauth") {
+    const saved = savedOAuthState(editState.authStatus, editState.authSyncError);
+    oauthStatus(t(saved.key), saved.type);
   } else oauthStatus(t("oauthLoginRequired"));
+}
+
+function savedOAuthState(status, unavailable = false) {
+  if (unavailable) return { key: "oauthStatusUnavailable", type: "warning" };
+  switch (status) {
+    case "connected": return { key: "oauthSaved", type: "info" };
+    case "reauth_required": return { key: "oauthReauthRequired", type: "error" };
+    case "temporary_error":
+    case "error": return { key: "oauthTemporaryError", type: "warning" };
+    default: return { key: "oauthUnauthed", type: "warning" };
+  }
+}
+
+function savedOAuthDetails(channel, unavailable = false) {
+  if (unavailable) return t("oauthRetryCheck");
+  if (!channel.auth_status || channel.auth_status === "unauthed") return "";
+  const parts = [];
+  const expiry = Number(channel.auth_expires_at);
+  const date = new Date(expiry * 1000);
+  if (expiry > 0 && Number.isFinite(date.getTime())) {
+    parts.push(`${t("oauthExpiry")}: ${date.toLocaleString()} (${t("oauthLocalTime")})`);
+  }
+  parts.push(t("oauthAutoRefresh"));
+  if (["temporary_error", "error"].includes(channel.auth_status)) parts.push(t("oauthRetryCheck"));
+  if (channel.auth_error) parts.push(channel.auth_error);
+  return parts.join(" · ");
+}
+
+export function beginAuthStateRequest(id) {
+  if (!id) return null;
+  const request = { id: String(id), loadGeneration, authGeneration: oauthGeneration, editRequest, checking: true };
+  authRequests.set(request.id, request);
+  return request;
+}
+
+function currentAuthStateRequest(request) {
+  return request && authRequests.get(request.id) === request && request.loadGeneration === loadGeneration
+    && (String(editState.id) !== request.id || request.authGeneration === oauthGeneration);
+}
+
+export async function finishAuthStateRequest(request) {
+  if (!currentAuthStateRequest(request)) return false;
+  try {
+    const channel = await api(`/api/admin/channels/${request.id}`);
+    if (!currentAuthStateRequest(request)) return false;
+    if (String(channel.id) !== request.id || channel.auth_type !== "oauth") throw new Error("Unexpected channel authorization state");
+    const metadata = { auth_status: channel.auth_status, auth_expires_at: channel.auth_expires_at, auth_error: channel.auth_error };
+    const saved = state.channels.find((entry) => String(entry.id) === request.id);
+    if (saved?.auth_type === "oauth") Object.assign(saved, metadata);
+    delete state.authSyncError[request.id];
+    if (String(editState.id) === request.id && request.editRequest === editRequest && !oauthSession && !oauthStarting) {
+      Object.assign(editState, { authStatus: metadata.auth_status, authExpiresAt: metadata.auth_expires_at, authError: metadata.auth_error, authSyncError: false });
+    }
+    return true;
+  } catch (error) {
+    if (!currentAuthStateRequest(request)) return false;
+    state.authSyncError[request.id] = true;
+    if (String(editState.id) === request.id && request.editRequest === editRequest && !oauthSession && !oauthStarting) editState.authSyncError = true;
+    return false;
+  } finally {
+    if (currentAuthStateRequest(request)) {
+      request.checking = false;
+      renderOAuth();
+      if (active) render();
+    }
+  }
+}
+
+export async function checkEditedOAuth() {
+  if (editState.id && editState.authType === "oauth" && !oauthSession && !oauthStarting) await runTest(editState.id);
 }
 
 export function cancelOAuthLogin({ consumed = false } = {}) {
@@ -343,7 +422,7 @@ export function oauthSaveFields(form) {
     renderOAuth();
   }
   if (!oauthSession && !oauthStarting && editState.id && editState.authType === "oauth"
-    && ["connected", "error"].includes(editState.authStatus)) return {};
+    && ["connected", "temporary_error", "reauth_required", "error"].includes(editState.authStatus)) return {};
   throw new Error(t("oauthLoginRequired"));
 }
 
@@ -480,6 +559,9 @@ export function openCreate() {
   editState.id = null;
   editState.authType = "api_key";
   editState.authStatus = null;
+  editState.authExpiresAt = null;
+  editState.authError = null;
+  editState.authSyncError = false;
   resetSaveButton();
   withForm((form) => {
     form.reset();
@@ -516,6 +598,15 @@ export async function openEdit(channel) {
   editState.id = channel.id;
   editState.authType = channel.auth_type || "api_key";
   editState.authStatus = channel.auth_status;
+  editState.authExpiresAt = channel.auth_expires_at;
+  editState.authError = channel.auth_error;
+  editState.authSyncError = false;
+  delete state.authSyncError[channel.id];
+  const saved = state.channels.find((entry) => entry.id === channel.id);
+  if (saved?.auth_type === "oauth" && channel.auth_type === "oauth") {
+    Object.assign(saved, { auth_status: channel.auth_status, auth_expires_at: channel.auth_expires_at, auth_error: channel.auth_error });
+    if (active) render();
+  }
   resetSaveButton();
   const extra = channel.extra || {};
   const { models_path, request_path, auth_type, ...restExtra } = extra;
@@ -572,6 +663,7 @@ export async function load() {
     ]);
     if (!active || generation !== loadGeneration) return;
     state.channels = channels;
+    state.authSyncError = {};
     state.routingState = indexRoutingState(routingState);
     state.routingError = routingError;
     render();
@@ -660,6 +752,7 @@ function renderCard(c) {
   const test = state.testResult[c.id];
   const menuOpen = state.openMenu === c.id;
   const cooling = hasCooldown(c.id);
+  const auth = savedOAuthState(c.auth_status, state.authSyncError[c.id]);
 
   return `
     <div class="channel-card ${c.enabled ? "" : "disabled"}${cooling ? " cooling" : ""}">
@@ -692,10 +785,11 @@ function renderCard(c) {
         ${badge(c.type, "accent")}
         ${badge(c.protocol, "info")}
         ${c.auth_type === "oauth" ? badge("ChatGPT OAuth", "accent") : ""}
-        ${c.auth_type === "oauth" && c.auth_status === "error" ? badge(t("oauthNeedsLogin"), "warning") : ""}
+        ${c.auth_type === "oauth" ? badge(t(auth.key), auth.type === "error" ? "danger" : auth.type) : ""}
         ${statusBadge(c.enabled)}
       </div>
       <div class="ch-base" title="${escapeHtml(c.base_url || "")}">${escapeHtml(c.base_url || "")}</div>
+      ${c.auth_type === "oauth" ? `<p class="muted text-sm">${escapeHtml(savedOAuthDetails(c, state.authSyncError[c.id]))}</p>` : ""}
       ${cooling ? `<div class="ch-meta cooldown-row">${routingBadges(c.id)}</div>` : ""}
       <div class="chips">
         ${models.map((m) => `<span class="chip">${escapeHtml(m)}</span>`).join("")}
@@ -722,7 +816,7 @@ function renderCard(c) {
           <div class="seg-failed" style="width:${failW}%"></div>
         </div>
         <button class="btn-secondary" data-channel-edit="${c.id}">
-          <i data-lucide="pencil"></i>${t("edit")}
+          <i data-lucide="${c.auth_type === "oauth" && c.auth_status === "reauth_required" ? "log-in" : "pencil"}"></i>${t(c.auth_type === "oauth" && c.auth_status === "reauth_required" ? "oauthSignInAgain" : "edit")}
         </button>
       </div>
     </div>`;
@@ -833,6 +927,12 @@ async function resetChannelCooldown(id) {
 }
 
 async function runTest(id) {
+  const oauth = state.channels.find((channel) => String(channel.id) === String(id))?.auth_type === "oauth"
+    || (String(editState.id) === String(id) && editState.authType === "oauth");
+  const request = oauth ? beginAuthStateRequest(id) : null;
+  const generation = loadGeneration;
+  let outcome;
+  if (oauth) renderOAuth();
   const card = document.querySelector(`[data-channel-test="${id}"]`)?.closest(".channel-card");
   if (card) {
     const btn = card.querySelector(`[data-channel-test="${id}"]`);
@@ -842,23 +942,30 @@ async function runTest(id) {
   }
   try {
     const result = await api(`/api/admin/channels/${id}/test`, { method: "POST" });
-    state.testResult[id] = {
+    outcome = {
       ok: result.ok,
       message: result.ok
         ? result.check_type === "oauth"
           ? `${t("oauthCheckPassed")} · ${result.latency_ms} ms`
           : `${t("modelCatalogReachable")} · ${result.latency_ms} ms · ${result.models.length} models`
-        : `${t("failed")} · ${result.latency_ms} ms · ${escapeHtml(result.error || result.status_code)}`,
+        : `${t("failed")} · ${result.latency_ms} ms · ${result.error || result.status_code}`,
     };
   } catch (e) {
-    state.testResult[id] = { ok: false, message: e.message };
+    outcome = { ok: false, message: e.message };
   }
-  render();
+  if (request) {
+    await finishAuthStateRequest(request);
+    if (!currentAuthStateRequest(request)) return;
+  } else if (generation !== loadGeneration) return;
+  state.testResult[id] = outcome;
+  if (active) render();
 }
 
 async function probeModels(id) {
   if (probingChannels.has(String(id))) return;
   probingChannels.add(String(id));
+  const oauth = state.channels.find((channel) => String(channel.id) === String(id))?.auth_type === "oauth";
+  const authRequest = oauth ? beginAuthStateRequest(id) : null;
   try {
     const result = await api(`/api/admin/channels/${id}/probe-models`, {
       method: "POST",
@@ -892,6 +999,7 @@ async function probeModels(id) {
     const oauth = state.channels.find((c) => String(c.id) === String(id))?.auth_type === "oauth";
     toast(oauth ? t("oauthProbeFailed") : error.message, "error", 5000);
   } finally {
+    if (authRequest) await finishAuthStateRequest(authRequest);
     probingChannels.delete(String(id));
   }
 }
