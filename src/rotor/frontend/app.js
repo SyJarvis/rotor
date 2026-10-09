@@ -7,15 +7,15 @@ import * as users from "./pages/users.js?v=3";
 import { initSidebar, closeSidebar } from "./sidebar.js?v=1";
 import { api, copyText } from "./api.js?v=3";
 import { parseCsv, parseJson, refreshIcons, toast } from "./ui.js?v=12";
-import { refreshTheme } from "./charts.js?v=9";
+import { refreshTheme } from "./charts.js?v=10";
 import { setChannelPresets, applyChannelDefaults, channelConnection } from "./channel-form.js?v=2";
 
 import * as overview from "./pages/overview.js?v=8";
 import * as channels from "./pages/channels.js?v=10";
 import { editState as channelEditState } from "./pages/channels.js?v=10";
 import * as tokens from "./pages/tokens.js?v=10";
-import * as usage from "./pages/usage.js?v=15";
-import * as logs from "./pages/logs.js?v=6";
+import * as usage from "./pages/usage.js?v=16";
+import * as logs from "./pages/logs.js?v=7";
 import * as monitoring from "./pages/monitoring.js?v=7";
 import * as chat from "./pages/chat.js?v=7";
 

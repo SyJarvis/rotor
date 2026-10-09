@@ -9,7 +9,7 @@ import { t, locale } from "../i18n.js";
 import {
   escapeHtml, formatNumber, formatRequestCount, formatLatency, skeletonKpis, refreshIcons, badge, toast,
 } from "../ui.js?v=12";
-import { renderLine, renderDonut, renderHBar, destroyChart, isAvailable } from "../charts.js?v=9";
+import { renderLine, renderDonut, renderHBar, destroyChart, isAvailable } from "../charts.js?v=10";
 import {
   TIME_RANGES, bucketKey, bucketLabel, createCustomTimeRange, createTimeRange,
   dateInTimezone, expectedRangeBuckets,
@@ -19,7 +19,7 @@ let state = {
   range: "today", timeRange: null, startDate: "", endDate: "", displayTimezone: "",
   modelFilter: "", channelFilter: "", metric: "tokens", byModel: false, currency: "",
   stats: null, timeline: null, modelsAgg: null, channelStats: null,
-  channels: null, knownModels: new Set(), errors: {}, loading: false,
+  channels: null, knownModels: new Set(), errors: {}, loading: false, snapshot: null,
 };
 let generation = 0;
 let requestController = null;
@@ -34,7 +34,7 @@ function clearCharts() {
 function selectedRange() {
   return state.range === "custom"
     ? createCustomTimeRange(state.startDate, state.endDate)
-    : createTimeRange(state.range, state.displayTimezone);
+    : createTimeRange(state.range, state.displayTimezone, state.snapshot || new Date());
 }
 
 export async function load() {
@@ -46,6 +46,7 @@ export async function load() {
   const options = { signal: controller.signal };
   clearCharts();
   state.loading = true;
+  state.snapshot = new Date();
   state.errors = {};
   state.stats = state.timeline = state.modelsAgg = state.channelStats = null;
   const container = document.getElementById("usage");
@@ -127,10 +128,10 @@ function rangeLabel(range) {
   return range.key === "custom" ? t("customDateRange") : t(`usageRange_${range.key}`);
 }
 
-function sectionMessage(key, rows) {
+function sectionMessage(key, rows, allowEmpty = false) {
   if (state.loading) return `<div class="empty-state" role="status">${t("usageLoading")}</div>`;
   if (state.errors[key]) return `<div class="empty-state usage-unavailable" role="status"><h3>${t("usageUnavailable")}</h3><p>${escapeHtml(state.errors[key])}</p></div>`;
-  if (!rows?.length) return `<div class="empty-state"><h3>${t("noData")}</h3></div>`;
+  if (!rows?.length && !allowEmpty) return `<div class="empty-state"><h3>${t("noData")}</h3></div>`;
   return "";
 }
 
@@ -194,6 +195,7 @@ export function render() {
   const allGroups = trendGroups(state.timeline || [], range);
   if (state.metric === "cost" && !allGroups.some((group) => group.unit === state.currency)) state.currency = allGroups[0]?.unit || "";
   const groups = state.metric === "cost" ? allGroups.filter((group) => group.unit === state.currency) : allGroups;
+  const emptyToday = range.key === "today" && !state.byModel && state.metric !== "cost" && Array.isArray(state.timeline);
   const channelItems = filteredChannels();
   const channelOptions = [...(state.channels || [])];
   if (state.channelFilter && !channelOptions.some((channel) => String(channel.id) === state.channelFilter)) {
@@ -225,7 +227,8 @@ export function render() {
         <div class="usage-trend-controls"><div class="range-switch" id="usageMetricSwitch">${["tokens", "requests", "cost"].map((metric) => `<button type="button" data-metric="${metric}" aria-pressed="${metric === state.metric}" class="${metric === state.metric ? "active" : ""}">${metricLabel(metric)}</button>`).join("")}</div>
         ${state.metric === "cost" && allGroups.length > 1 ? `<label class="usage-currency">${t("usageCurrency")}<select class="select" id="usageCurrency">${allGroups.map((group) => `<option value="${escapeHtml(group.unit)}" ${group.unit === state.currency ? "selected" : ""}>${escapeHtml(group.unit)}</option>`).join("")}</select></label>` : ""}
         <label class="usage-split"><input type="checkbox" id="usageByModel" ${state.byModel ? "checked" : ""}>${t("usageByModel")}</label></div></div>
-      ${sectionMessage("timeline", state.timeline) || (groups.length ? groups.map((group, index) => `<div class="usage-trend-group">${state.metric === "cost" ? `<div class="card-sub mb-2">${escapeHtml(group.unit)}</div>` : ""}<div class="chart-canvas-wrap usage-main-chart">${chartAvailable ? `<canvas id="usageTrend${index}"></canvas>` : renderTrendFallback(group)}</div></div>`).join("") : `<div class="empty-state"><h3>—</h3><p>${t("usageCostUnknown")}</p></div>`)}
+      ${sectionMessage("timeline", state.timeline, emptyToday) || (groups.length ? groups.map((group, index) => `<div class="usage-trend-group">${state.metric === "cost" ? `<div class="card-sub mb-2">${escapeHtml(group.unit)}</div>` : ""}<div class="chart-canvas-wrap usage-main-chart">${chartAvailable ? `<canvas id="usageTrend${index}"></canvas>` : renderTrendFallback(group)}</div></div>`).join("") : `<div class="empty-state"><h3>—</h3><p>${t("usageCostUnknown")}</p></div>`)}
+      ${range.key === "today" && !state.loading && !state.errors.timeline ? `<p class="usage-chart-note">${t("usageTodayHint")}</p>` : ""}
       ${state.metric === "cost" ? `<p class="usage-chart-note">${t("usageCostTrendHint")}</p>` : ""}
     </div>
     <div class="usage-grid">
@@ -299,9 +302,14 @@ function metricLabel(metric) {
 }
 
 function trendGroups(rows, range) {
-  const currentBucket = bucketKey(new Date().toISOString(), range.bucket, state.displayTimezone);
-  const buckets = expectedRangeBuckets(range, state.displayTimezone).filter((bucket) => bucket <= currentBucket);
+  const today = range.key === "today";
+  const snapshot = today ? state.snapshot : new Date();
+  const currentBucket = bucketKey(snapshot.toISOString(), range.bucket, state.displayTimezone);
+  const buckets = expectedRangeBuckets(range, state.displayTimezone).filter((bucket) => today || bucket <= currentBucket);
   const labels = buckets.map((bucket) => bucketLabel(bucket, range));
+  if (today) labels.push("24:00");
+  const parts = today ? Object.fromEntries(new Intl.DateTimeFormat("en", { timeZone: state.displayTimezone, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(snapshot).map((part) => [part.type, part.value])) : null;
+  const currentHour = parts ? Number(parts.hour) : null;
   const models = state.byModel ? [...new Set(rows.map((row) => row.model))].sort() : [null];
   const units = state.metric === "cost" ? [...new Set(rows.flatMap((row) => costEntries(row).map(([currency]) => currency)))].sort() : [state.metric];
   return units.map((unit) => {
@@ -317,10 +325,10 @@ function trendGroups(rows, range) {
       }
       return {
         label: model === null ? t("usageTotal") : model,
-        data: buckets.map((bucket) => values.has(bucket) ? values.get(bucket) : state.metric === "cost" && unknownBuckets.has(bucket) ? null : 0),
+        data: [...buckets.map((bucket) => today && bucket > currentBucket ? null : values.has(bucket) ? values.get(bucket) : state.metric === "cost" && unknownBuckets.has(bucket) ? null : 0), ...(today ? [null] : [])],
       };
     }).filter((dataset) => state.metric !== "cost" || dataset.data.some((value) => value !== null));
-    return { unit, labels, datasets };
+    return { unit, labels, datasets, ...(today ? { currentHour, nowValue: currentHour + Number(parts.minute) / 60 } : {}) };
   });
 }
 
@@ -331,7 +339,7 @@ function filteredChannels() {
 }
 
 function drawCharts(groups, channels) {
-  if (!state.errors.timeline && state.timeline?.length) groups.forEach((group, index) => {
+  if (!state.errors.timeline) groups.forEach((group, index) => {
     const canvas = document.getElementById(`usageTrend${index}`);
     if (!canvas) return;
     const key = `usage-trend-${index}`;
@@ -340,7 +348,15 @@ function drawCharts(groups, channels) {
     renderLine(key, canvas, group.labels, group.datasets, {
       fill: !state.byModel,
       yTitle: state.metric === "cost" ? group.unit : metricLabel(state.metric),
-      tooltipCallbacks: { label: (context) => ` ${context.dataset.label}: ${metric === "cost" ? `${group.unit} ${formatCost(context.parsed.y)}` : formatRequestCount(context.parsed.y)}` },
+      ...(group.currentHour !== undefined ? { xAxis: { min: 0, max: 24, tickStep: 4 }, nowMarker: { value: group.nowValue, label: t("usageNow") } } : {}),
+      tooltipCallbacks: {
+        ...(group.currentHour !== undefined ? { title: (items) => {
+          const index = items[0]?.dataIndex;
+          if (index === undefined || index >= 24) return "";
+          return `${group.labels[index]}–${group.labels[index + 1]}${index === group.currentHour ? ` · ${t("usageInProgress")}` : ""}`;
+        } } : {}),
+        label: (context) => ` ${context.dataset.label}: ${metric === "cost" ? `${group.unit} ${formatCost(context.parsed.y)}` : formatRequestCount(context.parsed.y)}`,
+      },
     });
   });
   if (!state.errors.modelsAgg && state.modelsAgg?.length) {
