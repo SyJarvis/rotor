@@ -12,6 +12,16 @@ _TOKEN_FIELDS = {
     "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
 }
 _DETAIL_FIELDS = {"prompt_tokens_details", "completion_tokens_details", "input_tokens_details", "output_tokens_details", "cache_creation"}
+# Detail objects also carry non-counter provider metadata (commandcode.ai
+# sends reasoning_tokens_estimated: true); only well-known counter keys are
+# validated, anything else passes through untouched instead of failing.
+_DETAIL_COUNT_KEYS = {
+    "prompt_tokens", "completion_tokens", "total_tokens",
+    "input_tokens", "output_tokens", "cached_tokens",
+    "text_tokens", "audio_tokens", "video_tokens", "image_tokens",
+    "reasoning_tokens", "accepted_prediction_tokens", "rejected_prediction_tokens",
+    "cache_read_tokens", "cache_write_tokens", "cache_creation_input_tokens",
+}
 # Providers echo native stop reasons (Gemini "STOP"/"safety" via OpenRouter,
 # Anthropic "end_turn"/"max_tokens") instead of the Chat finish reasons.
 # Map the known ones to their canonical meaning; anything else is invalid.
@@ -48,8 +58,10 @@ def _provider_usage(payload, *, strict=False, upstream_status=None):
             if value is None:
                 continue
             if not isinstance(value, dict) or any(
-                count is not None and (not isinstance(count, int) or isinstance(count, bool) or count < 0)
-                for count in value.values()
+                detail in _DETAIL_COUNT_KEYS
+                and count is not None
+                and (not isinstance(count, int) or isinstance(count, bool) or count < 0)
+                for detail, count in value.items()
             ):
                 if strict:
                     _fail("Invalid Chat token usage details", upstream_status=upstream_status)

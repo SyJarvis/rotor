@@ -187,6 +187,22 @@ def test_missing_zero_or_partial_usage_remains_compatible(usage):
     assert state.provider_usage == (usage or None)
 
 
+@pytest.mark.parametrize("details", [
+    {"reasoning_tokens": 38, "reasoning_tokens_estimated": True, "image_tokens": 0},
+    {"cached_tokens": 0, "audio_tokens": 0, "video_tokens": 0},
+    {"cached_tokens": 5, "vendor_cache_kind": "prefix"},
+])
+@pytest.mark.parametrize("field", ["prompt_tokens_details", "completion_tokens_details"])
+def test_non_counter_usage_detail_metadata_is_passed_through(field, details):
+    usage = {"prompt_tokens": 17, "completion_tokens": 44, "total_tokens": 61, field: details}
+    body = completion(usage=usage)
+    assert validate_chat_response(body) is body
+    state = ChatStreamIntegrity()
+    state.feed({**chunk(finish="stop"), "usage": usage})
+    state.finish()
+    assert state.provider_usage == usage
+
+
 @pytest.mark.parametrize("details", [None, {"cached_tokens": None, "audio_tokens": 0},
                                      {"reasoning_tokens": None, "accepted_prediction_tokens": 2}])
 @pytest.mark.parametrize("field", ["prompt_tokens_details", "completion_tokens_details"])
