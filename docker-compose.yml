@@ -7,11 +7,12 @@ services:
     environment:
       - DATABASE_URL=sqlite+aiosqlite:////data/rotor.db
       - CONVERSATION_STORE_DIR=/data/conversations
+      - CHAT_STORE_DIR=/data/chats
       - ROTOR_LOG_DIR=/data/logs
       - LOG_LEVEL=INFO
       # Set to true when serving the admin console over HTTPS.
       - ROTOR_ADMIN_COOKIE_SECURE=false
     volumes:
-      # Persists the SQLite database, conversations, and runtime logs.
+      # Persists the database, gateway records, user chats, attachments, and logs.
       - ./data:/data
     restart: unless-stopped

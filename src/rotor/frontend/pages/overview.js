@@ -1,17 +1,20 @@
 // Overview page — KPI cards + endpoints + system status.
 
-import { api } from "../api.js?v=2";
+import { api } from "../api.js?v=3";
 import { locale, t } from "../i18n.js";
+import { isAdmin, accountId } from "../session.js?v=1";
 import {
   escapeHtml, formatNumber, formatRequestCount, formatLatency, formatTimeInTimezone, badge, refreshIcons,
-  skeletonKpis, copy, toast,
+  skeletonKpis, copy,
 } from "../ui.js?v=12";
 import { sparkline } from "../charts.js";
 
 const HEALTH_WINDOW_MINUTES = 15;
 const FAILURE_WINDOW_HOURS = 24;
 
-let state = {
+const emptyState = () => ({
+  owner: accountId(),
+  admin: isAdmin(),
   stats: null,
   healthStats: null,
   channels: [],
@@ -19,22 +22,39 @@ let state = {
   recentFailures: [],
   latestSuccess: null,
   displayTimezone: "Asia/Shanghai",
-};
+  error: null,
+});
+let state = emptyState(), epoch = 0, controller = null;
 
 export async function load() {
   const container = document.getElementById("overview");
+  controller?.abort();
+  controller = new AbortController();
+  const signal = controller.signal;
+  const request = ++epoch, owner = accountId(), admin = isAdmin();
+  const current = () => request === epoch && owner === accountId() && admin === isAdmin();
+  const logs = admin ? "/api/admin/logs" : "/api/me/logs";
+  const read = (path, fallback) => api(path, { signal }).catch((error) => {
+    if (admin) return fallback;
+    throw error;
+  });
+  state = emptyState();
   skeletonKpis(container);
   try {
     const [stats, channels, timeline, healthStats, recentFailures, latestSuccess, settings] = await Promise.all([
-      api("/api/admin/logs/stats?days=7").catch(() => null),
-      api("/api/admin/channels").catch(() => []),
-      api("/api/admin/logs/timeseries?days=7&bucket=day").catch(() => []),
-      api(`/api/admin/logs/stats?${timeWindowQuery(HEALTH_WINDOW_MINUTES)}`).catch(() => null),
-      api(`/api/admin/logs?success=false&limit=5&${timeWindowQuery(FAILURE_WINDOW_HOURS * 60)}`).catch(() => []),
-      api("/api/admin/logs?success=true&limit=1").then((logs) => logs[0] || null).catch(() => null),
-      api("/api/admin/settings").catch(() => null),
+      read(`${logs}/stats?days=7`, null),
+      read(admin ? "/api/admin/channels" : `${logs}/channels`, []).then((rows) => admin ? rows : rows.map((row) => ({ id: row.channel_id, name: row.channel_name }))),
+      read(`${logs}/timeseries?days=7&bucket=day`, []),
+      read(`${logs}/stats?${timeWindowQuery(HEALTH_WINDOW_MINUTES)}`, null),
+      read(`${logs}?success=false&limit=5&${timeWindowQuery(FAILURE_WINDOW_HOURS * 60)}`, []),
+      read(`${logs}?success=true&limit=1`, []).then((rows) => rows[0] || null),
+      read(admin ? "/api/admin/settings" : "/api/me", null),
     ]);
+    if (!current()) return;
+    if (!admin && !settings?.display_timezone) throw new Error(t("usageTimezoneUnavailable"));
     state = {
+      owner,
+      admin,
       stats,
       channels,
       timeline,
@@ -45,13 +65,20 @@ export async function load() {
     };
     render();
   } catch (e) {
-    container.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><h3>${escapeHtml(e.message)}</h3></div>`;
-    refreshIcons(container);
+    if (!current()) return;
+    state.error = e.message;
+    render();
   }
 }
 
 export function render() {
   const container = document.getElementById("overview");
+  if (state.owner !== accountId() || state.admin !== isAdmin()) { container.innerHTML = ""; return; }
+  if (state.error) {
+    container.innerHTML = `<div class="empty-state" role="alert"><i data-lucide="alert-circle"></i><h3>${escapeHtml(state.error)}</h3></div>${renderEndpointSection()}`;
+    refreshIcons(container);
+    return;
+  }
   const s = state.stats || {};
   const successRate = s.total_requests ? ((s.success_requests / s.total_requests) * 100) : 0;
   const health = getHealthSummary();
@@ -64,12 +91,12 @@ export function render() {
     <div class="section-head">
       <div>
         <h2>${t("gatewayTitle")}</h2>
-        <p>${t("gatewayDescription")}</p>
+        <p>${t(state.admin ? "gatewayDescription" : "personalGatewayDescription")}</p>
       </div>
       ${badge(health.label, health.badgeType)}
     </div>
 
-    <div class="overview-summary-label">${t("last7Days")}</div>
+    <div class="overview-summary-label">${t(state.admin ? "last7Days" : "personalLast7Days")}</div>
     <div class="kpi-grid">
       <div class="kpi">
         <div class="kpi-label"><i data-lucide="activity"></i>${t("metrics")[0]}</div>
@@ -100,12 +127,7 @@ export function render() {
       ${renderFailuresCard()}
     </div>
 
-    <div class="section-head mt-6">
-      <div><h2>${t("endpoints") || "API Endpoints"}</h2><p>${t("gatewayDescription")}</p></div>
-    </div>
-    <div class="endpoint-grid">
-      ${renderEndpoints()}
-    </div>
+    ${renderEndpointSection()}
   `;
   refreshIcons(container);
 }
@@ -138,7 +160,7 @@ function getHealthSummary() {
   }
   if (!failed) {
     return {
-      label: t("healthy"),
+      label: t(state.admin ? "healthy" : "personalRequestsSucceeded"),
       badgeType: "success",
       icon: "check-circle-2",
       detail: t("allRecentRequestsSucceeded"),
@@ -149,7 +171,7 @@ function getHealthSummary() {
   }
   if (!succeeded) {
     return {
-      label: t("down"),
+      label: t(state.admin ? "down" : "personalRequestsFailed"),
       badgeType: "danger",
       icon: "circle-x",
       detail: t("allRecentRequestsFailed"),
@@ -159,7 +181,7 @@ function getHealthSummary() {
     };
   }
   return {
-    label: t("degraded"),
+    label: t(state.admin ? "degraded" : "personalRequestsPartiallyFailed"),
     badgeType: "warning",
     icon: "triangle-alert",
     detail: t("someRecentRequestsFailed"),
@@ -181,8 +203,8 @@ function renderHealthCard(health) {
     <section class="overview-insight-card overview-health-card">
       <div class="card-head">
         <div>
-          <div class="card-title">${t("systemStatus")}</div>
-          <div class="card-sub">${t("systemStatusHint")}</div>
+          <div class="card-title">${t(state.admin ? "systemStatus" : "personalRequestStatus")}</div>
+          <div class="card-sub">${t(state.admin ? "systemStatusHint" : "personalRequestStatusHint")}</div>
         </div>
         ${badge(health.label, health.badgeType)}
       </div>
@@ -228,8 +250,8 @@ function renderFailuresCard() {
     <section class="overview-insight-card overview-failures-card">
       <div class="card-head">
         <div>
-          <div class="card-title">${t("recentFailures")}</div>
-          <div class="card-sub">${t("recentFailuresHint")}</div>
+          <div class="card-title">${t(state.admin ? "recentFailures" : "personalRecentFailures")}</div>
+          <div class="card-sub">${t(state.admin ? "recentFailuresHint" : "personalRecentFailuresHint")}</div>
         </div>
         <button class="btn-ghost btn-sm" type="button" data-overview-open-logs>${t("viewAllLogs")}</button>
       </div>
@@ -251,6 +273,10 @@ function renderFailure(log) {
       </span>
       <time>${escapeHtml(formatTimeInTimezone(log.created_at, state.displayTimezone))}</time>
     </button>`;
+}
+
+function renderEndpointSection() {
+  return `<div class="section-head mt-6"><div><h2>${t("endpoints") || "API Endpoints"}</h2><p>${t(state.admin ? "gatewayDescription" : "personalGatewayDescription")}</p></div></div><div class="endpoint-grid">${renderEndpoints()}</div>`;
 }
 
 function renderEndpoints() {
@@ -294,3 +320,13 @@ export function onClick(target) {
   }
   return false;
 }
+
+export function unload() {
+  ++epoch;
+  controller?.abort();
+  controller = null;
+  state = emptyState();
+  const container = document.getElementById("overview");
+  if (container) container.innerHTML = "";
+}
+document.addEventListener("sessionended", unload);

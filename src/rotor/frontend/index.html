@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap">
-    <link rel="stylesheet" href="/styles.css?v=42">
+    <link rel="stylesheet" href="/styles.css?v=44">
     <script>
       // FOUC guard — must run before body paints.
       (function () {
@@ -45,7 +45,7 @@
           <button class="nav-item active" data-tab="overview">
             <i data-lucide="layout-dashboard"></i><span data-i18n="overview">接入信息</span>
           </button>
-          <button class="nav-item" data-tab="channels">
+          <button class="nav-item" data-tab="channels" data-admin-only>
             <i data-lucide="layers"></i><span data-i18n="channels">模型渠道</span>
           </button>
           <button class="nav-item" data-tab="tokens">
@@ -57,12 +57,13 @@
           <button class="nav-item" data-tab="logs">
             <i data-lucide="scroll-text"></i><span data-i18n="logs">请求日志</span>
           </button>
-          <button class="nav-item" data-tab="monitoring">
+          <button class="nav-item" data-tab="monitoring" data-admin-only>
             <i data-lucide="radio-tower"></i><span data-i18n="monitoringTitle">监控</span>
           </button>
           <button class="nav-item" data-tab="chat">
             <i data-lucide="messages-square"></i><span data-i18n="chatChat">对话</span>
           </button>
+          <button class="nav-item" data-tab="users" data-admin-only><i data-lucide="users"></i><span data-i18n="usersTitle">用户管理</span></button>
         </nav>
         <div class="sidebar-footer">
           <button class="nav-item" id="openSettings" type="button">
@@ -101,6 +102,7 @@
           <section id="logs" class="panel"></section>
           <section id="monitoring" class="panel"></section>
           <section id="chat" class="panel"></section>
+          <section id="users" class="panel"></section>
         </main>
       </div>
     </div>
@@ -277,18 +279,19 @@
               <button type="button" id="settingsTabGeneral" class="settings-nav-item active" role="tab" aria-selected="true" aria-controls="settingsGeneral" data-settings-tab="general">
                 <i data-lucide="sliders-horizontal"></i><span data-i18n="generalSettings">通用</span>
               </button>
-              <button type="button" id="settingsTabRouting" class="settings-nav-item" role="tab" aria-selected="false" aria-controls="settingsRouting" data-settings-tab="routing" tabindex="-1">
+              <button type="button" data-admin-setting id="settingsTabRouting" class="settings-nav-item" role="tab" aria-selected="false" aria-controls="settingsRouting" data-settings-tab="routing" tabindex="-1">
                 <i data-lucide="route"></i><span data-i18n="routingSettings">路由</span>
               </button>
+              <button type="button" id="settingsTabAccount" class="settings-nav-item" role="tab" aria-selected="false" aria-controls="settingsAccount" data-settings-tab="account" tabindex="-1"><i data-lucide="user-round"></i><span data-i18n="accountSettings">账户</span></button>
             </nav>
             <div class="settings-content">
-              <div id="settingsLoadNotice" class="settings-load-notice hidden" role="status">
+              <div data-admin-setting id="settingsLoadNotice" class="settings-load-notice hidden" role="status">
                 <span id="settingsLoadMessage"></span>
                 <button type="button" class="btn-secondary" id="settingsRetry" data-i18n="retrySettings">重试加载</button>
               </div>
               <section id="settingsGeneral" role="tabpanel" aria-labelledby="settingsTabGeneral" data-settings-panel="general">
                 <h3 data-i18n="generalSettings">通用</h3>
-                <p class="settings-section-description" data-i18n="generalSettingsDescription">调整此浏览器的显示偏好与服务端时区。</p>
+                <p id="settingsGeneralDescription" class="settings-section-description" data-i18n="generalSettingsDescription">调整此浏览器的显示偏好与服务端时区。</p>
                 <div class="settings-fields">
                   <div class="settings-preference">
                     <span id="settingsThemeLabel" data-i18n="appearanceSetting">外观</span>
@@ -304,7 +307,7 @@
                       <option value="en">English</option>
                     </select>
                   </label>
-                  <label class="settings-server-row">
+                  <label class="settings-server-row" data-admin-setting>
                     <span data-i18n="displayTimezone">日期与时间</span>
                     <small data-i18n="displayTimezoneDescription">用于用量和请求日志的自然日边界与日期范围。</small>
                     <input name="display_timezone" list="displayTimezoneOptions" data-server-setting disabled required>
@@ -315,6 +318,21 @@
                       <option value="America/New_York"></option><option value="Europe/London"></option>
                     </datalist>
                   </label>
+                </div>
+              </section>
+              <section id="settingsAccount" role="tabpanel" aria-labelledby="settingsTabAccount" data-settings-panel="account" hidden>
+                <h3 data-i18n="accountSettings">账户</h3>
+                <div class="settings-fields">
+                  <label><span data-i18n="adminUsername">用户名</span><output id="accountUsername" class="account-identity"></output></label>
+                  <span class="badge" id="accountRole"></span>
+                  <label><span data-i18n="displayName">显示名称</span><input id="accountDisplayName" maxlength="100"></label>
+                  <button type="button" class="btn-secondary" id="accountSave" data-i18n="saveProfile">保存资料</button>
+                  <label><span data-i18n="currentPassword">当前密码</span><input id="accountCurrentPassword" type="password" autocomplete="current-password"></label>
+                  <label><span data-i18n="newPassword">新密码</span><input id="accountNewPassword" type="password" autocomplete="new-password" minlength="6"></label>
+                  <label><span data-i18n="confirmPassword">确认密码</span><input id="accountConfirmPassword" type="password" autocomplete="new-password" minlength="6"></label>
+                  <button type="button" class="btn-secondary" id="accountPasswordSave" data-i18n="savePassword">保存新密码</button>
+                  <p id="accountStatus" role="status"></p>
+                  <button type="button" class="btn-secondary" id="accountLogout" data-i18n="signOut">退出登录</button>
                 </div>
               </section>
               <section id="settingsRouting" role="tabpanel" aria-labelledby="settingsTabRouting" data-settings-panel="routing" hidden>
@@ -359,7 +377,7 @@
               </section>
             </div>
           </div>
-          <footer class="modal-actions settings-actions">
+          <footer class="modal-actions settings-actions" id="settingsFooter">
             <span id="settingsStatus" role="status" aria-live="polite"></span>
             <div class="settings-action-buttons">
               <button type="submit" class="btn-primary" id="settingsSave" disabled>
@@ -388,7 +406,7 @@
       </div>
     </div>
 
-    <script src="/config.js?v=46"></script>
-    <script type="module" src="/auth.js?v=35"></script>
+    <script src="/config.js?v=51"></script>
+    <script type="module" src="/auth.js?v=40"></script>
   </body>
 </html>

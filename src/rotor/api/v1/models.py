@@ -6,6 +6,7 @@ from sqlalchemy import select, func
 
 from rotor.database import get_db
 from rotor.core.deps import get_current_token, get_optional_token
+from rotor.core.user_access import effective_permissions
 from rotor.models.channel import Channel
 from rotor.schemas.request import ModelInfo, ModelsResponse
 
@@ -27,8 +28,11 @@ async def list_models(
     query = select(Channel).where(Channel.enabled == True)
 
     # Filter by token's allowed channels if specified
-    if token and token.allowed_channels:
-        query = query.where(Channel.id.in_(token.allowed_channels))
+    model_ids = None
+    if token:
+        channel_ids, model_ids = await effective_permissions(token, db)
+        if channel_ids is not None:
+            query = query.where(Channel.id.in_(channel_ids))
 
     result = await db.execute(query)
     channels = result.scalars().all()
@@ -36,8 +40,9 @@ async def list_models(
     # Collect all unique models
     models = set()
     for channel in channels:
-        for model in channel.models:
-            models.add(model)
+        for model in [*(channel.models or []), *(channel.model_mapping or {})]:
+            if model_ids is None or model in model_ids:
+                models.add(model)
 
     # Create model info objects
     model_list = []

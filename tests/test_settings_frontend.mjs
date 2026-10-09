@@ -29,7 +29,7 @@ export function toggleLocale() {
 }
 `;
 
-async function environment({ storageFails = false, storedLocale, gap = 0, cachedI18n = false } = {}) {
+async function environment({ storageFails = false, storedLocale, gap = 0, cachedI18n = false, role = 'admin' } = {}) {
   const storage = new Map(storedLocale ? [['rotor.locale', storedLocale]] : []);
   const nodes = new Map();
   let document;
@@ -106,6 +106,8 @@ async function environment({ storageFails = false, storedLocale, gap = 0, cached
     const module = new vm.SourceTextModule(cachedI18n && name === 'i18n.js' ? cachedI18nSource : sources[name], { context, identifier: name });
     modules.set(name, module);
     await module.link(async (specifier) => {
+      if (specifier.startsWith('./session.js')) return new vm.SyntheticModule(['isAdmin'], function () { this.setExport('isAdmin', () => role === 'admin'); }, { context });
+      if (specifier.startsWith('./account.js')) return new vm.SyntheticModule(['initAccount'], function () { this.setExport('initAccount', () => ({ load() {} })); }, { context });
       if (specifier.startsWith('./api.js')) return new vm.SyntheticModule(['api'], function () {
         this.setExport('api', (path, options = {}) => new Promise((resolve, reject) => calls.push({ path, options, resolve, reject })));
       }, { context });
@@ -275,4 +277,14 @@ test('Settings links against cached i18n exports and language selection only tog
   select.value = 'en'; await select.emit('change'); assert.equal(h.events.length, initialEvents + 1);
   select.value = 'zh-CN'; await select.emit('change');
   assert.equal(h.document.documentElement.lang, 'zh-CN'); assert.equal(h.get('settingsModalTitle').textContent, '设置');
+});
+
+test('ordinary user settings never request admin settings and expose only General and Account', async () => {
+  const h = await environment({ role: 'user' }); h.controller.open();
+  assert.equal(h.calls.length, 0); assert.equal(h.get('settingsTabRouting').hidden, true);
+  assert.equal(h.get('settingsFooter').hidden, true); assert.equal(h.form.elements.display_timezone.closest('[data-admin-setting]').hidden, true);
+  await h.get('settingsTabGeneral').emit('keydown', { key: 'ArrowRight' });
+  assert.equal(h.get('settingsAccount').hidden, false); assert.equal(h.document.activeElement, h.get('settingsTabAccount'));
+  await h.submit(); assert.equal(h.calls.length, 0);
+  await h.get('settingsThemeDark').emit('click'); assert.equal(h.storage.get('rotor.theme'), 'dark');
 });

@@ -21,6 +21,7 @@ from rotor.models.admin_auth import (
     AdminLoginThrottle,
     AdminSession,
     AdminUser,
+    UserInvitation,
 )
 from rotor.models.channel import Channel
 from rotor.models.channel_oauth import ChannelOAuthSession
@@ -44,6 +45,7 @@ _REGISTERED_MODELS = (
     AdminLoginThrottle,
     AdminSession,
     AdminUser,
+    UserInvitation,
     Channel,
     ChannelOAuthSession,
     ConversationRecord,
@@ -57,6 +59,40 @@ _REGISTERED_MODELS = (
     Token,
     UsageLedger,
 )
+
+_PRE_USER_REVISION = "e1f2a3b4c5d6"
+_USER_COLUMNS = {
+    "admin_users": {"role", "display_name", "quota", "used_quota", "allowed_channels", "allowed_models", "default_token_id"},
+    "tokens": {"owner_id", "is_base", "allowed_models"},
+    "request_logs": {"owner_id"}, "usage_ledger": {"owner_id"}, "conversation_records": {"owner_id"},
+}
+_USER_INDEXES = {"ix_tokens_owner_id", "uq_tokens_owner_base", "ix_request_logs_owner_id", "ix_usage_ledger_owner_id", "ix_conversation_records_owner_id"}
+
+
+def _is_user_addition(difference):
+    operation = difference[0]
+    if operation == "add_table":
+        return difference[1].name == "user_invitations"
+    if operation == "add_column" and len(difference) == 4:
+        return difference[3].name in _USER_COLUMNS.get(difference[2], set())
+    if operation == "add_index":
+        return difference[1].name in _USER_INDEXES
+    if operation == "add_fk":
+        constraint = difference[1]
+        return (constraint.table.name == "tokens" and list(constraint.column_keys) == ["owner_id"]
+                and [element.target_fullname for element in constraint.elements] == ["admin_users.id"])
+    return False
+
+
+def _validate_user_schema_generation(connection):
+    schema = inspect(connection)
+    tables = set(schema.get_table_names())
+    observed = [(table, column) for table, columns in _USER_COLUMNS.items() if table in tables
+                for column in columns if column in {item["name"] for item in schema.get_columns(table)}]
+    expected = [(table, column) for table, columns in _USER_COLUMNS.items() for column in columns]
+    if (observed or "user_invitations" in tables) and (set(observed) != set(expected) or "user_invitations" not in tables):
+        raise LegacyDatabaseError("cannot safely adopt unversioned SQLite database: partial user ownership schema")
+
 
 _PRE_ADMIN_REVISION = "f6a7b8c9d0e1"
 _PRE_SCHEMA_PARITY_REVISION = "b8c9d0e1f2a3"
@@ -184,6 +220,7 @@ def _schema_parity_signature(
 
 
 def _legacy_revision(connection: Connection) -> str:
+    _validate_user_schema_generation(connection)
     context = MigrationContext.configure(
         connection,
         opts={"compare_type": True},
@@ -209,10 +246,15 @@ def _legacy_revision(connection: Connection) -> str:
     oauth_columns = []
     oauth_table_additions = 0
     callback_columns = []
+    user_additions = False
     for difference in diff_tuples:
         signature = _schema_parity_signature(difference)
         if signature is not None:
             parity_signatures.append(signature)
+        elif _is_user_addition(difference):
+            if "user_invitations" in inspect(connection).get_table_names():
+                raise LegacyDatabaseError("cannot safely adopt unversioned SQLite database: partial user ownership constraints")
+            user_additions = True
         elif _is_admin_addition(difference):
             admin_additions += 1
         elif (
@@ -291,6 +333,8 @@ def _legacy_revision(connection: Connection) -> str:
             )
         return _PRE_ADMIN_REVISION
 
+    if user_additions:
+        return _PRE_USER_REVISION
     raise LegacyDatabaseError(
         "cannot safely adopt unversioned SQLite database: "
         "its schema does not match a known Rotor release"

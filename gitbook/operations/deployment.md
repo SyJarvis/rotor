@@ -32,8 +32,9 @@ docker run --rm -p 8000:8000 \
   rotor
 ```
 
-镜像默认使用 `/data/rotor.db`、`/data/conversations/` 和 `/data/logs/`。把宿主机
-目录挂载到 `/data` 后，SQLite 数据库、Conversation store 和运行日志会一起持久化。
+镜像默认使用 `/data/rotor.db`、`/data/conversations/`、`/data/chats/` 和 `/data/logs/`。
+`CHAT_STORE_DIR=/data/chats` 保存按用户隔离的聊天 JSON 和附件。把宿主机目录挂载到
+`/data` 后，SQLite 数据库、网关请求记录、用户聊天与附件和运行日志会一起持久化。
 
 ## Docker Compose
 
@@ -44,8 +45,8 @@ docker compose up -d
 curl http://127.0.0.1:8000/health
 ```
 
-Compose 默认只把端口绑定到 `127.0.0.1`，并把 SQLite 数据库、会话和日志统一写入
-宿主机的 `./data/`。对外提供服务时，应在前面放置反向代理并设置
+Compose 默认只把端口绑定到 `127.0.0.1`，并把 SQLite 数据库、网关请求记录、
+用户聊天与附件和日志统一写入宿主机的 `./data/`。对外提供服务时，应在前面放置反向代理并设置
 `ROTOR_ADMIN_COOKIE_SECURE=true`。
 
 ## 数据库

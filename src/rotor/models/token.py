@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, func, ForeignKey, JSON
+from sqlalchemy import Index, text, Column, Integer, String, Boolean, DateTime, func, ForeignKey, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from rotor.database import Base
 from typing import Optional
@@ -14,6 +14,12 @@ class Token(Base):
     key: Mapped[str] = mapped_column(String(200), unique=True, index=True, nullable=False)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     user_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+
+    owner_id: Mapped[int | None] = mapped_column(ForeignKey("admin_users.id", ondelete="RESTRICT"), nullable=True, index=True)
+    is_base: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
+    allowed_models: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    __table_args__ = (Index("uq_tokens_owner_base", "owner_id", unique=True,
+                           sqlite_where=text("is_base = 1"), postgresql_where=text("is_base = true")),)
 
     # Quota management
     quota: Mapped[Optional[int]] = mapped_column(

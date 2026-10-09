@@ -72,7 +72,7 @@ async function environment({ listedChannels = [], channelDetails = {}, detailErr
     escapeHtml: (text) => String(text), toast: (...args) => toasts.push(args),
   };
   const context = vm.createContext({
-    document: { getElementById: getNode, querySelectorAll: () => [], addEventListener() {}, },
+    document: { getElementById: getNode, querySelectorAll: () => [], querySelector: () => null, addEventListener() {}, },
     window: {}, Element: class {},
     setTimeout: () => 1, clearTimeout() {},
     FormData: class { constructor(target) { this.target = target; } get(name) { return name === 'enabled' ? (this.target.elements.enabled.checked ? 'on' : null) : this.target.elements[name]?.value; } },
@@ -89,6 +89,7 @@ async function environment({ listedChannels = [], channelDetails = {}, detailErr
     if (specifier.includes('i18n.js')) return synthetic(['t', 'applyLocale', 'toggleLocale']);
     if (specifier.includes('ui.js')) return synthetic(['parseCsv', 'parseJson', 'refreshIcons', 'toast', 'escapeHtml', 'badge', 'statusBadge', 'skeletonCards', 'showInline', 'hideInline']);
     if (specifier.includes('theme.js')) return synthetic(['toggleTheme']);
+    if (specifier.includes('session.js')) return new vm.SyntheticModule(['isAdmin', 'actor'], function () { this.setExport('isAdmin', () => true); this.setExport('actor', () => ({ id: 1, role: 'admin' })); }, { context });
     if (specifier.includes('settings.js')) return synthetic(['initSettings']);
     if (specifier.includes('sidebar.js')) return synthetic(['initSidebar', 'closeSidebar']);
     if (specifier.includes('charts.js')) return synthetic(['refreshTheme']);

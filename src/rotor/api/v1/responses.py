@@ -27,6 +27,7 @@ from rotor.adapters.protocol.responses import (
     validate_responses_response,
 )
 from rotor.core.deps import get_available_channels, get_current_token
+from rotor.core.user_access import effective_permissions
 from rotor.core.client_session import resolve_client_session
 from rotor.core.header_forwarding import snapshot_inbound_headers
 from rotor.application_settings import application_settings
@@ -409,13 +410,15 @@ async def create_response(
         if previous_route is None:
             raise HTTPException(status_code=404, detail="Response not found")
         previous_channel = await db.get(Channel, previous_route.channel_id)
+        channel_ids, model_ids = await effective_permissions(token, db)
         if (
             previous_channel is None
+            or (model_ids is not None and request.model not in model_ids)
             or str(previous_channel.protocol or "").lower()
             not in {"responses", "openai_responses"}
             or (
-                token.allowed_channels
-                and previous_channel.id not in token.allowed_channels
+                channel_ids is not None
+                and previous_channel.id not in channel_ids
             )
         ):
             raise HTTPException(status_code=404, detail="Response not found")
@@ -827,12 +830,14 @@ async def _resolve_response_channel(
     if route is None:
         raise HTTPException(status_code=404, detail="Response not found")
     channel = await db.get(Channel, route.channel_id)
+    channel_ids, model_ids = await effective_permissions(token, db)
     if (
         channel is None
         or str(channel.protocol or "").lower()
         not in {"responses", "openai_responses"}
         or str(channel.type or "").lower() == "openai_codex"
-        or (token.allowed_channels and channel.id not in token.allowed_channels)
+        or (channel_ids is not None and channel.id not in channel_ids)
+        or (model_ids is not None and route.model not in model_ids)
     ):
         # Do not disclose whether another token owns a response or whether its
         # original channel has since been removed from this token's access.

@@ -31,8 +31,9 @@ Pydantic Settings 从当前目录的 `.env` 和进程环境读取大写字段。
 | `CONNECT_TIMEOUT` | `10.0` | 上游连接超时秒数 |
 | `WRITE_TIMEOUT` | `30.0` | 上游写入超时秒数 |
 | `POOL_TIMEOUT` | `10.0` | HTTP 连接池等待秒数 |
-| `CONVERSATION_STORE_ENABLED` | `true` | 是否启用会话存储 |
-| `CONVERSATION_STORE_DIR` | `~/.cache/rotor/conversations` | 会话文件目录 |
+| `CHAT_STORE_DIR` | `~/.cache/rotor/chats` | 按用户 ID 隔离的聊天 JSON 与附件目录 |
+| `CONVERSATION_STORE_ENABLED` | `true` | 是否启用网关请求记录存储 |
+| `CONVERSATION_STORE_DIR` | `~/.cache/rotor/conversations` | 网关请求记录文件目录 |
 | `SAVE_CONVERSATION_BODY` | `true` | 是否保存会话请求正文 |
 | `SAVE_PROVIDER_RESPONSE` | `true` | 是否保存清理后的上游响应 |
 | `CONVERSATION_QUEUE_MAXSIZE` | `10000` | 会话异步写入队列容量 |
@@ -44,6 +45,11 @@ CORS_ORIGINS=["https://admin.example.com"]
 ```
 
 环境变量在进程启动时读取，修改后需要重启 Rotor。
+
+用户聊天在 `CHAT_STORE_DIR/<user_id>/index.json` 保存索引，在
+`<user_id>/<conversation_id>/conversation.json` 保存对话、设置与草稿，在同一会话的
+`attachments/` 目录保存附件。该目录独立于 `CONVERSATION_STORE_DIR`，不受
+`CONVERSATION_STORE_ENABLED` 控制；旧浏览器本地历史和网关请求记录均不迁移为聊天。
 
 旧的 `ROTOR_MINDAGENT_MCP_COMMAND`、`ROTOR_MINDAGENT_MCP_ARGS` 和
 `ROTOR_MINDAGENT_MCP_CWD` 配置已停用；升级时兼容忽略，不会启动 MCP 子进程。

@@ -12,25 +12,24 @@ import uuid
 import zipfile
 from collections.abc import AsyncIterator
 from contextlib import aclosing
-from datetime import datetime, timezone
 from pathlib import PurePath
 from typing import Any, Literal
 from xml.etree import ElementTree
 
 import anyio
 import httpx2
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from openai import APIError, APIStatusError, AsyncOpenAI
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
-from sqlalchemy import select
 
 from rotor.api.v1.chat import chat_completions
 from rotor.api.v1.responses import create_response
 from rotor.core.openai_errors import openai_error_response
 from rotor.core.exceptions import _sanitize_provider_value
+from rotor.core.admin_auth import AdminActor, require_admin_access
+from rotor.core.user_access import accessible_models, resolve_default_chat_token, validate_token_access
 from rotor.database import async_session_maker
-from rotor.models.channel import Channel
 from rotor.models.token import Token
 from rotor.schemas.request import ChatCompletionRequest
 from rotor.schemas.responses import ResponsesRequest
@@ -206,53 +205,27 @@ class AdminChatRequest(ChatSettings):
         return self
 
 
-def _token_is_usable(token: Token) -> bool:
-    if not token.enabled or token.expired:
-        return False
-    if token.quota is not None and (token.used_quota or 0) >= token.quota:
-        return False
-    if token.expire_time is None:
-        return True
-    expires = token.expire_time
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    return expires > datetime.now(timezone.utc)
-
-
-async def _chat_access() -> tuple[list[Token], list[Channel]]:
-    async with async_session_maker() as db:
-        tokens = (await db.execute(select(Token).order_by(Token.id.asc()))).scalars().all()
-        channels = (await db.execute(
-            select(Channel).where(Channel.enabled.is_(True)).order_by(Channel.id.asc())
-        )).scalars().all()
-        return [token for token in tokens if _token_is_usable(token)], list(channels)
-
-
-def _accessible_models(token: Token, channels: list[Channel]) -> set[str]:
-    return {
-        model
-        for channel in channels
-        if not token.allowed_channels or channel.id in token.allowed_channels
-        for model in [*(channel.models or []), *(channel.model_mapping or {})]
-    }
-
-
-async def _chat_token(model: str) -> Token:
-    tokens, channels = await _chat_access()
-    if not tokens:
-        raise HTTPException(400, "没有可用的 Rotor API Key，请先在 API Key 页面创建或启用")
-    for token in tokens:
-        if model in _accessible_models(token, channels):
-            return token
-    raise HTTPException(404, "此模型没有可访问的已启用渠道，请检查模型与 API Key 权限")
+async def _chat_token(model: str, actor: AdminActor) -> Token:
+    return await resolve_default_chat_token(actor, model)
 
 
 @router.get("/models")
-async def chat_models() -> dict[str, Any]:
-    tokens, channels = await _chat_access()
+async def chat_models(actor: AdminActor = Depends(require_admin_access)) -> dict[str, Any]:
+    return await models_for_user(actor)
+
+
+async def models_for_user(actor: AdminActor) -> dict[str, Any]:
+    try:
+        token = await resolve_default_chat_token(actor)
+    except HTTPException as exc:
+        if exc.status_code not in {400, 403, 404, 429}:
+            raise
+        return {"models": [], "token_available": False, "message": str(exc.detail)}
+    async with async_session_maker() as db:
+        models = await accessible_models(token, db)
     return {
-        "models": sorted({model for token in tokens for model in _accessible_models(token, channels)}),
-        "token_available": bool(tokens),
+        "models": sorted(models),
+        "token_available": True,
     }
 
 
@@ -378,21 +351,28 @@ class _GatewayTransport(httpx2.AsyncBaseTransport):
             "type": "http", "method": "POST", "path": request.url.path,
             "headers": [(b"x-conversation-id", self.conversation_id.encode("ascii"))],
             "client": self.http_request.scope.get("client"),
-            "state": {"request_origin": "admin_chat"},
+            "state": {"request_origin": "user_chat" if self.http_request.url.path.startswith("/api/chat/") else "admin_chat"},
         })
         session = async_session_maker()
         db = await session.__aenter__()
         try:
+            token = self.token
+            if getattr(token, "owner_id", None) is not None:
+                fresh = await db.get(Token, token.id, populate_existing=True)
+                if fresh is None or fresh.owner_id != token.owner_id:
+                    raise HTTPException(403, "Default API Key is no longer available")
+                await validate_token_access(fresh, db)
+                token = fresh
             if request.url.path == "/v1/responses":
                 response = await create_response(
-                    ResponsesRequest.model_validate(payload), gateway_request, Response(), db, self.token,
+                    ResponsesRequest.model_validate(payload), gateway_request, Response(), db, token,
                 )
             else:
                 parsed = ChatCompletionRequest.model_validate(payload)
                 for field in ("temperature", "top_p", "n", "presence_penalty", "frequency_penalty"):
                     if field not in payload:
                         setattr(parsed, field, None)
-                response = await chat_completions(parsed, gateway_request, Response(), db, self.token)
+                response = await chat_completions(parsed, gateway_request, Response(), db, token)
             if isinstance(response, StreamingResponse):
                 stream = _GatewayStream(response, session, self)
                 self.streams.add(stream)
@@ -485,8 +465,8 @@ async def _safe_chat_stream(request: AdminChatRequest, http_request: Request, to
 
 
 @router.post("/completions")
-async def admin_chat(request: AdminChatRequest, http_request: Request) -> StreamingResponse:
-    token = await _chat_token(request.model)
+async def admin_chat(request: AdminChatRequest, http_request: Request, actor: AdminActor = Depends(require_admin_access)) -> StreamingResponse:
+    token = await _chat_token(request.model, actor)
     return StreamingResponse(
         _safe_chat_stream(request, http_request, token), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -494,8 +474,12 @@ async def admin_chat(request: AdminChatRequest, http_request: Request) -> Stream
 
 
 @router.post("/test")
-async def test_connection(settings: ChatSettings, http_request: Request) -> dict[str, Any]:
-    token = await _chat_token(settings.model)
+async def test_connection(settings: ChatSettings, http_request: Request, actor: AdminActor = Depends(require_admin_access)) -> dict[str, Any]:
+    return await test_connection_for_user(settings, http_request, actor)
+
+
+async def test_connection_for_user(settings: ChatSettings, http_request: Request, actor: AdminActor) -> dict[str, Any]:
+    token = await _chat_token(settings.model, actor)
     request = AdminChatRequest(
         **settings.model_dump(),
         conversation_id=f"connection-test-{uuid.uuid4().hex}",

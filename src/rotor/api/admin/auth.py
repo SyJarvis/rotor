@@ -50,6 +50,8 @@ router = APIRouter(prefix="/auth", tags=["admin-auth"])
 
 def _actor_response(actor: AdminActor) -> AdminActorResponse:
     return AdminActorResponse(
+        id=actor.user_id, user_id=actor.user_id, role=actor.role,
+        display_name=actor.display_name, default_token_id=actor.default_token_id,
         actor_id=actor.actor_id,
         username=actor.username,
         auth_method=actor.auth_method,
@@ -173,7 +175,9 @@ async def login(
         auth_method="session",
         must_change_password=user.must_change_password,
         admin_user_id=user.id,
-        session_id=session.id,
+        session_id=session.id, role=user.role,
+        display_name=user.display_name or user.username,
+        default_token_id=user.default_token_id,
     ))
 
 
@@ -265,6 +269,8 @@ async def change_password(
     )
     await db.commit()
     return AdminActorResponse(
+        id=user.id, user_id=user.id, role=user.role,
+        display_name=user.display_name or user.username, default_token_id=user.default_token_id,
         actor_id=actor.actor_id,
         username=user.username,
         auth_method="session",

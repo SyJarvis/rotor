@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     ROTOR_LOG_DIR: str = str(DEFAULT_CACHE_DIR / "logs")
 
     # Conversation storage
+    CHAT_STORE_DIR: str = str(DEFAULT_CACHE_DIR / "chats")
+
     CONVERSATION_STORE_ENABLED: bool = True
     CONVERSATION_STORE_DIR: str = str(DEFAULT_CACHE_DIR / "conversations")
     SAVE_CONVERSATION_BODY: bool = True

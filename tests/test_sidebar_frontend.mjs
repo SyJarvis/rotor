@@ -145,7 +145,7 @@ test('missing or invalid saved preferences start expanded and storage failures r
 
 test('every collapsed navigation and settings button retains its action and accessible name', async () => {
   const env = await environment({ saved: 'true' });
-  assert.equal(env.navigation.length, 8);
+  assert.equal(env.navigation.length, 9);
   for (const item of env.navigation) {
     assert.ok(item.getAttribute('aria-label'));
     item.dispatch('mouseenter');
@@ -157,7 +157,7 @@ test('every collapsed navigation and settings button retains its action and acce
     assert.equal(env.tooltip.hidden, true);
     assert.equal(env.collapsed(), true);
   }
-  assert.deepEqual(env.actions, ['overview', 'channels', 'tokens', 'usage', 'logs', 'monitoring', 'chat', 'openSettings']);
+  assert.deepEqual(env.actions, ['overview', 'channels', 'tokens', 'usage', 'logs', 'monitoring', 'chat', 'users', 'openSettings']);
   assert.equal(env.overlays().length, 0);
 });
 

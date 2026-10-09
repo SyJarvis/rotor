@@ -114,9 +114,10 @@ docker run --rm \
   rotor
 ```
 
-The image stores SQLite at `/data/rotor.db`, the conversation store under
-`/data/conversations/`, and runtime logs under `/data/logs/` by default. The
-single mount above persists all of them under `~/.cache/rotor/` on the host.
+The image stores SQLite at `/data/rotor.db`, gateway request records under
+`/data/conversations/`, user chats and attachments under `/data/chats/`, and runtime
+logs under `/data/logs/` by default. The single mount above persists all of them
+under `~/.cache/rotor/` on the host.
 
 Run Rotor with Docker Compose and keep runtime data in `./data`:
 
@@ -126,8 +127,8 @@ docker compose logs -f rotor
 ```
 
 The repository Compose file uses SQLite, binds the port to `127.0.0.1` only, and
-mounts the database, conversation store, and runtime logs under `./data/` on the
-host. The current Docker configuration runs Rotor only. `rotor-mcp` is intended
+mounts the database, gateway request records, user chats, attachments, and runtime
+logs under `./data/` on the host. The current Docker configuration runs Rotor only. `rotor-mcp` is intended
 to use a separate image.
 
 ## Make your first request
@@ -249,9 +250,16 @@ database-backed `rck_` credential under **API Keys → MCP Control Keys**. The
 full value is shown only once, can be disabled or deleted independently, and
 does not accept ordinary `sk-` user tokens.
 
-## Admin chat
+## User chat
 
-Admin chat uses the OpenAI SDK to call the Rotor gateway, retaining channel
+Administrators and regular users can chat after signing in. Administrators can
+create accounts or issue invitation codes to enter on the registration page. Each
+new account receives a `base` Key. Model listings, connection tests, and chat
+requests use the account’s current default Key and respect both account and Key
+quotas, channel access, and model restrictions. If the default Key is unavailable,
+resolve its status or select another default Key.
+
+Chat uses the OpenAI SDK to call the Rotor gateway, retaining channel
 routing, usage accounting, and request logging. Chat Completions is the
 default protocol; Responses is also available. Each conversation saves its
 own model, API format, System Prompt, temperature, and max_tokens in the right-hand
@@ -271,20 +279,25 @@ a stricter limit of 500,000 bytes. PDFs are limited to 100 pages, and each
 PDF/DOCX document to 500,000 extracted characters. Exceeding a limit returns
 an explicit error.
 
-Conversation history stays in the current browser and can be created,
-exported as JSON, or deleted. It does not sync across browsers. Existing
-conversations are retained; attachment content not saved by older versions
-cannot be recovered, and the UI asks you to attach those files again. This history
-is separate from the gateway request records in `CONVERSATION_STORE_DIR`.
-Admin chat does not require an MCP command or a Control token; configure the
-independent Rotor MCP service separately as described above.
+Conversations, settings, and drafts are stored on the server in `CHAT_STORE_DIR`,
+isolated by user ID. Signing in to the same account in another browser gives access
+to the saved content. Each user has an `index.json`; each conversation directory
+contains `conversation.json` and an `attachments/` directory for attachment files.
+The **…** menu on each history item exports JSON (including readable attachment
+content) or deletes the conversation and its attachments.
+
+Older browser-local conversations are not migrated, and gateway request records
+in `CONVERSATION_STORE_DIR` are not imported into chat history. These server
+stores are independent. User chat does not require an MCP command or a Control
+token; configure the independent Rotor MCP service separately as described above.
 
 ## Important configuration
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
 | `DATABASE_URL` | `sqlite+aiosqlite:///~/.cache/rotor/rotor.db` | Primary database |
-| `CONVERSATION_STORE_DIR` | `~/.cache/rotor/conversations` | Conversation storage |
+| `CHAT_STORE_DIR` | `~/.cache/rotor/chats` | User-isolated chat JSON and attachment storage |
+| `CONVERSATION_STORE_DIR` | `~/.cache/rotor/conversations` | Gateway request record storage |
 | `ROTOR_LOG_DIR` | `~/.cache/rotor/logs` | Runtime logs, grouped into monthly directories and daily files |
 | `LOG_LEVEL` | `INFO` | Logging; `DEBUG` also enables API documentation |
 | `ROTOR_DEFAULT_ADMIN_USERNAME` | `admin` | Administrator username used only when initializing an empty database |

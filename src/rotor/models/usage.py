@@ -17,6 +17,7 @@ class UsageLedger(Base):
     conversation_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
 
     user_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    owner_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     token_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     channel_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
 

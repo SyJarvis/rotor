@@ -31,6 +31,13 @@ class AdminActor:
     must_change_password: bool
     admin_user_id: int
     session_id: int
+    role: str = "admin"
+    display_name: str = ""
+    default_token_id: int | None = None
+
+    @property
+    def user_id(self) -> int:
+        return self.admin_user_id
 
 
 def hash_admin_password(password: str) -> str:
@@ -70,8 +77,11 @@ def verify_admin_password(password: str, encoded: str) -> bool:
 
 
 async def ensure_default_admin(db: AsyncSession) -> AdminUser:
-    existing = await db.scalar(select(AdminUser).limit(1))
+    existing = await db.scalar(select(AdminUser).where(AdminUser.role == "admin").order_by(AdminUser.id).limit(1))
     if existing is not None:
+        from rotor.core.user_access import ensure_base_token
+        await ensure_base_token(db, existing)
+        await db.commit()
         return existing
 
     password_hash = await asyncio.to_thread(
@@ -79,19 +89,24 @@ async def ensure_default_admin(db: AsyncSession) -> AdminUser:
     )
     admin = AdminUser(
         username=settings.ROTOR_DEFAULT_ADMIN_USERNAME,
+        role="admin", display_name=settings.ROTOR_DEFAULT_ADMIN_USERNAME,
+        quota=None, allowed_channels=None,
         password_hash=password_hash,
         enabled=True,
         must_change_password=True,
     )
     db.add(admin)
     try:
+        await db.flush()
+        from rotor.core.user_access import ensure_base_token
+        await ensure_base_token(db, admin)
         await db.commit()
     except IntegrityError:
         await db.rollback()
         existing = await find_admin_user(
             db, settings.ROTOR_DEFAULT_ADMIN_USERNAME
         )
-        if existing is None:
+        if existing is None or existing.role != "admin":
             raise
         return existing
     await db.refresh(admin)
@@ -220,12 +235,22 @@ async def require_admin_actor(
         must_change_password=user.must_change_password,
         admin_user_id=user.id,
         session_id=session.id,
+        role=user.role, display_name=user.display_name or user.username,
+        default_token_id=user.default_token_id,
     )
 
 
-async def require_admin_access(
+async def require_user_access(
     actor: AdminActor = Depends(require_admin_actor),
 ) -> AdminActor:
     if actor.must_change_password:
         raise password_change_required_error()
+    return actor
+
+
+async def require_admin_access(
+    actor: AdminActor = Depends(require_user_access),
+) -> AdminActor:
+    if actor.role != "admin":
+        raise HTTPException(403, "Administrator access required")
     return actor

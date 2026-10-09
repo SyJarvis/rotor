@@ -13,6 +13,7 @@ class RequestLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
 
     # Request info
+    owner_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     token_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     channel_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     model: Mapped[str] = mapped_column(String(100), nullable=False, index=True)

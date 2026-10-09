@@ -1,7 +1,10 @@
-const SESSION_ENDPOINT = "/api/admin/auth/me";
-const LOGIN_ENDPOINT = "/api/admin/auth/login";
-const CHANGE_PASSWORD_ENDPOINT = "/api/admin/auth/change-password";
-const LOGOUT_ENDPOINT = "/api/admin/auth/logout";
+import { setActor, endSession } from "./session.js?v=1";
+
+const SESSION_ENDPOINT = "/api/auth/me";
+const LOGIN_ENDPOINT = "/api/auth/login";
+const CHANGE_PASSWORD_ENDPOINT = "/api/auth/change-password";
+const LOGOUT_ENDPOINT = "/api/auth/logout";
+const registrationRequested = new URL(window.location.href).searchParams.get("register") === "1";
 
 let appLoaded = false;
 
@@ -40,7 +43,7 @@ function authScreen() {
         <form id="adminLoginForm">
           <label>
             <span>${text.adminUsername}</span>
-            <input name="username" autocomplete="username" value="admin" required>
+            <input name="username" autocomplete="username" required>
           </label>
           <label>
             <span>${text.adminPassword}</span>
@@ -53,6 +56,19 @@ function authScreen() {
           </label>
           <p class="auth-error hidden" data-auth-error role="alert"></p>
           <button type="submit" class="btn-primary">${text.signIn}</button>
+        </form>
+        <a href="?register=1" class="auth-switch" id="openRegistration">${text.inviteRegister}</a>
+      </section>
+      <section id="registerPanel" class="hidden">
+        <h1>${text.inviteRegister}</h1><p>${text.inviteOnly}</p>
+        <form id="registerForm">
+          <label><span>${text.invitationCode}</span><input name="invite_token" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
+          <label><span>${text.adminUsername}</span><input name="username" autocomplete="username" required></label>
+          <label><span>${text.adminPassword}</span><input name="password" type="password" autocomplete="new-password" minlength="6" required></label>
+          <label><span>${text.registerConfirmPassword}</span><input name="confirm_password" type="password" autocomplete="new-password" minlength="6" required></label>
+          <p class="auth-error hidden" data-auth-error role="alert"></p>
+          <button type="submit" class="btn-primary">${text.inviteRegister}</button>
+          <button type="button" class="btn-secondary" id="backToLogin">${text.backToLogin}</button>
         </form>
       </section>
       <section id="adminStartupPanel" class="hidden">
@@ -104,6 +120,9 @@ function authScreen() {
     ?.addEventListener("submit", submitLogin);
   screen.querySelector("#adminPasswordForm")
     ?.addEventListener("submit", submitPasswordChange);
+  screen.querySelector("#registerForm")?.addEventListener("submit", submitRegister);
+  screen.querySelector("#openRegistration")?.addEventListener("click", (event) => { event.preventDefault(); switchAuthPage(true); });
+  screen.querySelector("#backToLogin")?.addEventListener("click", () => switchAuthPage(false));
   screen.querySelector("#adminReloadApp")
     ?.addEventListener("click", () => window.location.reload());
   return screen;
@@ -127,21 +146,28 @@ function showLogin(message = "") {
   showPanel("adminLoginPanel", message);
 }
 
+function switchAuthPage(register) {
+  window.history.replaceState(null, "", `${window.location.pathname}${register ? "?register=1" : ""}`);
+  showPanel(register ? "registerPanel" : "adminLoginPanel");
+}
+
 function showPasswordChange(message = "") {
   showPanel("adminPasswordPanel", message);
 }
 
 async function startApp(actor) {
+  if (appLoaded) { window.location.reload(); return; }
+  setActor(actor);
   if (actor.must_change_password) {
     showPasswordChange();
     return;
   }
-  authScreen().classList.add("hidden");
-  document.body.classList.remove("auth-pending");
   if (!appLoaded) {
     try {
-      await import("./app.js?v=56");
+      await import("./app.js?v=60");
       appLoaded = true;
+      authScreen().classList.add("hidden");
+      document.body.classList.remove("auth-pending");
     } catch {
       showPanel("adminStartupPanel", labels().adminAppLoadRetry);
     }
@@ -217,7 +243,30 @@ async function submitPasswordChange(event) {
   }
 }
 
+async function submitRegister(event) {
+  event.preventDefault();
+  const form = event.currentTarget, button = form.querySelector("button[type=submit]");
+  if (button.disabled) return;
+  const values = new FormData(form);
+  const inviteToken = String(values.get("invite_token") || "").trim();
+  const password = String(values.get("password") || "");
+  if (!inviteToken) { showPanel("registerPanel", labels().invitationCodeRequired); return; }
+  if (password.length < 6) { showPanel("registerPanel", labels().passwordMinimum); return; }
+  if (password !== values.get("confirm_password")) { showPanel("registerPanel", labels().registerPasswordMismatch); return; }
+  button.disabled = true;
+  try {
+    const response = await fetch("/api/auth/register", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ invite_token: inviteToken, username: values.get("username"), password }) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : labels().registrationFailed);
+    form.reset();
+    window.history.replaceState(null, "", window.location.pathname);
+    await startApp(result);
+  } catch (error) { showPanel("registerPanel", error.message || labels().registrationFailed); }
+  finally { button.disabled = false; }
+}
+
 async function logout() {
+  endSession();
   const csrf = csrfToken();
   await fetch(LOGOUT_ENDPOINT, {
     method: "POST",
@@ -228,9 +277,11 @@ async function logout() {
 }
 
 window.addEventListener("rotorauthrequired", () => {
+  endSession();
   showLogin(labels().adminSessionExpired);
 });
 document.getElementById("logoutBtn")?.addEventListener("click", logout);
+window.addEventListener("rotorlogout", logout);
 
 try {
   const response = await fetch(SESSION_ENDPOINT, {
@@ -238,7 +289,8 @@ try {
     cache: "no-store",
   });
   if (response.ok) await startApp(await response.json());
+  else if (registrationRequested) showPanel("registerPanel");
   else showLogin();
 } catch {
-  showLogin(labels().adminServiceUnavailable);
+  showPanel(registrationRequested ? "registerPanel" : "adminLoginPanel", labels().adminServiceUnavailable);
 }

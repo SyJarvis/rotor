@@ -3,6 +3,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.core.deps import get_current_token
+from rotor.core.user_access import effective_permissions
 from rotor.database import get_db
 from rotor.models.channel import Channel
 from rotor.models.token import Token
@@ -23,14 +24,15 @@ async def list_models(
     if after_id is not None and before_id is not None:
         raise HTTPException(400, "Specify only one pagination cursor")
     query = select(Channel).where(Channel.enabled.is_(True))
-    if token.allowed_channels:
-        query = query.where(Channel.id.in_(token.allowed_channels))
+    channel_ids, model_ids_allowed = await effective_permissions(token, db)
+    if channel_ids is not None:
+        query = query.where(Channel.id.in_(channel_ids))
     result = await db.execute(query)
     model_ids = sorted({
         model
         for channel in result.scalars().all()
         for model in [*(channel.models or []), *(channel.model_mapping or {})]
-        if isinstance(model, str) and model.strip()
+        if isinstance(model, str) and model.strip() and (model_ids_allowed is None or model in model_ids_allowed)
     })
     cursor = after_id if after_id is not None else before_id
     if cursor is not None and cursor not in model_ids:

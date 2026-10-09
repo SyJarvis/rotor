@@ -103,13 +103,15 @@ body.auth-pending .app-shell { visibility: hidden; }
   z-index: 2000;
   display: grid;
   place-items: center;
-  padding: 24px;
+  align-items: safe center;
+  overflow-y: auto;
+  padding: clamp(12px, 3vw, 24px);
   background: var(--bg);
 }
 
 .auth-card {
   width: min(420px, 100%);
-  padding: 32px;
+  padding: clamp(20px, 5vw, 32px);
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   background: var(--panel);
@@ -142,6 +144,7 @@ body.auth-pending .app-shell { visibility: hidden; }
   font: 14px var(--font-mono);
 }
 .auth-card button { justify-content: center; }
+.auth-switch { display: block; margin-top: 20px; text-align: center; }
 .auth-error { color: var(--danger); }
 
 h1, h2, h3, h4 { margin: 0; color: var(--text-strong); font-weight: 600; }
@@ -2528,3 +2531,18 @@ svg.lucide { flex-shrink: 0; stroke-width: 1.5; }
   .performance-section { padding: 14px; }
   .performance-actions { width: 100%; justify-content: space-between; }
 }
+
+/* Account access and server chat feedback. */
+[data-admin-only][hidden], [data-admin-setting][hidden] { display: none !important; }
+.chat-sync-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; color: var(--danger); font-size: 12px; }
+.chat-sync-status.hidden { display: none; }
+.chat-sync-status button { flex-shrink: 0; }
+.user-display-name { display: block; color: var(--muted); }
+.user-search { width: min(100%, 360px); margin-bottom: 16px; padding: 9px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); color: var(--text); }
+.invitation-result { display: grid; gap: 12px; margin: 16px 0; }
+.invitation-result input { min-width: 0; width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); color: var(--text); }
+.report-scope { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-bottom: 16px; }
+#accountStatus.error { color: var(--danger); }
+@media (max-width: 480px) { .chat-sync-status { flex-wrap: wrap; } .settings-nav { gap: 2px; } .settings-nav-item { padding-inline: 8px; } }
+
+.account-identity { display: block; min-height: 36px; padding: 9px 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-2); overflow-wrap: anywhere; }

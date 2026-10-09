@@ -191,6 +191,11 @@ class RequestLogDetailResponse(RequestLogResponse):
     response_body: Optional[dict] = None
 
 
+def _owner_conditions(db) -> list:
+    owner_id = getattr(db, "info", {}).get("log_owner_id")
+    return [RequestLog.owner_id == owner_id] if owner_id is not None else []
+
+
 def _log_filter_conditions(
     *,
     token_id: int | None = None,
@@ -269,6 +274,7 @@ async def list_logs(
         start_time=start_time,
         end_time=end_time,
     )
+    conditions.extend(_owner_conditions(db))
 
     query = select(RequestLog)
 
@@ -322,6 +328,7 @@ async def count_logs(
         start_time=start_time,
         end_time=end_time,
     )
+    conditions.extend(_owner_conditions(db))
     query = select(func.count(RequestLog.id))
     if conditions:
         query = query.where(and_(*conditions))
@@ -363,7 +370,7 @@ async def get_log_stats(
     )
 
     # Build conditions
-    conditions = [RequestLog.created_at >= start_time]
+    conditions = _owner_conditions(db) + [RequestLog.created_at >= start_time]
     if end_time is not None:
         conditions.append(RequestLog.created_at < end_time)
 
@@ -471,6 +478,7 @@ async def get_channel_usage(
         token_id=token_id, channel_id=channel_id, model=model,
         start_time=start_time, end_time=end_time,
     )
+    conditions.extend(_owner_conditions(db))
     rows = (await db.execute(
         select(
             RequestLog.channel_id,
@@ -533,7 +541,7 @@ async def get_log_timeseries(
         period_date=period_date,
     )
 
-    conditions = [RequestLog.created_at >= start_time]
+    conditions = _owner_conditions(db) + [RequestLog.created_at >= start_time]
     if end_time is not None:
         conditions.append(RequestLog.created_at < end_time)
     if token_id is not None:
@@ -623,7 +631,7 @@ async def get_log_timeseries_by_model(
             end_date=end_date,
         )
 
-    conditions = [RequestLog.created_at >= start_time]
+    conditions = _owner_conditions(db) + [RequestLog.created_at >= start_time]
     if end_time is not None:
         conditions.append(RequestLog.created_at < end_time)
     if channel_id is not None:
@@ -710,7 +718,7 @@ async def get_model_usage(
         period=period,
         period_date=period_date,
     )
-    conditions = [RequestLog.created_at >= start_time]
+    conditions = _owner_conditions(db) + [RequestLog.created_at >= start_time]
     if end_time is not None:
         conditions.append(RequestLog.created_at < end_time)
     if channel_id is not None:
@@ -801,7 +809,7 @@ async def get_log(
     db: AsyncSession = Depends(get_db),
 ):
     """Get full request log detail (including request/response bodies)."""
-    result = await db.execute(select(RequestLog).where(RequestLog.id == log_id))
+    result = await db.execute(select(RequestLog).where(RequestLog.id == log_id, *_owner_conditions(db)))
     log = result.scalar_one_or_none()
     if not log:
         raise HTTPException(

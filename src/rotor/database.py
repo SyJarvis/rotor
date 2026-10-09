@@ -180,6 +180,12 @@ async def init_db():
 
     async with async_session_maker() as session:
         admin = await ensure_default_admin(session)
+        from rotor.core.user_access import ensure_base_token
+        from rotor.models.admin_auth import AdminUser
+        from sqlalchemy import select
+        for account in (await session.scalars(select(AdminUser).where(AdminUser.default_token_id.is_(None)))).all():
+            await ensure_base_token(session, account)
+        await session.commit()
         if admin.must_change_password:
             logger.warning(
                 "Default administrator password must be changed before "

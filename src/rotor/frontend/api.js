@@ -1,4 +1,11 @@
 // Authenticated fetch wrapper with unified error unfolding.
+let sessionEpoch = 0;
+const sessionRequests = new Set();
+document.addEventListener("sessionended", () => {
+  sessionEpoch++;
+  for (const controller of sessionRequests) controller.abort();
+  sessionRequests.clear();
+});
 
 export function adminCsrfHeaders() {
   const prefix = "rotor_admin_csrf=";
@@ -26,12 +33,20 @@ export async function api(path, options = {}) {
     Object.assign(headers, adminCsrfHeaders());
   }
 
+  const epoch = sessionEpoch, controller = new AbortController();
+  const abort = () => controller.abort();
+  if (options.signal?.aborted) controller.abort();
+  else options.signal?.addEventListener("abort", abort, { once: true });
+  sessionRequests.add(controller);
+  try {
   const response = await fetch(path, {
     ...options,
     credentials: "same-origin",
+    signal: controller.signal,
     headers,
   });
   handleAdminUnauthorized(response);
+  if (epoch !== sessionEpoch) throw new DOMException("Session changed", "AbortError");
 
   if (!response.ok) {
     const contentType = response.headers.get("content-type") || "";
@@ -40,14 +55,24 @@ export async function api(path, options = {}) {
       const detail = Array.isArray(body.detail)
         ? body.detail.map((item) => item.msg || JSON.stringify(item)).join("; ")
         : body.detail;
-      throw new Error(detail || body.message || `${response.status} ${response.statusText}`);
+      const error = new Error(detail || body.message || `${response.status} ${response.statusText}`);
+      error.status = response.status;
+      throw error;
     }
     const text = await response.text();
-    throw new Error(text || `${response.status} ${response.statusText}`);
+    const error = new Error(text || `${response.status} ${response.statusText}`);
+    error.status = response.status;
+    throw error;
   }
 
   if (response.status === 204) return null;
-  return response.json();
+  const result = await response.json();
+  if (epoch !== sessionEpoch) throw new DOMException("Session changed", "AbortError");
+  return result;
+  } finally {
+    sessionRequests.delete(controller);
+    options.signal?.removeEventListener("abort", abort);
+  }
 }
 
 export async function copyText(value) {

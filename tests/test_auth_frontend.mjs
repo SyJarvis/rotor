@@ -6,19 +6,22 @@ import vm from 'node:vm';
 const authSource = await readFile(new URL('../src/rotor/frontend/auth.js', import.meta.url), 'utf8');
 const configSource = await readFile(new URL('../src/rotor/frontend/config.js', import.meta.url), 'utf8');
 
-async function environment({ networkFails = false, status = 200, importFails = false, language = 'zh-CN', mustChangePassword = false } = {}) {
+async function environment({ networkFails = false, status = 200, importFails = false, language = 'zh-CN', mustChangePassword = false, href = 'http://localhost/', registrationError = null } = {}) {
   const nodes = new Map(); let activeElement;
   function element(id = '') {
     const classes = new Set(), listeners = new Map();
     const node = {
-      id, textContent: '', children: [], disabled: false,
+      id, textContent: '', children: [], disabled: false, value: '', elements: {}, resetCount: 0,
       classList: { add: (value) => classes.add(value), remove: (value) => classes.delete(value), contains: (value) => classes.has(value), toggle(value, yes) { yes ? classes.add(value) : classes.delete(value); } },
       appendChild(child) { this.children.push(child); nodes.set(child.id, child); },
       addEventListener(name, callback) { listeners.set(name, callback); },
-      click() { return listeners.get('click')?.({ currentTarget: this }); },
+      click() { return listeners.get('click')?.({ currentTarget: this, preventDefault() {} }); },
+      submit() { return listeners.get('submit')?.({ currentTarget: this, preventDefault() {} }); },
+      reset() { this.resetCount++; for (const input of Object.values(this.elements)) input.value = ''; },
       focus() { activeElement = this; },
       querySelector(selector) {
         if (selector.startsWith('#')) return nodes.get(selector.slice(1));
+        if (selector === 'button[type=submit]') return this.submitButton;
         if (selector === '[data-auth-error]') return this.error;
         if (selector === 'input, button') return this.firstInput || this.firstButton;
         return null;
@@ -27,10 +30,13 @@ async function environment({ networkFails = false, status = 200, importFails = f
       set innerHTML(html) {
         this.markup = html;
         for (const match of html.matchAll(/<section id="([^"]+)"[^>]*>([\s\S]*?)<\/section>/g)) {
-          const panel = element(match[1]); panel.error = element();
-          for (const tag of match[2].matchAll(/<(form|input|button)\b([^>]*)>/g)) {
+          const panel = element(match[1]); panel.error = element(); let form;
+          for (const tag of match[2].matchAll(/<(form|input|button|a)\b([^>]*)>/g)) {
             const id = tag[2].match(/\bid="([^"]+)"/)?.[1] || '';
             const child = element(id);
+            if (tag[1] === 'form') form = child;
+            if (tag[1] === 'input' && form) form.elements[tag[2].match(/\bname="([^"]+)"/)?.[1]] = child;
+            if (tag[1] === 'button' && form && /type="submit"/.test(tag[2])) form.submitButton = child;
             if (tag[1] === 'input' && !panel.firstInput) panel.firstInput = child;
             if (tag[1] === 'button' && !panel.firstButton) panel.firstButton = child;
             if (id) nodes.set(id, child);
@@ -46,25 +52,28 @@ async function environment({ networkFails = false, status = 200, importFails = f
     createElement: () => element(), getElementById: (id) => nodes.get(id) || null,
   };
   let reloads = 0, imports = 0, failImport = importFails;
-  const window = { addEventListener() {}, location: { reload() { reloads++; } } };
+  const window = { addEventListener() {}, location: { href, pathname: new URL(href).pathname, reload() { reloads++; } } };
+  window.history = { replaceState(_state, _title, url) { window.cleanUrl = url; window.location.href = new URL(url, window.location.href).href; } };
   vm.runInNewContext(configSource, { window });
   const requests = [];
-  const context = vm.createContext({ document, window, localStorage: { getItem: () => language },
+  const context = vm.createContext({ document, window, URL, FormData: class { constructor(form) { this.form = form; } get(name) { return this.form.elements[name]?.value; } }, localStorage: { getItem: () => language },
     fetch: async (path, options) => {
       requests.push({ path, options });
       if (networkFails) throw new TypeError('Failed to fetch');
-      return { ok: status === 200, status, json: async () => ({ must_change_password: mustChangePassword }) };
+      if (path === '/api/auth/register' && registrationError) return { ok: false, status: 400, json: async () => ({ detail: registrationError }) };
+      if (path === '/api/auth/register') return { ok: true, json: async () => ({ id: 8, username: 'new-user', role: 'user', must_change_password: false }) };
+      return { ok: status === 200, status, json: async () => ({ id: 7, username: 'test-user', role: 'user', must_change_password: mustChangePassword }) };
     },
   });
-  const module = new vm.SourceTextModule(authSource + '\nexport { appLoaded, startApp };', { context,
+  const module = new vm.SourceTextModule(authSource + '\nexport { appLoaded, startApp, submitRegister };', { context,
     importModuleDynamically: async () => {
-      imports++;
+      imports++; window.pendingDuringImport = body.classList.contains("auth-pending");
       if (failImport) throw new SyntaxError("The requested module './i18n.js' does not provide an export named 'setLocale'");
       const app = new vm.SyntheticModule([], () => {}, { context }); await app.link(() => {}); await app.evaluate(); return app;
     },
   });
-  await module.link(() => {}); await module.evaluate();
-  return { module, document, requests, get: (id) => nodes.get(id), get imports() { return imports; }, get reloads() { return reloads; }, get activeElement() { return activeElement; }, allowImport() { failImport = false; } };
+  await module.link(() => new vm.SyntheticModule(['setActor', 'endSession'], function () { this.setExport('setActor', (value) => { window.ROTOR_ACTOR = value; }); this.setExport('endSession', () => { window.ROTOR_ACTOR = null; }); }, { context })); await module.evaluate();
+  return { module, document, window, requests, get: (id) => nodes.get(id), get imports() { return imports; }, get reloads() { return reloads; }, get activeElement() { return activeElement; }, allowImport() { failImport = false; }, allowRegistration() { registrationError = null; } };
 }
 
 test('module startup failure is distinct from service failure, keeps loaded false, and offers reload without clearing session', async () => {
@@ -90,7 +99,7 @@ test('a real session fetch network failure retains the service-unavailable messa
   assert.equal(h.get('adminLoginPanel').classList.contains('hidden'), false);
   assert.equal(h.get('adminLoginPanel').error.textContent, '无法连接 Rotor 管理服务');
   assert.equal(h.imports, 0); assert.equal(h.module.namespace.appLoaded, false);
-  assert.equal(h.requests[0].path, '/api/admin/auth/me'); assert.equal(h.requests[0].options.cache, 'no-store');
+  assert.equal(h.requests[0].path, '/api/auth/me'); assert.equal(h.requests[0].options.cache, 'no-store');
 });
 
 test('unauthenticated and password-change-required sessions retain their existing flows without importing app', async () => {
@@ -99,4 +108,74 @@ test('unauthenticated and password-change-required sessions retain their existin
   assert.equal(anonymous.get('adminLoginPanel').error.textContent, ''); assert.equal(anonymous.imports, 0);
   const reset = await environment({ mustChangePassword: true });
   assert.equal(reset.get('adminPasswordPanel').classList.contains('hidden'), false); assert.equal(reset.imports, 0);
+});
+
+function fillRegistration(h, values = {}) {
+  const form = h.get('registerForm');
+  const defaults = { invite_token: '  manually-entered-code  ', username: 'new-user', password: 'test-password', confirm_password: 'test-password' };
+  for (const [name, value] of Object.entries({ ...defaults, ...values })) form.elements[name].value = value;
+  return form;
+}
+
+test('login offers a standalone registration page and submits the manually entered code without a role or code in the URL', async () => {
+  const h = await environment({ status: 401 });
+  assert.equal(h.get('adminLoginPanel').classList.contains('hidden'), false);
+  h.get('openRegistration').click();
+  assert.equal(h.window.cleanUrl, '/?register=1');
+  assert.equal(h.get('registerPanel').classList.contains('hidden'), false);
+  assert.doesNotMatch(h.get('adminAuthScreen').markup, /value="admin"|name="role"/);
+  const form = fillRegistration(h);
+  assert.deepEqual(Object.keys(form.elements).sort(), ['confirm_password', 'invite_token', 'password', 'username']);
+  await form.submit();
+  const request = h.requests.find(({ path }) => path === '/api/auth/register');
+  assert.deepEqual(JSON.parse(request.options.body), { invite_token: 'manually-entered-code', username: 'new-user', password: 'test-password' });
+  assert.equal(h.window.ROTOR_ACTOR.role, 'user'); assert.equal(h.window.cleanUrl, '/'); assert.equal(form.resetCount, 1);
+  assert.equal(h.window.pendingDuringImport, true); assert.equal(h.document.body.classList.contains('auth-pending'), false);
+});
+
+test('direct registration refresh and login/register navigation retain the selected page and in-page draft', async () => {
+  const h = await environment({ status: 401, href: 'http://localhost/?register=1' });
+  assert.equal(h.get('registerPanel').classList.contains('hidden'), false);
+  assert.equal(h.get('registerForm').elements.invite_token.value, '');
+  const form = fillRegistration(h);
+  h.get('backToLogin').click();
+  assert.equal(h.window.cleanUrl, '/'); assert.equal(h.get('adminLoginPanel').classList.contains('hidden'), false);
+  const refreshedLogin = await environment({ status: 401, href: h.window.location.href });
+  assert.equal(refreshedLogin.get('adminLoginPanel').classList.contains('hidden'), false);
+  h.get('openRegistration').click();
+  assert.equal(h.get('registerForm'), form); assert.equal(form.elements.username.value, 'new-user');
+  assert.equal(form.elements.invite_token.value, '  manually-entered-code  ');
+  const refreshedRegister = await environment({ status: 401, href: h.window.location.href });
+  assert.equal(refreshedRegister.get('registerPanel').classList.contains('hidden'), false);
+  assert.equal(refreshedRegister.get('registerForm').elements.invite_token.value, '');
+});
+
+test('missing invitation code, short password and confirmation mismatch block registration and retain input', async () => {
+  for (const language of ['zh-CN', 'en']) {
+    const h = await environment({ status: 401, href: 'http://localhost/?register=1', language });
+    for (const [values, message] of [
+      [{ invite_token: '   ' }, language === 'en' ? 'Enter an invitation code.' : '请输入邀请码。'],
+      [{ password: 'short', confirm_password: 'short' }, language === 'en' ? 'Use at least 6 characters for the password.' : '密码至少需要 6 个字符。'],
+      [{ confirm_password: 'different' }, language === 'en' ? 'The passwords do not match.' : '两次输入的密码不一致。'],
+    ]) {
+      const form = fillRegistration(h, values); await form.submit();
+      assert.equal(h.get('registerPanel').error.textContent, message);
+      assert.equal(form.elements.username.value, 'new-user'); assert.equal(form.resetCount, 0);
+      assert.equal(form.submitButton.disabled, false);
+    }
+    assert.equal(h.requests.filter(({ path }) => path === '/api/auth/register').length, 0);
+  }
+});
+
+test('rejected registration preserves all fields and allows replacing the invitation code before retry', async () => {
+  const h = await environment({ status: 401, href: 'http://localhost/?register=1', registrationError: 'Invitation code expired' });
+  const form = fillRegistration(h); const before = Object.fromEntries(Object.entries(form.elements).map(([name, input]) => [name, input.value]));
+  await form.submit();
+  assert.equal(h.get('registerPanel').error.textContent, 'Invitation code expired');
+  assert.deepEqual(Object.fromEntries(Object.entries(form.elements).map(([name, input]) => [name, input.value])), before);
+  assert.equal(form.resetCount, 0); assert.equal(form.submitButton.disabled, false); assert.equal(h.imports, 0);
+  form.elements.invite_token.value = ' replacement-code '; h.allowRegistration(); await form.submit();
+  const registrations = h.requests.filter(({ path }) => path === '/api/auth/register');
+  assert.equal(JSON.parse(registrations[1].options.body).invite_token, 'replacement-code');
+  assert.equal(h.window.ROTOR_ACTOR.role, 'user'); assert.equal(form.resetCount, 1);
 });

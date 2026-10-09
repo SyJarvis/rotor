@@ -1,5 +1,7 @@
 // Browser preferences apply immediately; server settings keep a draft until saved.
-import { api } from "./api.js?v=2";
+import { api } from "./api.js?v=3";
+import { isAdmin } from "./session.js?v=1";
+import { initAccount } from "./account.js?v=1";
 import { t, locale, toggleLocale } from "./i18n.js";
 import { currentTheme, setTheme } from "./theme.js";
 import { closeSidebar } from "./sidebar.js?v=1";
@@ -23,6 +25,7 @@ export function initSettings({ onSaved = () => {} } = {}) {
   const themeButtons = [...modal.querySelectorAll("[data-settings-theme]")];
   const serverFields = [...form.querySelectorAll("[data-server-setting]")];
   const shell = document.querySelector(".app-shell");
+  const account = initAccount();
   let baseline = null, draft = null, tab = "general", opened = false;
   let loading = null, saving = false, revision = 0, loadEpoch = 0;
   let loadError = "", statusKey = "", saveError = "", returnFocus = null, background = null;
@@ -36,6 +39,10 @@ export function initSettings({ onSaved = () => {} } = {}) {
     get("settingsPath").textContent = baseline?.settings_path || "—";
   }
   function render() {
+    if (!isAdmin() && tab === "routing") tab = "general";
+    get("settingsGeneralDescription").textContent = t(isAdmin() ? "generalSettingsDescription" : "personalSettingsDescription");
+    modal.querySelectorAll("[data-admin-setting]").forEach((element) => { element.hidden = !isAdmin(); });
+    get("settingsFooter").hidden = !isAdmin() || tab === "account";
     themeButtons.forEach((button) => {
       const active = button.dataset.settingsTheme === currentTheme();
       button.classList.toggle("active", active);
@@ -63,7 +70,7 @@ export function initSettings({ onSaved = () => {} } = {}) {
     get("settingsStatus").classList.toggle("error", Boolean(saveError) || statusKey.startsWith("settingsInvalid"));
   }
   async function load() {
-    if (loading || saving || dirty()) return;
+    if (!isAdmin() || loading || saving || dirty()) return;
     const epoch = ++loadEpoch;
     const initialRevision = revision;
     const controller = new AbortController();
@@ -101,7 +108,8 @@ export function initSettings({ onSaved = () => {} } = {}) {
     modal.classList.remove("hidden");
     render();
     get("settingsClose").focus();
-    if (!dirty() && !saving) load();
+    account.load();
+    if (isAdmin() && !dirty() && !saving) load();
   }
   function close(restoreFocus = true) {
     if (!opened) return;
@@ -132,7 +140,7 @@ export function initSettings({ onSaved = () => {} } = {}) {
   }
   async function save(event) {
     event.preventDefault();
-    if (saving || loading || loadError || !dirty()) return;
+    if (!isAdmin() || saving || loading || loadError || !dirty()) return;
     const ttl = Number(draft.session_lease_idle_ttl_seconds);
     if (!Number.isInteger(ttl) || ttl < 60 || ttl > 86400) return invalid("settingsInvalidTtl", "session_lease_idle_ttl_seconds", "routing");
     const timezone = draft.display_timezone.trim();
@@ -178,12 +186,14 @@ export function initSettings({ onSaved = () => {} } = {}) {
     }
     if (event.target.closest("[data-settings-tab]") && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) {
       event.preventDefault();
-      const index = tabs.findIndex((button) => button.dataset.settingsTab === tab);
-      const next = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs.at(-1) : tabs[(index + (["ArrowLeft", "ArrowUp"].includes(event.key) ? -1 : 1) + tabs.length) % tabs.length];
+      const availableTabs = tabs.filter((button) => !button.hidden);
+      const index = availableTabs.findIndex((button) => button.dataset.settingsTab === tab);
+      const next = event.key === "Home" ? availableTabs[0] : event.key === "End" ? availableTabs.at(-1) : availableTabs[(index + (["ArrowLeft", "ArrowUp"].includes(event.key) ? -1 : 1) + availableTabs.length) % availableTabs.length];
       tab = next.dataset.settingsTab; render(); next.focus();
     }
   });
   window.addEventListener("rotorauthrequired", () => close(false));
+  document.addEventListener("sessionended", () => close(false));
   document.addEventListener("focusin", (event) => {
     if (opened && !modal.contains(event.target)) get("settingsClose").focus();
   });

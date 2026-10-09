@@ -105,9 +105,9 @@ docker run --rm \
   rotor
 ```
 
-镜像默认把 SQLite 数据库写入 `/data/rotor.db`，把 Conversation store 和
-运行日志分别写入 `/data/conversations/` 和 `/data/logs/`。上面的单一挂载会
-持久化这些运行数据，对应宿主机目录为 `~/.cache/rotor/`。
+镜像默认把 SQLite 数据库写入 `/data/rotor.db`，把网关请求记录、用户聊天与附件、
+运行日志分别写入 `/data/conversations/`、`/data/chats/` 和 `/data/logs/`。上面的
+单一挂载会持久化这些运行数据，对应宿主机目录为 `~/.cache/rotor/`。
 
 使用 Docker Compose 启动 Rotor 并把运行数据写入 `./data`：
 
@@ -116,8 +116,8 @@ docker compose up --build -d
 docker compose logs -f rotor
 ```
 
-仓库 Compose 使用 SQLite，只把端口绑定到 `127.0.0.1`，并把数据库、Conversation store
-和运行日志统一挂载到宿主机的 `./data/`。当前 Docker 配置只运行 Rotor；`rotor-mcp`
+仓库 Compose 使用 SQLite，只把端口绑定到 `127.0.0.1`，并把数据库、网关请求记录、
+用户聊天与附件和运行日志统一挂载到宿主机的 `./data/`。当前 Docker 配置只运行 Rotor；`rotor-mcp`
 后续应使用独立镜像运行。
 
 ## 完成第一次请求
@@ -226,9 +226,14 @@ usage:read
 创建数据库保存的 `rck_` 凭据。完整值只在创建时显示一次；可以单独停用或删除，且不
 接受普通的 `sk-` 用户 Token。
 
-## 管理页聊天
+## 用户聊天
 
-管理页的聊天通过 OpenAI SDK 调用 Rotor 网关，沿用渠道路由、用量计量和请求日志。
+管理员和普通用户登录后均可使用聊天。管理员可以创建账户，或生成邀请码供用户在注册页
+填写；每个账户创建时会获得 `base` Key。聊天的模型列表、连接测试和生成请求均使用
+当前账户的默认 Key，并遵循账户与 Key 的额度、渠道和模型限制。默认 Key 不可用时
+需要先处理该 Key 或更换默认 Key。
+
+聊天通过 OpenAI SDK 调用 Rotor 网关，沿用渠道路由、用量计量和请求日志。
 默认使用 Chat Completions，也可切换到 Responses。每个对话独立保存右侧面板中的
 模型、API 格式、System Prompt、temperature 和 max_tokens；后两项留空时使用上游默认值。
 System Prompt 最多 10 万字符。
@@ -242,17 +247,22 @@ System Prompt 最多 10 万字符。
 500,000 字节；PDF 最多 100 页，单个 PDF/DOCX 提取的文字最多 50 万字符，超出时
 会明确提示。
 
-对话历史保存在当前浏览器本地，可新建、导出 JSON 或删除，不会自动跨浏览器同步。
-已有对话会保留；旧版本未保存的附件内容无法恢复，页面会提示重新添加。
-这与 `CONVERSATION_STORE_DIR` 中保存的网关请求记录是两套存储。管理页聊天无需
-MCP 启动命令或 Control Token；独立 Rotor MCP 服务仍按上面的方式单独配置。
+对话、设置和草稿保存在服务器的 `CHAT_STORE_DIR` 中，按用户 ID 隔离；同一账户在
+其他浏览器登录后可读取已保存的内容。每个用户的 `index.json` 保存会话索引，各会话
+目录中的 `conversation.json` 保存正文，`attachments/` 保存附件实体。历史列表每项的
+“…”菜单可导出 JSON（含可读取的附件内容）或删除会话；删除同时移除该会话的附件。
+
+旧版本的浏览器本地对话不迁移，也不会从 `CONVERSATION_STORE_DIR` 中的网关请求
+记录恢复聊天历史。这两套服务器存储相互独立。用户聊天无需 MCP 启动命令或
+Control Token；独立 Rotor MCP 服务仍按上面的方式单独配置。
 
 ## 重要配置
 
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `DATABASE_URL` | `sqlite+aiosqlite:///~/.cache/rotor/rotor.db` | 主数据库 |
-| `CONVERSATION_STORE_DIR` | `~/.cache/rotor/conversations` | 会话存储目录 |
+| `CHAT_STORE_DIR` | `~/.cache/rotor/chats` | 按用户隔离的聊天 JSON 与附件目录 |
+| `CONVERSATION_STORE_DIR` | `~/.cache/rotor/conversations` | 网关请求记录目录 |
 | `ROTOR_LOG_DIR` | `~/.cache/rotor/logs` | 按月分目录、按日保存运行日志的目录 |
 | `LOG_LEVEL` | `INFO` | 日志级别；`DEBUG` 时开放 API 文档页面 |
 | `ROTOR_DEFAULT_ADMIN_USERNAME` | `admin` | 仅首次初始化数据库时使用的管理员用户名 |

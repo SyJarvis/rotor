@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import vm from 'node:vm';
 
+const storeSource = await readFile(new URL('../src/rotor/frontend/chat-store.js', import.meta.url), 'utf8');
 const source = await readFile(new URL('../src/rotor/frontend/pages/chat.js', import.meta.url), 'utf8');
 const translations = await readFile(new URL('../src/rotor/frontend/config.js', import.meta.url), 'utf8');
 const appSource = await readFile(new URL('../src/rotor/frontend/app.js', import.meta.url), 'utf8');
@@ -10,10 +11,15 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 
 async function environment({ availableModels = ['model-a', 'model-b'], language = 'zh-CN', viewportWidth = 1200,
-  storage = new Map(), attachments = new Map(), storageFailure = false, storageReadFailure = false, attachmentFailure = false,
+  storage = new Map(), serverRecords = new Map(), actorId = '1', attachments = new Map(), storageFailure = false, storageReadFailure = false, attachmentFailure = false,
   streams = [], modelResponses = [], probes = [], tokenAvailable = true, reducedMotion = false, attachmentReads = null } = {}) {
   const nodes = new Map(), actions = new Map(), listeners = {}, requests = [], downloads = [], notices = [];
   let nextId = 0, focused, unauthorized = 0;
+  const apiRequests = [];
+  const record = (id) => serverRecords.get(id);
+  const copy = (value) => structuredClone(value);
+  const canonical = (value) => ({ id: value.id || `server-${++nextId}`, title: 'New chat', messages: [], settings: { model: 'model-a', api_format: 'chat', system_prompt: '', temperature: null, max_tokens: null }, draft: { text: '', attachments: [] }, revision: 1, draftRevision: 1, createdAt: '2026-01-01', updatedAt: '2026-01-01', ...copy(value) });
+  for (const [id, item] of serverRecords) serverRecords.set(id, canonical(item));
   function parse(html, ancestors = '') {
     for (const tag of html.matchAll(/<[^>]+>/g)) {
       const id = tag[0].match(/\bid="([^"]+)"/)?.[1];
@@ -41,7 +47,7 @@ async function environment({ availableModels = ['model-a', 'model-b'], language 
         toggle(n, force) { const yes = force ?? !classes.has(n); yes ? classes.add(n) : classes.delete(n); return yes; } },
       setAttribute: (name, value) => { attrs[name] = value; }, getAttribute: (name) => attrs[name],
       addEventListener(name, callback) { this.listeners[name] = callback; },
-      querySelector: (selector) => query(selector),
+      querySelector: (selector) => id === 'chatSyncStatus' && ['span', 'button'].includes(selector) ? (nodes.get('sync-' + selector) || nodes.set('sync-' + selector, element('sync-' + selector)).get('sync-' + selector)) : query(selector),
       querySelectorAll: (selector) => selector === '[data-agent-action="close-drawer"]'
         ? [nodes.get("agentDrawerBackdrop"), nodes.get("agentHistoryDrawer-close"), nodes.get("agentDetailsDrawer-close")].filter(Boolean)
         : [query(selector)].filter(Boolean),
@@ -74,30 +80,73 @@ async function environment({ availableModels = ['model-a', 'model-b'], language 
     document, window: { innerHeight: 800, innerWidth: viewportWidth, matchMedia: () => ({ matches: reducedMotion }) },
     localStorage: { getItem: (key) => { if (storageReadFailure) throw new Error('storage unavailable'); return storage.get(key); }, setItem: (key, value) => { if (storageFailure) throw new Error('quota'); storage.set(key, value); } },
     crypto: { randomUUID: () => `new-${++nextId}` },
+    structuredClone, DOMException,
     CustomEvent: class { constructor(name) { this.type = name; } }, Event, Date, Blob, TextDecoder, TextEncoder, Uint8Array, AbortController,
     FileReader: class { readAsDataURL(file) { this.result = file.dataUrl || `data:${file.type};base64,QUJD`; this.onload(); } },
     URL: { createObjectURL: (blob) => { downloads.push({ blob }); return 'blob:export'; }, revokeObjectURL() {} }, setTimeout: (callback) => callback(), clearTimeout() {},
     fetch: async (url, options) => {
-      requests.push({ url, options, payload: JSON.parse(options.body) });
+      const payload = JSON.parse(options.body); requests.push({ url, options, payload });
       const stream = streams.shift() || {};
       if (stream.response) return stream.response;
-      let index = 0;
+      const conversation = record(payload.conversation_id);
+      if (conversation.revision !== payload.expected_revision) return { ok: false, status: 409, text: async () => JSON.stringify({ detail: 'Conflict' }) };
+      const user = { id: `u-${++nextId}`, role: 'user', content: payload.message.content, attachments: payload.message.attachments.map(({ id }) => { const item = attachments.get(id); return { id, kind: item.kind, name: item.name, mimeType: item.mime_type || item.mimeType, size: item.size }; }) };
+      const assistant = { id: `a-${++nextId}`, role: 'assistant', content: '', status: 'running', model: payload.settings.model };
+      conversation.messages.push(user, assistant); conversation.settings = payload.settings;
+      conversation.draft = { text: '', attachments: [] }; conversation.revision++; conversation.draftRevision++;
+      let index = 0, started = false;
       const chunks = stream.chunks || ['data: {"type":"delta","content":"draft"}\n\ndata: {"type":"done","answer":"final answer"}\n\n'];
+      options.signal.addEventListener('abort', () => { if (assistant.status === 'running') { assistant.status = 'stopped'; conversation.revision++; } });
       return { ok: true, body: { getReader: () => ({ read: async () => {
+        if (!started) { started = true; return { value: new TextEncoder().encode(`data: ${JSON.stringify({ type: 'start', conversation: copy(conversation) })}\n\n`), done: false }; }
         const gate = stream.gates?.[index] || (index === 0 ? stream.gate : null);
-        if (gate) {
-          await Promise.race([gate.promise, new Promise((_, reject) => options.signal.addEventListener('abort', () => { if (!stream.ignoreAbort) reject(Object.assign(new Error('stopped'), { name: 'AbortError' })); }))]);
-        }
+        if (gate) await Promise.race([gate.promise, new Promise((_, reject) => options.signal.addEventListener('abort', () => { if (!stream.ignoreAbort) reject(Object.assign(new Error('stopped'), { name: 'AbortError' })); }))]);
         if (index >= chunks.length) return { done: true };
         stream.onChunk?.(index);
-        return { value: new TextEncoder().encode(chunks[index++]), done: false };
+        let chunk = chunks[index++];
+        // Model the canonical terminal event when this chunk contains a complete event.
+        chunk = chunk.replace(/data: (\{[^\n]+\})/g, (line, data) => {
+          let event; try { event = JSON.parse(data); } catch { return line; }
+          if (event.type === 'delta') assistant.content += event.content || '';
+          if (['done', 'error'].includes(event.type)) {
+            assistant.content = event.answer ?? assistant.content; assistant.status = event.type === 'done' ? 'done' : 'error';
+            if (event.usage) assistant.usage = event.usage;
+            if (event.type === 'error') assistant.error = event.message;
+            conversation.revision++; event.conversation = copy(conversation);
+          }
+          return 'data: ' + JSON.stringify(event);
+        });
+        return { value: new TextEncoder().encode(chunk), done: false };
       }, releaseLock() {}, cancel() {} }) } };
     },
   });
   const bindings = {
-    t, api: async (url, options) => {
+    t, api: async (url, options = {}) => {
       if (url.endsWith('/models')) return modelResponses.length ? await modelResponses.shift() : { models: availableModels, token_available: tokenAvailable };
-      requests.push({ url, options, payload: JSON.parse(options.body) });
+      const payload = options.body ? JSON.parse(options.body) : null;
+      if (url.startsWith('/api/chat/conversations')) {
+        apiRequests.push({ url, options, payload });
+        const path = url.split('/').slice(4), id = path[0]?.split('?')[0], method = options.method || 'GET';
+        if (!id && method === 'GET') return [...serverRecords.values()].map((item) => ({ ...copy(item), messageCount: item.messages.length }));
+        if (!id && method === 'POST') { const item = canonical(payload); serverRecords.set(item.id, item); return copy(item); }
+        const item = record(id); if (!item) throw Object.assign(new Error('Not found'), { status: 404 });
+        if (path[1] === 'attachments') {
+          const aid = path[2];
+          if (method === 'POST') { if (attachmentFailure) throw new Error('quota'); const value = { ...payload, id: `file-${++nextId}` }; attachments.set(value.id, value); return { id: value.id, kind: value.kind, name: value.name, mimeType: value.mime_type, size: value.size }; }
+          if (method === 'GET') { const value = attachmentReads ? await attachmentReads(aid) : attachments.get(aid); if (!value) throw Object.assign(new Error('Missing attachment'), { status: 404 }); return copy(value); }
+          attachments.delete(aid); return null;
+        }
+        if (method === 'GET') return copy(item);
+        if (method === 'PATCH') {
+          const versionMatches = payload.expected_draft_revision !== undefined ? payload.expected_draft_revision === item.draftRevision : payload.expected_revision === item.revision;
+          if (!versionMatches) throw Object.assign(new Error('Conflict'), { status: 409 });
+          if (payload.settings) item.settings = payload.settings;
+          if (payload.draft) { item.draft = payload.draft; item.draftRevision++; }
+          item.revision++; return copy(item);
+        }
+        if (method === 'DELETE') { for (const message of [...item.messages, item.draft]) for (const attachment of message.attachments || []) attachments.delete(attachment.id); serverRecords.delete(id); return null; }
+      }
+      requests.push({ url, options, payload });
       return probes.length ? await probes.shift() : { success: true, latency_ms: 12.8 };
     },
     adminCsrfHeaders: () => ({ 'X-Test-Csrf': 'present' }), handleAdminUnauthorized(response) { if (response.status === 401) unauthorized++; }, copyText: async () => true,
@@ -106,18 +155,22 @@ async function environment({ availableModels = ['model-a', 'model-b'], language 
     saveAttachment: async (attachment) => { if (attachmentFailure) throw new Error('quota'); attachments.set(attachment.id, structuredClone(attachment)); },
     getAttachment: async (id) => attachmentReads ? await attachmentReads(id) : attachments.get(id), deleteAttachments: async (ids) => { ids.forEach((id) => attachments.delete(id)); },
   };
-  const module = new vm.SourceTextModule(source, { context });
+  const synthetic = (names) => new vm.SyntheticModule(names, function () { names.forEach((name) => this.setExport(name, bindings[name])); }, { context });
+  const storeModule = new vm.SourceTextModule(storeSource, { context }); await storeModule.link(() => synthetic(['api']));
+  const module = new vm.SourceTextModule(source + '\nexport { activeConversation as testCurrent };', { context });
   await module.link((specifier) => {
-    const names = specifier.includes('i18n') ? ['t'] : specifier.includes('api.js') ? ['adminCsrfHeaders', 'api', 'copyText', 'handleAdminUnauthorized']
-      : specifier.includes('chat-attachments') ? ['saveAttachment', 'getAttachment', 'deleteAttachments'] : ['escapeHtml', 'refreshIcons', 'toast'];
-    return new vm.SyntheticModule(names, function () { names.forEach((name) => this.setExport(name, bindings[name])); }, { context });
+    if (specifier.includes('chat-store')) return storeModule;
+    if (specifier.includes('session')) return new vm.SyntheticModule(['accountId'], function () { this.setExport('accountId', () => actorId); }, { context });
+    const names = specifier.includes('i18n') ? ['t'] : specifier.includes('api.js') ? ['adminCsrfHeaders', 'api', 'copyText', 'handleAdminUnauthorized'] : ['escapeHtml', 'refreshIcons', 'toast'];
+    return synthetic(names);
   });
   await module.evaluate();
   await module.namespace.load();
   return {
-    page: module.namespace, nodes, actions, listeners, storage, requests, downloads, notices, attachments,
+    page: module.namespace, nodes, actions, listeners, storage, requests, apiRequests, downloads, notices, attachments, serverRecords,
     setLocale(value) { language = value; document.documentElement.lang = value; },
-    current: () => JSON.parse(storage.get('rotor.chat.conversations.v1')).find((item) => item.id === storage.get('rotor.chat.active.v1')),
+    changeActor(value) { listeners.sessionended(); actorId = value; serverRecords.clear(); },
+    current: () => module.namespace.testCurrent(),
     target(action, dataset = {}, ancestors = '.agent-drawer') { const node = element('', action, ancestors); Object.assign(node.dataset, dataset); return node; },
     outside: () => element(), focused: () => focused, unauthorized: () => unauthorized,
     change(id, value) { const node = nodes.get(id); node.value = value; (node.listeners.input || node.listeners.change)({ target: node, currentTarget: node }); },
@@ -165,13 +218,13 @@ test('settings persist by conversation and streaming requests carry a validated 
   env.change('chatTemperature', '0.4'); env.change('chatMaxTokens', '256');
   const sending = env.send('question'); await tick();
   const request = env.requests[0];
-  assert.equal(request.url, '/api/admin/chat/completions');
+  assert.equal(request.url, '/api/chat/completions');
   assert.equal(request.options.credentials, 'same-origin');
   assert.equal(request.options.headers['X-Test-Csrf'], 'present');
-  assert.equal(request.payload.model, 'model-b'); assert.equal(request.payload.api_format, 'responses');
-  assert.equal(request.payload.system_prompt, 'Be concise'); assert.equal(request.payload.temperature, 0.4); assert.equal(request.payload.max_tokens, 256);
+  assert.equal(request.payload.settings.model, 'model-b'); assert.equal(request.payload.settings.api_format, 'responses');
+  assert.equal(request.payload.settings.system_prompt, 'Be concise'); assert.equal(request.payload.settings.temperature, 0.4); assert.equal(request.payload.settings.max_tokens, 256);
   env.change('chatTemperature', '0.9');
-  assert.equal(request.payload.temperature, 0.4);
+  assert.equal(request.payload.settings.temperature, 0.4);
   gate.resolve(); await sending;
   const old = env.current().id;
   await env.page.onClick(env.actions.get('new'));
@@ -179,7 +232,7 @@ test('settings persist by conversation and streaming requests carry a validated 
   assert.equal(env.nodes.get('agentDetailsDrawer').classList.contains('hidden'), false);
   env.change('chatSystemPrompt', 'New conversation settings');
   await env.page.onClick(env.target('open', { conversationId: old }));
-  assert.equal(env.current().settings.temperature, '0.9');
+  assert.equal(Number(env.current().settings.temperature), 0.9);
   assert.equal(env.current().settings.system_prompt, 'Be concise');
 });
 
@@ -202,7 +255,7 @@ test('connection test only sends settings, reports latency and becomes stale on 
   await env.send('private history');
   await env.testConnection();
   const request = env.requests[1];
-  assert.equal(request.url, '/api/admin/chat/test'); assert.equal(request.options.method, 'POST');
+  assert.equal(request.url, '/api/chat/test'); assert.equal(request.options.method, 'POST');
   assert.deepEqual(Object.keys(request.payload).sort(), ['api_format', 'max_tokens', 'model', 'system_prompt', 'temperature']);
   assert.match(env.nodes.get('chatProbeResult').textContent, /24 ms/);
   env.change('chatSystemPrompt', 'Changed');
@@ -214,35 +267,31 @@ test('connection test only sends settings, reports latency and becomes stale on 
   assert.equal(env.nodes.get('chatProbeResult').textContent, '');
 });
 
-test('images, text and binary documents retain payloads across turns and page reload', async () => {
+test('images, text and binary documents stay on the server across turns and page reload; requests send IDs only', async () => {
   const env = await environment();
   await env.addFiles([image()], true);
-  await env.addFiles([file(), { name: 'paper.pdf', type: '', size: 3, dataUrl: 'data:application/octet-stream;base64,QUJD' }, { name: 'paper.docx', type: '', size: 3, dataUrl: 'data:application/octet-stream;base64,QUJD' }]);
-  assert.match(env.nodes.get('agentAttachmentStrip').innerHTML, /data:image\/png/);
-  await env.send('review');
-  const attachments = env.requests[0].payload.messages[0].attachments;
-  assert.equal(attachments.length, 4); assert.equal(attachments[1].content, 'notes');
-  assert.match(attachments[2].data_url, /^data:application\/pdf;/);
-  assert.match(attachments[3].data_url, /^data:application\/vnd.openxmlformats-officedocument.wordprocessingml.document;/);
-  const stored = env.storage.get('rotor.chat.conversations.v1');
-  assert.doesNotMatch(stored, /base64|"content":"notes"/);
-  const reload = await environment({ storage: env.storage, attachments: env.attachments });
+  await env.addFiles([file(), { name: 'paper.pdf', type: 'application/pdf', size: 3 }, { name: 'doc.docx', type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', size: 3 }]);
+  await env.send('read attachments');
+  const sent = env.requests[0].payload.message.attachments;
+  assert.equal(sent.length, 4); assert.deepEqual(Object.keys(sent[0]), ['id']);
+  assert.equal(env.attachments.get(sent[1].id).content, 'notes');
+  assert.match(env.attachments.get(sent[2].id).data_url, /^data:application\/pdf;/);
+  assert.match(env.attachments.get(sent[3].id).data_url, /^data:application\/vnd.openxmlformats-officedocument.wordprocessingml.document;/);
+  assert.equal(env.storage.has('rotor.chat.conversations.v1'), false);
+  const reload = await environment({ serverRecords: env.serverRecords, attachments: env.attachments });
   await reload.send('follow up');
-  assert.deepEqual(reload.requests[0].payload.messages[0].attachments, attachments);
-  assert.equal(reload.requests[0].payload.messages.at(-1).content, 'follow up');
+  assert.equal('messages' in reload.requests[0].payload, false);
+  assert.equal(reload.current().messages[0].attachments.length, 4);
+  assert.equal(reload.requests[0].payload.message.content, 'follow up');
 });
 
-test('old MindAgent conversations migrate without deleting old data and missing attachments are explicit', async () => {
-  const old = [{ id: 'legacy', model: 'model-b', title: 'old', messages: [{ id: 'u', role: 'user', content: 'look', attachments: [{ kind: 'image', name: 'old.png', size: 4 }] }], updatedAt: '2025-01-01' }];
-  const storage = new Map([['rotor.mindagent.conversations.v1', JSON.stringify(old)], ['rotor.mindagent.active.v1', 'legacy']]);
-  const env = await environment({ storage });
-  assert.equal(env.current().id, 'legacy'); assert.equal(env.current().settings.model, 'model-b');
-  assert.equal(storage.get('rotor.mindagent.conversations.v1'), JSON.stringify(old));
-  assert.match(env.nodes.get('agentMessages').innerHTML, /内容未保存/);
-  await env.send('continue');
-  assert.match(env.requests[0].payload.messages[0].content, /Attachment content unavailable.*old.png/);
-  assert.deepEqual(env.requests[0].payload.messages[0].attachments, []);
-  assert.ok(env.notices.some((notice) => /历史附件内容不可用/.test(notice.message)));
+test('old local and MindAgent conversations are neither imported nor deleted', async () => {
+  const old = JSON.stringify([{ id: 'legacy', model: 'secret-model', title: 'old private chat', messages: [] }]);
+  const storage = new Map([['rotor.mindagent.conversations.v1', old], ['rotor.mindagent.active.v1', 'legacy'], ['rotor.chat.conversations.v1', old], ['rotor.chat.active.v1', 'legacy']]);
+  const snapshot = [...storage]; const env = await environment({ storage });
+  assert.notEqual(env.current().id, 'legacy'); assert.equal(env.current().messages.length, 0);
+  assert.doesNotMatch(env.nodes.get('chat').innerHTML, /old private chat|secret-model/);
+  await env.send('new account chat'); assert.deepEqual([...storage], snapshot);
 });
 
 test('attachment storage failure does not enqueue an unsaved file', async () => {
@@ -269,11 +318,11 @@ test('SSE handles fragmented CRLF events and final event without trailing delimi
 
 test('incomplete streams and structured errors are visible and not sent back as assistant context', async () => {
   const env = await environment({ streams: [{ chunks: ['data: {"type":"delta","content":"partial"}\n\n'] }, { response: { ok: false, status: 401, text: async () => JSON.stringify({ detail: 'Expired session' }) } }] });
-  await env.send(); assert.equal(env.current().messages.at(-1).status, 'error');
+  await env.send(); assert.equal(env.current().messages.at(-1).status, 'stopped');
   assert.equal(env.current().messages.at(-1).content, 'partial'); assert.match(env.current().messages.at(-1).error, /提前中断/); assert.equal(env.requests[0].options.signal.aborted, true);
   await env.send('again'); assert.equal(env.unauthorized(), 1);
-  assert.match(env.current().messages.at(-1).error, /Expired session/);
-  assert.equal(env.requests[1].payload.messages.filter((message) => message.role === 'assistant').length, 0);
+  assert.ok(env.notices.some((notice) => /Expired session/.test(notice.message)));
+  assert.equal('messages' in env.requests[1].payload, false);
 });
 
 for (const action of ['new', 'delete', 'unload']) {
@@ -299,7 +348,7 @@ for (const action of ['new', 'delete', 'unload']) {
 
 test('stale model loads and connection tests do not redraw after unload', async () => {
   const slow = deferred();
-  const env = await environment({ modelResponses: [{ models: ['model-a'], token_available: true }, slow.promise, { models: ['model-b'], token_available: true }] });
+  const env = await environment({ modelResponses: [{ models: ['model-a'], token_available: true }, { models: ['model-a'], token_available: true }, slow.promise, { models: ['model-b'], token_available: true }] });
   const first = env.page.load();
   await env.page.load();
   slow.resolve({ models: ['old-model'], token_available: true }); await first;
@@ -350,7 +399,7 @@ test('no-model, missing token and full localStorage failures are handled without
   const empty = await environment({ availableModels: [] }); await empty.send(); assert.equal(empty.requests.length, 0);
   const noToken = await environment({ tokenAvailable: false }); await noToken.send(); assert.equal(noToken.requests.length, 0);
   const quota = await environment({ storageFailure: true }); await quota.send();
-  assert.equal(quota.requests.length, 1); assert.ok(quota.notices.some((notice) => /无法保存对话/.test(notice.message)));
+  assert.equal(quota.requests.length, 1); assert.equal(quota.storage.has('rotor.chat.conversations.v1'), false);
 });
 
 test('all navigation routes use Chat and settings has no page navigation handler', async () => {
@@ -359,19 +408,18 @@ test('all navigation routes use Chat and settings has no page navigation handler
   const node = (id, dataset = {}) => ({ id, dataset, listeners: {}, textContent: '', classList: { toggle(name, value) { toggles.set(`${id}:${name}`, value); } }, addEventListener(name, callback) { this.listeners[name] = callback; } });
   const navigation = pages.map((page) => node(page, { tab: page })), settings = node('openSettings'), panels = pages.map((page) => node(page));
   const other = new Map(['content', 'pageTitle', '.main', '.app-shell'].map((id) => [id, node(id)]));
-  const context = vm.createContext({ PAGES: Object.fromEntries(pages.map((name) => [name, { load: () => loads.push(name), unload() {} }])), TITLES: Object.fromEntries(pages.map((name) => [name, () => name])), current: 'overview', closeSidebar() {}, refreshActive: async () => context.PAGES[context.current].load(), document: { getElementById: (id) => other.get(id), querySelector: (selector) => other.get(selector), querySelectorAll: (selector) => selector === '.nav-item[data-tab]' ? navigation : selector === '.panel' ? panels : selector === '.nav-item' ? [...navigation, settings] : [] } });
+  const context = vm.createContext({ isAdmin: () => true, PAGES: Object.fromEntries(pages.map((name) => [name, { load: () => loads.push(name), unload() {} }])), TITLES: Object.fromEntries(pages.map((name) => [name, () => name])), current: 'overview', closeSidebar() {}, refreshActive: async () => context.PAGES[context.current].load(), document: { getElementById: (id) => other.get(id), querySelector: (selector) => other.get(selector), querySelectorAll: (selector) => selector === '.nav-item[data-tab]' ? navigation : selector === '.panel' ? panels : selector === '.nav-item' ? [...navigation, settings] : [] } });
   vm.runInContext(appSource.slice(appSource.indexOf('function switchTab('), appSource.indexOf('document.addEventListener("chatconversationopen"')), context);
   for (const nav of navigation.slice(1)) await nav.listeners.click();
   assert.equal(loads.join(','), pages.slice(1).join(',')); assert.equal(toggles.get('.app-shell:chat-app'), true); assert.equal(settings.listeners.click, undefined);
 });
 
 test('saved missing models remain selected and are never silently replaced', async () => {
-  const storage = new Map([['rotor.chat.conversations.v1', JSON.stringify([{ id: 'saved', model: 'removed-model', messages: [], settings: { model: 'removed-model', api_format: 'responses' } }])], ['rotor.chat.active.v1', 'saved']]);
-  const env = await environment({ storage });
+  const env = await environment({ serverRecords: historyStorage([{ id: 'saved', settings: { model: 'removed-model', api_format: 'responses', system_prompt: '', temperature: null, max_tokens: null } }]) });
   assert.equal(env.nodes.get('agentModel').value, 'removed-model');
   assert.match(env.nodes.get('agentModel').innerHTML, /removed-model.*不可用/);
   await env.send(); assert.equal(env.requests.length, 0);
-  env.change('agentModel', 'model-a'); await env.send(); assert.equal(env.requests[0].payload.model, 'model-a');
+  env.change('agentModel', 'model-a'); await env.send(); assert.equal(env.requests[0].payload.settings.model, 'model-a');
 });
 
 test('an old probe completion after unload cannot replace a later probe result', async () => {
@@ -390,20 +438,18 @@ test('text payload reports actual UTF-8 bytes and the six-attachment limit is en
   const env = await environment();
   await env.addFiles([{ name: 'bom.txt', type: 'text/plain', size: 6, text: async () => '汉' }, ...Array.from({ length: 6 }, (_, index) => file(`${index}.txt`))]);
   await env.send();
-  assert.equal(env.requests[0].payload.messages[0].attachments.length, 6);
-  assert.equal(env.requests[0].payload.messages[0].attachments[0].size, 3);
+  assert.equal(env.requests[0].payload.message.attachments.length, 6);
+  assert.equal(env.attachments.get(env.requests[0].payload.message.attachments[0].id).size, 3);
   assert.ok(env.notices.some((notice) => /最多添加 6/.test(notice.message)));
 });
 
-test('lost IndexedDB bodies are marked unavailable while the conversation remains usable', async () => {
-  const env = await environment(); await env.addFiles([file()]); await env.send();
-  const reloaded = await environment({ storage: env.storage, attachments: new Map() });
-  await reloaded.send('continue without the file');
-  assert.match(reloaded.requests[0].payload.messages[0].content, /Attachment content unavailable/);
-  assert.match(reloaded.nodes.get('agentMessages').innerHTML, /内容未保存/);
-  assert.equal(reloaded.current().messages.at(-1).content, 'final answer');
+test('missing server draft attachment is shown explicitly and can be removed before sending', async () => {
+  const serverRecords = historyStorage([{ id: 'missing', draft: { text: 'kept', attachments: [{ id: 'gone', name: 'missing.txt', kind: 'file', mimeType: 'text/plain', size: 1 }] } }]);
+  const env = await environment({ serverRecords });
+  assert.match(env.nodes.get('agentAttachmentStrip').innerHTML, /内容未保存/);
+  await env.page.onClick(env.target('remove-attachment', { attachmentId: 'gone' }));
+  await env.send('continue'); assert.equal(env.requests[0].payload.message.attachments.length, 0);
 });
-
 
 test('locale refresh updates every persistent chat shell label without replacing the draft or losing attachments and scroll', async () => {
   const env = await environment();
@@ -439,13 +485,13 @@ test('locale refresh updates every persistent chat shell label without replacing
   assert.equal(env.nodes.get('agentDetailsTitle').textContent, 'Conversation settings');
   assert.match(env.nodes.get('chatComposerHint').textContent, /Enter to send/);
   await env.send('use draft attachment');
-  assert.equal(env.requests[0].payload.messages[0].attachments[0].content, 'notes');
+  assert.equal(env.attachments.get(env.requests[0].payload.message.attachments[0].id).content, 'notes');
 });
 
 function historyStorage(items, active = items[0].id) {
-  return new Map([['rotor.chat.conversations.v1', JSON.stringify(items.map((item) => ({
-    model: 'model-a', messages: [], draft: { text: '', attachments: [] }, updatedAt: '2026-01-01', ...item,
-  })))], ['rotor.chat.active.v1', active]]);
+  return new Map([...items].sort((a, b) => a.id === active ? -1 : b.id === active ? 1 : 0).map((item) => [item.id, {
+    title: 'Saved', settings: { model: item.model || 'model-a', api_format: 'chat', system_prompt: '', temperature: null, max_tokens: null }, messages: [], draft: { text: '', attachments: [] }, updatedAt: '2026-01-01', ...item,
+  }]));
 }
 
 test('new chat reuses only truly empty conversations and inherits a separate settings object', async () => {
@@ -465,7 +511,7 @@ test('new chat reuses only truly empty conversations and inherits a separate set
   assert.equal(env.current().settings.system_prompt, 'Inherited');
   await env.page.onClick(env.actions.get('new'));
   assert.equal(env.current().id, second);
-  assert.equal(JSON.parse(env.storage.get('rotor.chat.conversations.v1')).length, 2);
+  assert.equal(env.serverRecords.size, 2);
 });
 
 test('draft text, attachment payloads and reading positions survive switches and draft data survives reload', async () => {
@@ -482,9 +528,9 @@ test('draft text, attachment payloads and reading positions survive switches and
   assert.equal(env.attachments.size, 2);
   env.page.unload(); await env.page.load();
   assert.equal(env.nodes.get('agentPrompt').value, 'Draft one'); assert.equal(env.attachments.size, 2);
-  const reload = await environment({ storage: env.storage, attachments: env.attachments });
+  const reload = await environment({ serverRecords: env.serverRecords, attachments: env.attachments });
   assert.equal(reload.nodes.get('agentPrompt').value, 'Draft one');
-  await reload.send('use first'); assert.equal(reload.requests[0].payload.messages.at(-1).attachments[0].content, 'one');
+  await reload.send('use first'); assert.equal(reload.attachments.get(reload.requests[0].payload.message.attachments[0].id).content, 'one');
   await reload.page.onClick(reload.target('open', { conversationId: second }));
   assert.equal(reload.nodes.get('agentPrompt').value, 'Draft two');
   assert.match(reload.nodes.get('agentAttachmentStrip').innerHTML, /two.txt/);
@@ -495,7 +541,7 @@ test('history search filters titles and models without replacing its input or mo
     { id: 'a', title: 'Design review', model: 'model-a', messages: [{ role: 'user', content: 'design' }] },
     { id: 'b', title: 'Debug issue', model: 'model-b', messages: [{ role: 'user', content: 'debug' }] },
   ]);
-  const env = await environment({ storage });
+  const env = await environment({ serverRecords: storage });
   assert.equal(env.nodes.get('chatCurrentTitle').textContent, '最近');
   const scroller = env.nodes.get('agentMessages'); scroller.scrollHeight = 1200; scroller.scrollTop = 120; scroller.listeners.scroll();
   await env.page.onClick(env.actions.get('history'));
@@ -540,7 +586,7 @@ test('late attachment restoration cannot overwrite another conversation or reviv
   const slow = deferred();
   const meta = { id: 'saved-file', kind: 'file', name: 'saved.txt', mimeType: 'text/plain', size: 4 };
   const storage = historyStorage([{ id: 'a', draft: { text: 'A', attachments: [meta] } }, { id: 'b', draft: { text: 'B', attachments: [] } }], 'b');
-  const env = await environment({ storage, attachmentReads: () => slow.promise });
+  const env = await environment({ serverRecords: storage, attachmentReads: () => slow.promise });
   const opening = env.page.onClick(env.target('open', { conversationId: 'a' })); await tick();
   await env.page.onClick(env.target('remove-attachment', { attachmentId: meta.id }));
   await env.page.onClick(env.target('open', { conversationId: 'b' }));
@@ -548,23 +594,21 @@ test('late attachment restoration cannot overwrite another conversation or reviv
   slow.resolve({ ...meta, content: 'late' }); await opening;
   assert.equal(env.current().id, 'b'); assert.equal(env.nodes.get('agentPrompt').value, 'B edited');
   assert.match(env.nodes.get('agentAttachmentStrip').innerHTML, /new.txt/); assert.doesNotMatch(env.nodes.get('agentAttachmentStrip').innerHTML, /saved.txt/);
-  const savedA = JSON.parse(env.storage.get('rotor.chat.conversations.v1')).find((item) => item.id === 'a');
+  const savedA = env.serverRecords.get('a');
   assert.equal(savedA.draft.attachments.length, 0);
 });
 
-test('input and attachments added while preparing an earlier request remain as the next draft', async () => {
-  const slow = deferred();
-  const meta = { id: 'old-file', kind: 'file', name: 'old.txt', mimeType: 'text/plain', size: 3 };
-  const storage = historyStorage([{ id: 'old', messages: [{ role: 'user', content: 'earlier', attachments: [meta] }] }]);
-  const env = await environment({ storage, attachmentReads: () => slow.promise });
+test('input and attachments added during streaming remain as the next persisted draft', async () => {
+  const gate = deferred(); const env = await environment({ streams: [{ gate }] });
   const sending = env.send('submitted snapshot'); await tick();
   env.nodes.get('agentPrompt').scrollHeight = 120;
   env.change('agentPrompt', 'next draft\nsecond line'); await env.addFiles([file('next.txt')]);
-  slow.resolve({ ...meta, content: 'old' }); await sending;
-  assert.equal(env.requests[0].payload.messages.at(-1).content, 'submitted snapshot');
-  assert.equal(env.requests[0].payload.messages.at(-1).attachments.length, 0);
-  assert.equal(env.nodes.get('agentPrompt').value, 'next draft\nsecond line');
-  assert.equal(env.nodes.get('agentPrompt').style.height, '120px');
+  await tick();
+  const onServer = env.serverRecords.get(env.current().id);
+  assert.equal(onServer.draft.text, 'next draft\nsecond line'); assert.equal(onServer.draft.attachments[0].name, 'next.txt');
+  gate.resolve(); await sending;
+  assert.equal(env.requests[0].payload.message.content, 'submitted snapshot'); assert.equal(env.requests[0].payload.message.attachments.length, 0);
+  assert.equal(env.nodes.get('agentPrompt').value, 'next draft\nsecond line'); assert.equal(env.nodes.get('agentPrompt').style.height, '120px');
   assert.equal(env.current().draft.text, 'next draft\nsecond line'); assert.equal(env.current().draft.attachments[0].name, 'next.txt');
 });
 
@@ -615,7 +659,7 @@ test('a changed reading position is checked before rendering even before the scr
 
 for (const visible of [true, false]) {
   test(`settings choice ${visible ? 'shown' : 'hidden'} survives history, chat actions, conversation changes, navigation and reload`, async () => {
-    const preference = 'rotor.chat.settings.visible.v1';
+    const preference = 'rotor.chat.settings.visible.v2.1';
     const gate = deferred();
     const env = await environment({ storage: new Map([[preference, String(visible)]]), streams: [{ gate }] });
     const assertChoice = () => {
@@ -660,7 +704,7 @@ for (const visible of [true, false]) {
 }
 
 test('settings default to shown for missing, invalid or unreadable preferences and remain usable when storage writes fail', async () => {
-  const preference = 'rotor.chat.settings.visible.v1';
+  const preference = 'rotor.chat.settings.visible.v2.1';
   for (const stored of [undefined, 'invalid']) {
     const env = await environment({ storage: stored === undefined ? new Map() : new Map([[preference, stored]]) });
     assert.equal(env.nodes.get('agentDetailsDrawer').classList.contains('hidden'), false);
@@ -675,4 +719,43 @@ test('settings default to shown for missing, invalid or unreadable preferences a
   assert.equal(unwritable.nodes.get('agentDetailsDrawer').classList.contains('hidden'), true);
   await unwritable.page.onClick(unwritable.actions.get('details'));
   assert.equal(unwritable.nodes.get('agentDetailsDrawer').classList.contains('hidden'), false);
+});
+
+test('a revision conflict keeps local text and remote draft unchanged until explicit save-as-new', async () => {
+  const env = await environment(); const id = env.current().id;
+  const remote = env.serverRecords.get(id); remote.draft.text = 'other device'; remote.revision++; remote.draftRevision++;
+  env.change('agentPrompt', 'my unsent draft'); await tick();
+  assert.equal(env.nodes.get('agentPrompt').value, 'my unsent draft');
+  assert.equal(env.serverRecords.get(id).draft.text, 'other device');
+  assert.equal(env.nodes.get('chatSyncStatus').classList.contains('hidden'), false);
+  assert.match(env.nodes.get('sync-span').textContent, /其他设备/);
+  await env.page.onClick(env.target('retry-sync')); await tick();
+  assert.notEqual(env.current().id, id); assert.equal(env.nodes.get('agentPrompt').value, 'my unsent draft');
+  assert.equal(env.serverRecords.get(id).draft.text, 'other device');
+  assert.equal(env.serverRecords.get(env.current().id).draft.text, 'my unsent draft');
+});
+
+test('stream checkpoints do not conflict with draft-only saves using draftRevision', async () => {
+  const gate = deferred(); const env = await environment({ streams: [{ gate }] });
+  const sending = env.send('stream'); await tick();
+  env.serverRecords.get(env.current().id).revision += 3;
+  env.change('agentPrompt', 'next message'); await tick();
+  const writes = env.apiRequests.filter((request) => request.options.method === 'PATCH');
+  assert.ok(writes.at(-1).payload.expected_draft_revision);
+  assert.equal('settings' in writes.at(-1).payload, false);
+  assert.equal(env.serverRecords.get(env.current().id).draft.text, 'next message');
+  assert.equal(env.nodes.get('chatSyncStatus').classList.contains('hidden'), true);
+  gate.resolve(); await sending;
+});
+
+test('session end aborts the stream and clears all rendered conversation data before another account loads', async () => {
+  const gate = deferred(); const env = await environment({ streams: [{ gate, ignoreAbort: true }] });
+  const sending = env.send('private account one'); await tick();
+  env.changeActor('2');
+  assert.equal(env.requests[0].options.signal.aborted, true); assert.equal(env.nodes.get('chat').innerHTML, '');
+  assert.equal(env.current(), null);
+  gate.resolve(); await sending; await env.page.load();
+  assert.equal(env.current().messages.length, 0); assert.doesNotMatch(env.nodes.get('chat').innerHTML, /private account one/);
+  await env.page.onClick(env.actions.get('details')); assert.equal(env.storage.get('rotor.chat.settings.visible.v2.2'), 'false');
+  assert.equal(env.storage.has('rotor.chat.settings.visible.v2.1'), false);
 });

@@ -6,18 +6,19 @@ import {
   api,
   copyText,
   handleAdminUnauthorized,
-} from "../api.js?v=2";
+} from "../api.js?v=3";
 import { escapeHtml, refreshIcons, toast } from "../ui.js";
-import { saveAttachment, getAttachment, deleteAttachments } from "../chat-attachments.js?v=1";
+import { ChatStore } from "../chat-store.js?v=1";
+import { accountId } from "../session.js?v=1";
+const store = new ChatStore();
+const syncSnapshots = new Map();
+let syncError = null;
+let owner = "";
+let listLoaded = false;
 
-const STORAGE_KEY = "rotor.chat.conversations.v1";
-const ACTIVE_KEY = "rotor.chat.active.v1";
-const SETTINGS_VISIBLE_KEY = "rotor.chat.settings.visible.v1";
-const LEGACY_STORAGE_KEY = "rotor.mindagent.conversations.v1";
-const LEGACY_ACTIVE_KEY = "rotor.mindagent.active.v1";
-
-let conversations = readConversations();
-let activeId = readActiveId();
+const SETTINGS_VISIBLE_KEY = "rotor.chat.settings.visible.v2";
+let conversations = [];
+let activeId = null;
 let models = [];
 let status = null;
 let generation = null;
@@ -32,7 +33,7 @@ let pendingAttachments = [];
 let openConversationMenu = null;
 let pendingDeleteConversationId = null;
 let historyOpen = false;
-let settingsVisible = readSettingsVisibility();
+let settingsVisible = true;
 let historyQuery = "";
 let composerConversationId = null;
 let renderedConversationId = null;
@@ -52,76 +53,69 @@ function uid() {
   return globalThis.crypto?.randomUUID?.() || `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function readConversations() {
-  try {
-    const value = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY) ?? "[]");
-    if (!Array.isArray(value)) return [];
-    return value.filter((item) => item && typeof item.id === "string" && Array.isArray(item.messages)).map((item) => ({
-      ...item, draft: { text: typeof item.draft?.text === "string" ? item.draft.text : "", attachments: Array.isArray(item.draft?.attachments) ? item.draft.attachments : [] }, settings: { model: item.model || "", api_format: "chat", system_prompt: "", temperature: null, max_tokens: null, ...item.settings },
-    }));
-  } catch {
-    return [];
-  }
-}
-
-function readActiveId() {
-  try { return localStorage.getItem(ACTIVE_KEY) || localStorage.getItem(LEGACY_ACTIVE_KEY) || conversations[0]?.id || null; }
-  catch { return conversations[0]?.id || null; }
-}
-
 function readSettingsVisibility() {
-  try { return localStorage.getItem(SETTINGS_VISIBLE_KEY) !== "false"; }
+  try { return localStorage.getItem(`${SETTINGS_VISIBLE_KEY}.${accountId()}`) !== "false"; }
   catch { return true; }
 }
 
 function setSettingsVisibility(visible, restoreFocus = false) {
   settingsVisible = visible;
-  try { localStorage.setItem(SETTINGS_VISIBLE_KEY, String(visible)); } catch {}
+  try { localStorage.setItem(`${SETTINGS_VISIBLE_KEY}.${accountId()}`, String(visible)); } catch {}
   renderDrawers();
   if (restoreFocus) document.querySelector('[data-agent-action="details"]')?.focus();
 }
 
-function saveConversations() {
-  conversations = conversations
-    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
-    .slice(0, 50);
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
-    if (activeId) localStorage.setItem(ACTIVE_KEY, activeId);
-  } catch {
-    toast(t("chatStorageFailed"), "error");
-  }
+function renderSyncStatus() {
+  const element = document.getElementById("chatSyncStatus");
+  if (!element) return;
+  element.classList.toggle("hidden", !syncError);
+  element.querySelector("span").textContent = syncError?.status === 409 ? t("chatRevisionConflict") : syncError ? `${t("chatSyncFailed")}: ${syncError.message}` : "";
+  element.querySelector("button").textContent = syncError?.status === 409 ? t("chatKeepDraftCopy") : t("retrySettings");
+}
+
+function saveConversations(conversation = activeConversation(), force = false) {
+  if (!conversation || !store.records.has(conversation.id)) return Promise.resolve();
+  if (!force && generation?.conversation.id === conversation.id && !generation.inserted) return Promise.resolve();
+  const changes = !force && generation?.conversation.id === conversation.id ? { draft: structuredClone(conversation.draft) } : { settings: { ...conversation.settings }, draft: structuredClone(conversation.draft) };
+  for (const key of ["temperature", "max_tokens"]) if (changes.settings && changes.settings[key] !== null && changes.settings[key] !== "") changes.settings[key] = Number(changes.settings[key]);
+  const snapshot = JSON.stringify(changes);
+  if (syncSnapshots.get(conversation.id) === snapshot) return store.writers.get(conversation.id)?.running || Promise.resolve();
+  syncSnapshots.set(conversation.id, snapshot);
+  return store.save(conversation.id, changes).then((saved) => {
+    conversation.revision = saved.revision; if (activeId === conversation.id) { syncError = null; renderSyncStatus(); }
+  }).catch((error) => {
+    if (error.name === "AbortError") return;
+    syncSnapshots.delete(conversation.id);
+    if (activeId === conversation.id) { syncError = error; renderSyncStatus(); }
+    if (error.status === 409) {
+      const remote = store.records.get(conversation.id);
+      if (remote) { conversation.messages = remote.messages; conversation.revision = remote.revision; }
+      if (activeId === conversation.id) renderMessages();
+    }
+  });
+}
+
+function normalize(conversation) {
+  return { ...conversation, model: conversation.settings?.model || "", messages: conversation.messages || [], draft: conversation.draft || { text: "", attachments: [] } };
 }
 
 function activeConversation() {
   return conversations.find((conversation) => conversation.id === activeId) || null;
 }
 
-function createConversation(inheritedSettings = null) {
-  const now = new Date().toISOString();
-  const conversation = {
-    id: uid(),
-    title: t("newConversation"),
-    model: models[0] || "",
-    settings: inheritedSettings ? { ...inheritedSettings } : { model: models[0] || "", api_format: "chat", system_prompt: "", temperature: null, max_tokens: null },
-    draft: { text: "", attachments: [] },
-    messages: [],
-    createdAt: now,
-    updatedAt: now,
-  };
-  conversation.model = conversation.settings.model;
+async function createConversation(inheritedSettings = null, draft) {
+  const settings = inheritedSettings ? { ...inheritedSettings } : { model: models[0] || "", api_format: "chat", system_prompt: "", temperature: null, max_tokens: null };
+  const conversation = normalize(await store.create(settings, draft));
   conversations.unshift(conversation);
   activeId = conversation.id;
-  saveConversations();
+  syncSnapshots.set(conversation.id, JSON.stringify({ settings: conversation.settings, draft: conversation.draft }));
   return conversation;
 }
 
-function ensureConversation() {
-  return activeConversation() || createConversation();
-}
+function ensureConversation() { return activeConversation(); }
 
 function conversationTitle(conversation) {
-  return conversation?.messages.length ? conversation.title || t("newConversation") : t("newConversation");
+  return conversation?.title || t("newConversation");
 }
 
 function renderCurrentTitle() {
@@ -130,17 +124,18 @@ function renderCurrentTitle() {
   document.querySelector('[data-agent-action="history"]')?.setAttribute("title", t("chatRecent"));
 }
 
-function persistDraft() {
+function persistDraft(force = false) {
   const conversation = activeConversation();
   if (!conversation || composerConversationId !== conversation.id) return;
   const draft = { text: document.getElementById("agentPrompt")?.value || "", attachments: pendingAttachments.map(attachmentMetadata) };
   if (JSON.stringify(conversation.draft) !== JSON.stringify(draft)) conversation.updatedAt = new Date().toISOString();
   conversation.draft = draft;
-  saveConversations();
+  return saveConversations(conversation, force);
 }
 
 async function restoreComposer() {
   const conversation = ensureConversation();
+  if (!conversation) return;
   const epoch = ++attachmentEpoch;
   composerConversationId = conversation.id;
   pendingAttachments = (conversation.draft?.attachments || []).map((attachment) => ({ ...attachment }));
@@ -200,39 +195,56 @@ function scrollToBottom(smooth = false) {
 }
 
 async function changeConversation(id) {
-  persistDraft();
-  rememberScroll();
-  stopGenerating();
-  invalidateProbe();
-  releasePendingAttachments();
-  activeId = id;
-  closeForConversationChange();
-  closeAttachmentMenu();
-  historyQuery = "";
-  const search = document.getElementById("chatHistorySearch");
-  if (search) search.value = "";
-  saveConversations();
+  await persistDraft();
+  rememberScroll(); stopGenerating(); invalidateProbe(); releasePendingAttachments();
+  const epoch = ++loadEpoch;
+  const local = conversations.find((item) => item.id === id);
+  const fresh = normalize(await store.get(id));
+  if (epoch !== loadEpoch || !pageLoaded) return;
+  const conflict = store.writers.get(id)?.conflict;
+  if (conflict && local) { fresh.draft = local.draft; fresh.settings = local.settings; }
+  conversations = conversations.map((item) => item.id === id ? fresh : item);
+  activeId = id; syncError = conflict ? Object.assign(new Error(), { status: 409 }) : null;
+  closeForConversationChange(); closeAttachmentMenu(); historyQuery = "";
+  const search = document.getElementById("chatHistorySearch"); if (search) search.value = "";
   const restoring = restoreComposer();
-  renderThreads(); renderMessages(); renderDetails(); setGenerating(false);
+  renderThreads(); renderMessages(); renderDetails(); setGenerating(false); renderSyncStatus();
   document.dispatchEvent(new CustomEvent("chatconversationopen"));
   await restoring;
 }
 
 async function newConversation() {
-  persistDraft();
-  const settings = { ...ensureConversation().settings };
-  const reusable = conversations.find((conversation) => !conversation.messages.length && !conversation.draft?.text && !conversation.draft?.attachments?.length);
-  if (reusable) {
-    reusable.settings = settings;
-    reusable.model = settings.model;
-    await changeConversation(reusable.id);
-  } else {
-    const previous = activeId;
-    const created = createConversation(settings);
-    activeId = previous;
-    await changeConversation(created.id);
+  await persistDraft();
+  const current = ensureConversation();
+  const settings = { ...current?.settings };
+  if (current && !current.messages.length && !current.draft?.text && !current.draft?.attachments?.length) {
+    releasePendingAttachments(); closeForConversationChange(); document.getElementById("agentPrompt")?.focus(); return;
   }
+  const reusable = conversations.find((item) => item.messages && !item.messages.length && !item.messageCount && !item.draft?.text && !item.draft?.attachments?.length && store.records.has(item.id));
+  const previous = activeId;
+  if (reusable) { reusable.settings = settings; await saveConversations(reusable); }
+  const created = reusable || await createConversation(settings);
+  activeId = previous;
+  await changeConversation(created.id);
   document.getElementById("agentPrompt")?.focus();
+}
+
+async function retrySync() {
+  const conversation = activeConversation();
+  if (!conversation) return;
+  if (syncError?.status === 409) {
+    const draft = structuredClone(conversation.draft), settings = { ...conversation.settings };
+    // Attachment references are scoped to their conversation; upload copies first.
+    const created = await createConversation(settings);
+    for (const metadata of draft.attachments) {
+      const payload = await store.attachment(conversation.id, metadata.id);
+      const { id: ignored, ...content } = payload;
+      const uploaded = await store.upload(created.id, content); metadata.id = uploaded.id;
+    }
+    created.draft = draft; syncError = null;
+    await saveConversations(created); await changeConversation(created.id);
+  } else { syncSnapshots.delete(conversation.id); await saveConversations(conversation); }
+  renderSyncStatus();
 }
 
 function renderShell() {
@@ -259,6 +271,7 @@ function renderShell() {
         </div>
 
         <div class="agent-composer-wrap">
+          <div class="chat-sync-status hidden" id="chatSyncStatus" role="alert"><span></span><button type="button" class="btn-secondary" data-agent-action="retry-sync"></button></div>
           <div class="agent-attachment-strip hidden" id="agentAttachmentStrip"></div>
           <div class="agent-composer">
             <textarea id="agentPrompt" rows="1" maxlength="100000" placeholder="${t("chatPlaceholder")}" aria-label="${t("chatPlaceholder")}" data-i18n-placeholder="chatPlaceholder"></textarea>
@@ -398,7 +411,7 @@ function closeHistory(restoreFocus = false) {
 
 function closeForConversationChange() { closeHistory(); }
 
-function toggleDrawer(drawer) {
+async function toggleDrawer(drawer) {
   closeAttachmentMenu();
   if (drawer === "details") {
     setSettingsVisibility(!settingsVisible, settingsVisible);
@@ -412,6 +425,10 @@ function toggleDrawer(drawer) {
     closeHistory(true);
     return;
   }
+  const session = owner;
+  const summaries = await store.list();
+  if (owner !== session || !pageLoaded) return;
+  conversations = summaries.map((summary) => conversations.find((item) => item.id === summary.id) || normalize(summary));
   historyOpen = true;
   openConversationMenu = null;
   renderThreads();
@@ -476,7 +493,8 @@ function renderDetails() {
 }
 
 function validateSettings(showToast = true) {
-  const source = ensureConversation().settings;
+  const source = ensureConversation()?.settings;
+  if (!source) return null;
   const temperature = source.temperature === null || source.temperature === "" ? null : Number(source.temperature);
   const maxTokens = source.max_tokens === null || source.max_tokens === "" ? null : Number(source.max_tokens);
   let error = "";
@@ -514,7 +532,7 @@ async function testConnection() {
   probeResult = null;
   renderProbe();
   try {
-    const result = await api("/api/admin/chat/test", { method: "POST", body: JSON.stringify(settings), signal: operation.controller.signal });
+    const result = await api("/api/chat/test", { method: "POST", body: JSON.stringify(settings), signal: operation.controller.signal });
     if (probe !== operation || !pageLoaded || activeId !== operation.conversationId) return;
     if (!result?.success) throw new Error(result?.message || t("chatTestFailed"));
     probeResult = { text: `${t("chatTestSucceeded")} · ${Math.round(result.latency_ms)} ms`, error: false };
@@ -602,9 +620,10 @@ async function readFiles(event, images) {
       if (pendingAttachments.reduce((total, item) => total + item.size, 0) + attachment.size > 10_000_000) {
         toast(t("attachmentsTooLarge"), "warning"); break;
       }
-      await saveAttachment(attachment);
+      const uploaded = await store.upload(conversationId, { kind: attachment.kind, name: attachment.name, mime_type: attachment.mimeType, size: attachment.size, content: attachment.content, data_url: attachment.dataUrl });
+      attachment.id = uploaded.id;
       if (epoch !== attachmentEpoch || conversationId !== activeId || !pageLoaded) {
-        await deleteAttachments([attachment.id]); break;
+        await store.removeAttachment(conversationId, attachment.id); break;
       }
       attachmentCache.set(attachment.id, attachment);
       pendingAttachments.push(attachment);
@@ -620,10 +639,11 @@ function attachmentMetadata({ id, kind, name, mimeType, size }) {
   return { id, kind, name, mimeType, size };
 }
 
-function forgetAttachments(attachments) {
-  const ids = attachments.map((attachment) => attachment.id).filter(Boolean);
-  for (const id of ids) attachmentCache.delete(id);
-  deleteAttachments(ids).catch(() => {});
+async function forgetAttachments(attachments, conversationId = activeId) {
+  for (const attachment of attachments) {
+    attachmentCache.delete(attachment.id);
+    try { await store.removeAttachment(conversationId, attachment.id); } catch { /* Referenced attachments remain owned by their conversation. */ }
+  }
 }
 
 function releasePendingAttachments() {
@@ -632,35 +652,14 @@ function releasePendingAttachments() {
   pendingAttachments = [];
 }
 
-async function attachmentPayload(attachment) {
+async function attachmentPayload(attachment, conversationId = activeId) {
   if (attachment.dataUrl !== undefined || attachment.content !== undefined) return attachment;
   if (!attachment.id) return null;
   if (attachmentCache.has(attachment.id)) return attachmentCache.get(attachment.id);
-  const stored = await getAttachment(attachment.id);
+  const raw = await store.attachment(conversationId, attachment.id);
+  const stored = raw ? { ...raw, mimeType: raw.mime_type, dataUrl: raw.data_url } : null;
   if (stored) attachmentCache.set(attachment.id, stored);
   return stored || null;
-}
-
-async function payloadMessages(messages) {
-  const result = [];
-  let missing = false;
-  for (const message of messages) {
-    if (!["user", "assistant"].includes(message.role) || message.status === "error") continue;
-    const attachments = [];
-    const unavailable = [];
-    for (const metadata of message.attachments || []) {
-      const attachment = await attachmentPayload(metadata);
-      if (!attachment) { metadata.unavailable = true; unavailable.push(metadata.name); missing = true; continue; }
-      delete metadata.unavailable;
-      attachments.push({ kind: attachment.kind, name: attachment.name, mime_type: attachment.mimeType, size: attachment.size,
-        data_url: attachment.dataUrl, content: attachment.content });
-    }
-    let content = message.content || "";
-    if (unavailable.length) content += `\n[Attachment content unavailable; not included: ${unavailable.join(", ")}]`;
-    if (content || attachments.length) result.push({ role: message.role, content, attachments });
-  }
-  if (missing) toast(t("chatLegacyAttachmentHint"), "warning");
-  return result;
 }
 
 function renderPendingAttachments() {
@@ -741,28 +740,25 @@ function closeDeleteConfirmation() {
 }
 
 async function deleteConversation(conversation) {
+  if (!store.records.has(conversation.id)) await store.get(conversation.id);
   const deletingActive = activeId === conversation.id;
+  if (deletingActive) { await persistDraft(); stopGenerating(); invalidateProbe(); }
+  await store.remove(conversation.id);
+  if (deletingActive) releasePendingAttachments();
+  readingPositions.delete(conversation.id); syncSnapshots.delete(conversation.id);
+  closeForConversationChange(); conversations = conversations.filter((item) => item.id !== conversation.id);
   if (deletingActive) {
-    stopGenerating(); invalidateProbe(); releasePendingAttachments();
+    activeId = null;
+    if (conversations.length) await changeConversation(conversations[0].id);
+    else { await createConversation(conversation.settings); await restoreComposer(); renderMessages(); }
   }
-  forgetAttachments([...conversation.messages.flatMap((message) => message.attachments || []), ...(conversation.draft?.attachments || [])]);
-  readingPositions.delete(conversation.id);
-  closeForConversationChange();
-  conversations = conversations.filter((item) => item.id !== conversation.id);
-  if (deletingActive) {
-    activeId = conversations[0]?.id || null;
-    if (!activeId) createConversation(conversation.settings);
-    const restoring = restoreComposer();
-    renderMessages();
-    await restoring;
-  }
-  saveConversations();
   renderThreads(); renderDetails(); renderPendingAttachments();
 }
 
 async function exportConversation(conversation) {
-  const draftAttachments = await Promise.all((conversation.draft?.attachments || []).map(async (attachment) => await attachmentPayload(attachment) || { ...attachment, unavailable: true }));
-  const messages = await Promise.all(conversation.messages.map(async (message) => ({ ...message, attachments: await Promise.all((message.attachments || []).map(async (attachment) => await attachmentPayload(attachment) || { ...attachment, unavailable: true })) })));
+  conversation = normalize(await store.get(conversation.id));
+  const draftAttachments = await Promise.all((conversation.draft?.attachments || []).map(async (attachment) => await attachmentPayload(attachment, conversation.id) || { ...attachment, unavailable: true }));
+  const messages = await Promise.all(conversation.messages.map(async (message) => ({ ...message, attachments: await Promise.all((message.attachments || []).map(async (attachment) => await attachmentPayload(attachment, conversation.id) || { ...attachment, unavailable: true })) })));
   const payload = {
     schema_version: 1,
     exported_at: new Date().toISOString(),
@@ -866,7 +862,7 @@ function messageMarkup(message) {
   const role = message.role === "user" ? "user" : "assistant";
   const content = message.content
     ? (role === "assistant" ? renderMarkdown(message.content) : escapeHtml(message.content))
-    : role === "assistant" && !message.status ? `<span class="agent-typing"><i></i><i></i><i></i></span>` : "";
+    : role === "assistant" && (!message.status || message.status === "running") ? `<span class="agent-typing"><i></i><i></i><i></i></span>` : "";
   const attachments = (message.attachments || []).length ? `
     <div class="agent-sent-attachments">
       ${message.attachments.map((attachment) => `
@@ -896,6 +892,7 @@ function renderMessages({ forceBottom = false } = {}) {
   const container = document.getElementById("agentMessages");
   if (!container) return;
   const conversation = ensureConversation();
+  if (!conversation) { container.innerHTML = ""; return; }
   const previous = renderedConversationId === conversation.id ? { top: container.scrollTop, follow: followOutput && (smoothScrollPending || nearBottom(container)) } : readingPositions.get(conversation.id);
   if (!conversation.messages.length) {
     container.innerHTML = `
@@ -922,6 +919,7 @@ function renderModels() {
   const select = document.getElementById("agentModel");
   if (!select) return;
   const conversation = ensureConversation();
+  if (!conversation) return;
   const model = conversation.settings.model;
   const available = [...models];
   if (model && !available.includes(model)) available.unshift(model);
@@ -942,16 +940,17 @@ function setRuntimeStatus(text, active = false) {
 function setGenerating(generating) {
   document.getElementById("agentSend")?.classList.toggle("hidden", generating);
   document.getElementById("agentStop")?.classList.toggle("hidden", !generating);
-  const ready = status?.token_available === false ? t("chatTokenUnavailable") : t("agentReady");
+  const ready = status?.token_available === false ? status.message || t("chatTokenUnavailable") : t("agentReady");
   setRuntimeStatus(generating ? t("agentThinking") : ready, generating);
 }
 
 async function refreshModels(epoch) {
-  const response = await api("/api/admin/chat/models");
+  const response = await api("/api/chat/models");
   if (epoch !== loadEpoch || !pageLoaded) return;
   status = response;
   models = [...new Set(status.models || [])];
   const conversation = ensureConversation();
+  if (!conversation) return;
   if (!conversation.settings.model && models.length) {
     conversation.settings.model = models[0];
     conversation.model = models[0];
@@ -978,152 +977,141 @@ async function responseError(response) {
 
 async function sendMessage() {
   if (generation) return;
-  const textarea = document.getElementById("agentPrompt");
-  const submittedText = textarea?.value || "";
-  const typedPrompt = submittedText.trim();
-  if (!typedPrompt && !pendingAttachments.length) return;
-  const settings = validateSettings();
-  if (!settings) return;
+  const textarea = document.getElementById("agentPrompt"), submittedText = textarea?.value || "";
+  const content = submittedText.trim();
+  if (!content && !pendingAttachments.length) return;
+  const settings = validateSettings(); if (!settings) return;
   if (status?.token_available === false) { toast(t("chatTokenUnavailable"), "warning"); return; }
-  const conversation = ensureConversation();
-  const outboundAttachments = [...pendingAttachments];
-  const totalSize = conversation.messages.flatMap((message) => message.attachments || []).concat(outboundAttachments).reduce((total, attachment) => total + (attachment.size || 0), 0);
-  if (totalSize > 20_000_000) { toast(t("chatHistoryTooLarge"), "warning"); return; }
-  const userMessage = { id: uid(), role: "user", content: typedPrompt || t("defaultAttachmentPrompt"), attachments: outboundAttachments.map(attachmentMetadata) };
-  const assistantMessage = { id: uid(), role: "assistant", content: "", model: settings.model };
-  const operation = { controller: new AbortController(), conversation, assistantMessage, inserted: false };
-  generation = operation;
-  setGenerating(true);
+  const conversation = ensureConversation(), outbound = [...pendingAttachments];
+  const operation = { controller: new AbortController(), conversation, assistantMessage: null, inserted: false, session: owner };
+  generation = operation; setGenerating(true);
   try {
-    const messages = await payloadMessages([...conversation.messages, userMessage]);
-    if (generation !== operation || operation.controller.signal.aborted) return;
-    conversation.messages.push(userMessage, assistantMessage);
-    operation.inserted = true;
-    if (conversation.messages.filter((message) => message.role === "user").length === 1) {
-      conversation.title = userMessage.content.length > 32 ? `${userMessage.content.slice(0, 32)}…` : userMessage.content;
-    }
-    conversation.updatedAt = new Date().toISOString();
-    if (textarea.value === submittedText) {
-      textarea.value = "";
-      textarea.style.height = "auto";
-    }
-    pendingAttachments = pendingAttachments.filter((attachment) => !outboundAttachments.some((sent) => sent.id === attachment.id));
-    persistDraft();
-    renderPendingAttachments();
-    saveConversations();
-    renderThreads();
-    renderMessages({ forceBottom: true });
-    renderDetails();
-    const response = await fetch("/api/admin/chat/completions", {
-      method: "POST", credentials: "same-origin",
-      headers: { "Content-Type": "application/json", "X-Conversation-Id": conversation.id, ...adminCsrfHeaders() },
-      body: JSON.stringify({ ...settings, conversation_id: conversation.id, messages }),
-      signal: operation.controller.signal,
+    await persistDraft(true);
+    const canonical = await store.flush(conversation.id);
+    if (generation !== operation) return;
+    const response = await fetch("/api/chat/completions", {
+      method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json", ...adminCsrfHeaders() },
+      body: JSON.stringify({ conversation_id: conversation.id, expected_revision: canonical.revision, settings, message: { content, attachments: outbound.map(({ id }) => ({ id })) } }), signal: operation.controller.signal,
     });
     if (generation !== operation) return;
     handleAdminUnauthorized(response);
-    if (!response.ok) throw new Error(await responseError(response));
+    if (!response.ok) throw Object.assign(new Error(await responseError(response)), { status: response.status });
     if (!response.body) throw new Error(t("streamUnavailable"));
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let completed = false;
+    const reader = response.body.getReader(), decoder = new TextDecoder(); let buffer = "", completed = false;
     const consume = (block) => {
-      const event = parseEventBlock(block);
-      if (!event || completed) return;
-      if (event.type === "delta") {
-        assistantMessage.content += event.content || "";
-        if (pageLoaded && activeId === conversation.id && generation === operation) {
-          const list = document.getElementById("agentMessages");
-          followOutput = followOutput && (smoothScrollPending || nearBottom(list));
-          const content = document.querySelector(`[data-message-id="${assistantMessage.id}"] .agent-message-content`);
-          if (content) { content.classList.add("streaming"); content.innerHTML = renderMarkdown(assistantMessage.content); }
-          if (list && followOutput) scrollToBottom();
-          else updateScrollControl();
-        }
-      } else if (event.type === "done") {
+      const event = parseEventBlock(block); if (!event || completed) return;
+      if (event.type === "start") {
+        store.accept(event.conversation);
+        conversation.messages = event.conversation.messages; conversation.revision = event.conversation.revision; conversation.title = event.conversation.title;
+        operation.assistantMessage = conversation.messages.findLast((message) => message.role === "assistant"); operation.inserted = true;
+        if (textarea.value === submittedText) { textarea.value = ""; textarea.style.height = "auto"; }
+        pendingAttachments = pendingAttachments.filter((attachment) => !outbound.some((sent) => sent.id === attachment.id));
+        conversation.draft = { text: textarea.value, attachments: pendingAttachments.map(attachmentMetadata) };
+        syncSnapshots.delete(conversation.id); saveConversations(conversation);
+        renderPendingAttachments(); renderThreads(); renderMessages({ forceBottom: true });
+      } else if (event.type === "delta" && operation.assistantMessage) {
+        const list = document.getElementById("agentMessages"); followOutput = followOutput && (smoothScrollPending || nearBottom(list));
+        operation.assistantMessage.content += event.content || "";
+        const element = document.querySelector(`[data-message-id="${operation.assistantMessage.id}"] .agent-message-content`);
+        if (element) { element.classList.add("streaming"); element.innerHTML = renderMarkdown(operation.assistantMessage.content); }
+        if (followOutput) scrollToBottom(); else updateScrollControl();
+      } else if (event.type === "done" || event.type === "error") {
         completed = true;
-        assistantMessage.content = event.answer ?? assistantMessage.content;
-        assistantMessage.content ||= t("emptyResponse");
-        assistantMessage.status = "done";
-        if (event.usage) assistantMessage.usage = event.usage;
-      } else if (event.type === "error") throw new Error(event.message || t("chatFailed"));
+        if (event.conversation) { store.accept(event.conversation); conversation.messages = event.conversation.messages; conversation.revision = event.conversation.revision; conversation.title = event.conversation.title; }
+        if (event.type === "error") toast(event.message || t("chatFailed"), "error");
+      }
     };
     try {
       while (true) {
         const { value, done } = await reader.read();
-        if (generation !== operation || operation.controller.signal.aborted) { await reader.cancel?.(); return; }
+        if (generation !== operation) { await reader.cancel?.(); return; }
         buffer = (buffer + decoder.decode(value || new Uint8Array(), { stream: !done })).replaceAll("\r\n", "\n");
-        const blocks = buffer.split("\n\n");
-        buffer = blocks.pop() || "";
-        for (const block of blocks) consume(block);
+        const blocks = buffer.split("\n\n"); buffer = blocks.pop() || "";
+        blocks.forEach(consume);
         if (done) { if (buffer.trim()) consume(buffer); break; }
       }
       if (!completed) throw new Error(t("chatStreamInterrupted"));
-    } finally {
-      if (!completed) { try { await reader.cancel?.(); } catch { /* The request may already be aborted. */ } }
-      reader.releaseLock?.();
-    }
+    } finally { if (!completed) { try { await reader.cancel?.(); } catch {} } reader.releaseLock?.(); }
   } catch (error) {
-    if (generation !== operation) return;
-    if (error.name === "AbortError") {
-      assistantMessage.content ||= t("generationStopped");
-      assistantMessage.status = "stopped";
+    if (generation !== operation || error.name === "AbortError") return;
+    if (error.status === 409) {
+      const localDraft = { text: textarea.value, attachments: pendingAttachments.map(attachmentMetadata) };
+      try { const fresh = await store.get(conversation.id); conversation.messages = fresh.messages; conversation.revision = fresh.revision; conversation.draft = localDraft; } catch {}
+      const writer = store.writers.get(conversation.id) || {}; writer.conflict = true; store.writers.set(conversation.id, writer);
+      syncError = error; renderSyncStatus();
     } else {
-      operation.controller.abort();
-      assistantMessage.error = `${t("chatFailed")}: ${error.message}`;
-      assistantMessage.status = "error";
-      toast(error.message, "error");
+      operation.controller.abort(); toast(error.message, "error");
+      if (operation.assistantMessage) {
+        const messageId = operation.assistantMessage.id;
+        const failure = `${t("chatFailed")}: ${error.message}`;
+        try {
+          const fresh = await store.get(conversation.id);
+          if (generation !== operation) return;
+          conversation.messages = fresh.messages; conversation.revision = fresh.revision;
+          operation.assistantMessage = conversation.messages.find((message) => message.id === messageId) || operation.assistantMessage;
+        } catch {}
+        operation.assistantMessage.error = failure;
+      }
     }
   } finally {
     if (generation === operation) {
       generation = null;
-      if (operation.inserted && conversations.includes(conversation)) {
-        conversation.updatedAt = new Date().toISOString();
-        saveConversations();
-      }
-      if (pageLoaded && activeId === conversation.id) {
-        renderThreads(); renderMessages(); renderDetails(); setGenerating(false);
-      }
+      if (operation.inserted) { syncSnapshots.delete(conversation.id); await saveConversations(conversation); }
+      if (pageLoaded && activeId === conversation.id) { renderThreads(); renderMessages(); renderDetails(); setGenerating(false); }
     }
   }
 }
 
 function stopGenerating() {
-  const operation = generation;
-  if (!operation) return;
-  generation = null;
-  operation.controller.abort();
-  if (operation.inserted && conversations.includes(operation.conversation)) {
-    operation.assistantMessage.content ||= t("generationStopped");
-    operation.assistantMessage.status = "stopped";
-    operation.conversation.updatedAt = new Date().toISOString();
-    saveConversations();
-  }
-  if (pageLoaded && activeId === operation.conversation.id) {
-    renderMessages(); renderDetails(); setGenerating(false);
+  const operation = generation; if (!operation) return;
+  generation = null; operation.controller.abort();
+  if (operation.assistantMessage) operation.assistantMessage.status = "stopped";
+  if (pageLoaded && activeId === operation.conversation.id) { renderMessages(); setGenerating(false); }
+  if (operation.inserted) {
+    const session = owner, id = operation.conversation.id;
+    setTimeout(async () => {
+      if (owner !== session) return;
+      try {
+        const fresh = await store.get(id);
+        if (owner !== session) return;
+        operation.conversation.messages = fresh.messages; operation.conversation.revision = fresh.revision;
+        syncSnapshots.delete(id); await saveConversations(operation.conversation);
+        if (pageLoaded && activeId === id && !generation) renderMessages();
+      } catch {}
+    }, 300);
   }
 }
 
 export async function load() {
-  pageLoaded = true;
-  const epoch = ++loadEpoch;
-  const existingShell = initialized && document.querySelector("#chat .agent-chat-shell");
-  if (!existingShell) renderShell();
+  if (!accountId()) return;
+  if (owner !== accountId()) { resetSession(); owner = accountId(); settingsVisible = readSettingsVisibility(); }
+  pageLoaded = true; const epoch = ++loadEpoch;
+  const existingShell = initialized && document.querySelector("#chat .agent-chat-shell"); if (!existingShell) renderShell();
   refreshShellLabels();
-  ensureConversation();
-  const restoring = composerConversationId !== activeId ? restoreComposer() : Promise.resolve();
-  saveConversations();
-  renderThreads(); renderMessages(); renderDetails(); renderPendingAttachments(); renderDrawers();
-  setGenerating(Boolean(generation));
-  await restoring;
-  try { await refreshModels(epoch); }
-  catch (error) {
+  try {
+    if (!listLoaded) {
+      const [summaries, modelResult] = await Promise.all([store.list(), api("/api/chat/models")]);
+      if (epoch !== loadEpoch || !pageLoaded) return;
+      status = modelResult; models = [...new Set(status.models || [])]; conversations = summaries.map(normalize); listLoaded = true;
+      if (conversations.length) {
+        activeId = conversations[0].id; const fresh = normalize(await store.get(activeId)); conversations[0] = fresh;
+      } else await createConversation();
+    }
     if (epoch !== loadEpoch || !pageLoaded) return;
-    setRuntimeStatus(t("chatServiceUnavailable"));
-    toast(error.message, "error");
-  }
+    if (composerConversationId !== activeId) await restoreComposer();
+    renderThreads(); renderMessages(); renderDetails(); renderPendingAttachments(); renderDrawers(); renderSyncStatus(); setGenerating(Boolean(generation));
+    await refreshModels(epoch);
+  } catch (error) { if (epoch === loadEpoch && pageLoaded) { setRuntimeStatus(t("chatServiceUnavailable")); toast(error.message, "error"); } }
 }
+
+export function resetSession() {
+  stopGenerating(); store.reset(); invalidateProbe(); ++loadEpoch; ++attachmentEpoch;
+  pageLoaded = false; listLoaded = false; owner = ""; conversations = []; activeId = null; models = []; status = null;
+  syncSnapshots.clear(); attachmentCache.clear(); readingPositions.clear(); pendingAttachments = [];
+  composerConversationId = renderedConversationId = null; syncError = null; generation = null;
+  const container = document.getElementById("chat"); if (container) container.innerHTML = "";
+}
+document.addEventListener("sessionended", resetSession);
 
 export function renderHistory() {
   refreshShellLabels();
@@ -1159,7 +1147,7 @@ export async function onClick(target) {
     return false;
   }
   if (action === "history" || action === "details") {
-    toggleDrawer(action);
+    await toggleDrawer(action);
   } else if (action === "close-drawer") {
     if (button.closest("#agentDetailsDrawer")) setSettingsVisibility(false, true);
     else closeHistory(true);
@@ -1226,10 +1214,13 @@ export async function onClick(target) {
   } else if (action === "add-file") {
     document.getElementById("agentFileInput")?.click();
 
+  } else if (action === "retry-sync") {
+    await retrySync();
   } else if (action === "remove-attachment") {
-    forgetAttachments(pendingAttachments.filter((attachment) => attachment.id === button.dataset.attachmentId));
+    const removed = pendingAttachments.filter((attachment) => attachment.id === button.dataset.attachmentId);
     pendingAttachments = pendingAttachments.filter((attachment) => attachment.id !== button.dataset.attachmentId);
-    persistDraft();
+    await persistDraft();
+    await forgetAttachments(removed);
     renderPendingAttachments();
   }
   return true;
