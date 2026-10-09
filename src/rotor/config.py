@@ -1,7 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import SettingsConfigDict
 from pydantic_settings import BaseSettings
 
@@ -13,6 +14,18 @@ DEFAULT_CACHE_DIR = Path.home() / ".cache" / "rotor"
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_retired_chat_mcp_settings(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        retired = {
+            "ROTOR_MINDAGENT_MCP_COMMAND",
+            "ROTOR_MINDAGENT_MCP_ARGS",
+            "ROTOR_MINDAGENT_MCP_CWD",
+        }
+        return {key: value for key, value in values.items() if key not in retired}
 
     # API Settings
     API_V1_STR: str = "/v1"
@@ -41,12 +54,6 @@ class Settings(BaseSettings):
     ROTOR_CONTROL_ACTOR_ID: str = "rotor-agent"
     ROTOR_CONTROL_CLIENT_ID: str = "rotor-mcp"
     ROTOR_CONTROL_API_URL: str = "http://127.0.0.1:8000/api/control/v1"
-    # MindAgent starts the independent Rotor MCP Server only when an explicit
-    # command is configured. The Control token is passed through the child
-    # process environment, never exposed as a tool argument.
-    ROTOR_MINDAGENT_MCP_COMMAND: str | None = None
-    ROTOR_MINDAGENT_MCP_ARGS: list[str] = Field(default_factory=list)
-    ROTOR_MINDAGENT_MCP_CWD: str | None = None
     # Database. This release runs the startup migration path against a
     # file-backed SQLite database only; other drivers are rejected at startup.
     DATABASE_URL: str = f"sqlite+aiosqlite:///{DEFAULT_CACHE_DIR / 'rotor.db'}"

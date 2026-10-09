@@ -218,7 +218,7 @@ Inspect and update runtime settings through `GET/PUT /api/admin/settings`.
 Adaptive statistics and channel cooldowns are process-local and relearned after
 restart, while request outcomes and routing decisions are persisted.
 
-## Control API, MCP, and MindAgent
+## Control API and MCP
 
 The Control API uses a dedicated Bearer token and does not accept ordinary
 `sk-` user tokens:
@@ -249,11 +249,35 @@ database-backed `rck_` credential under **API Keys → MCP Control Keys**. The
 full value is shown only once, can be disabled or deleted independently, and
 does not accept ordinary `sk-` user tokens.
 
-The MindAgent chat in the admin UI is powered by the MindAgent library
-(`mindagent==0.5.3`, installed with Rotor) and can run independently. Loading
-the Rotor MCP diagnostic tools additionally requires `rotor-gateway[mcp]`, an
-MCP command, and a Control token. Its local conversation history can be
-created, exported as JSON, or deleted from the sidebar.
+## Admin chat
+
+Admin chat uses the OpenAI SDK to call the Rotor gateway, retaining channel
+routing, usage accounting, and request logging. Chat Completions is the
+default protocol; Responses is also available. Each conversation saves its
+own model, API format, System Prompt, temperature, and max_tokens in the right-hand
+settings panel. Leave temperature and max_tokens blank to use upstream
+defaults. The System Prompt is limited to 100,000 characters.
+**Test connection** makes a short, real text generation request with
+the current parameters and may incur upstream charges. It does not validate
+the model’s image or document understanding.
+
+Chat accepts text, PNG/JPEG/WebP/GIF images, UTF-8 text documents, PDFs, and
+DOCX files. The backend extracts text from PDF/DOCX documents; images and
+table layout are not preserved, and OCR is not performed. Convert scanned
+PDFs to images before uploading. Image understanding depends on the selected
+model's vision support. Attachments are limited to 5 MB per file, 6 files and
+10 MB per message, and 20 MB per conversation. UTF-8 text and code files have
+a stricter limit of 500,000 bytes. PDFs are limited to 100 pages, and each
+PDF/DOCX document to 500,000 extracted characters. Exceeding a limit returns
+an explicit error.
+
+Conversation history stays in the current browser and can be created,
+exported as JSON, or deleted. It does not sync across browsers. Existing
+conversations are retained; attachment content not saved by older versions
+cannot be recovered, and the UI asks you to attach those files again. This history
+is separate from the gateway request records in `CONVERSATION_STORE_DIR`.
+Admin chat does not require an MCP command or a Control token; configure the
+independent Rotor MCP service separately as described above.
 
 ## Important configuration
 
@@ -273,7 +297,6 @@ created, exported as JSON, or deleted from the sidebar.
 | `ROTOR_ADMIN_LOGIN_LOCK_SECONDS` | `900` | Lockout duration in seconds |
 | `ROTOR_CONTROL_API_TOKEN` | unset | Control API and MCP authentication |
 | `ROTOR_CONTROL_API_SCOPES` | three read-only scopes | Control API permissions |
-| `ROTOR_MINDAGENT_MCP_COMMAND` | unset | Command used by MindAgent to start an independent MCP server |
 
 See [Runtime configuration](gitbook/operations/configuration.md) for the full
 reference.

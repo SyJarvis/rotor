@@ -28,22 +28,33 @@ const registry = new Map();
 export function destroyChart(key) {
   const c = registry.get(key);
   if (c) { c.destroy(); registry.delete(key); }
+  snapshotStore.delete(key);
 }
 
 export function destroyAll() {
   for (const c of registry.values()) c.destroy();
   registry.clear();
+  snapshotStore.clear();
 }
 
 // Rebuild all charts on theme change (colors must follow CSS vars).
 export function refreshTheme() {
-  destroyAll();
-  for (const factory of snapshotStore.values()) factory();
+  for (const [key, { canvas, factory }] of [...snapshotStore]) {
+    const old = registry.get(key);
+    old?.destroy();
+    registry.delete(key);
+    if (!canvas.isConnected || canvas.closest(".panel")?.classList.contains("active") === false) {
+      snapshotStore.delete(key);
+      continue;
+    }
+    const chart = factory();
+    if (chart) registry.set(key, chart);
+  }
 }
 
 const snapshotStore = new Map();
-function register(key, factory) {
-  snapshotStore.set(key, factory);
+function register(key, canvas, factory) {
+  snapshotStore.set(key, { canvas, factory });
   const c = factory();
   if (c) registry.set(key, c);
 }
@@ -106,7 +117,7 @@ export function renderTimeline(key, canvas, data, opts = {}) {
     });
   };
   destroyChart(key);
-  register(key, factory);
+  register(key, canvas, factory);
 }
 
 /* ---------- grouped bar histogram (per-model token consumption) ---------- */
@@ -184,11 +195,11 @@ export function renderStackedBar(key, canvas, labels, datasets, opts = {}) {
     });
   };
   destroyChart(key);
-  register(key, factory);
+  register(key, canvas, factory);
 }
 
-/* ---------- stacked line (per-model token consumption) ---------- */
-export function renderStackedLine(key, canvas, labels, datasets, opts = {}) {
+/* ---------- usage line (total or per-model) ---------- */
+export function renderLine(key, canvas, labels, datasets, opts = {}) {
   if (!available()) return null;
   const factory = () => {
     const ctx = canvas.getContext("2d");
@@ -204,9 +215,11 @@ export function renderStackedLine(key, canvas, labels, datasets, opts = {}) {
             label: ds.label,
             data: ds.data,
             borderColor: c,
-            backgroundColor: hexA(c, 0.18),
-            fill: true,
-            tension: 0.35,
+            backgroundColor: hexA(c, 0.07),
+            fill: opts.fill === true,
+            cubicInterpolationMode: "monotone",
+            tension: 0.2,
+            spanGaps: false,
             pointRadius: 2,
             pointHoverRadius: 5,
             borderWidth: 2,
@@ -233,13 +246,13 @@ export function renderStackedLine(key, canvas, labels, datasets, opts = {}) {
         },
         scales: {
           x: { ticks: { color: colors.muted, maxRotation: 0, autoSkipPadding: 16 }, grid: { display: false } },
-          y: { stacked: true, ticks: { color: colors.muted, callback: (v) => formatShort(v) }, grid: { color: colors.line } },
+          y: { stacked: false, beginAtZero: true, min: 0, title: { display: true, text: opts.yTitle || "Tokens", color: colors.muted }, ticks: { color: colors.muted, callback: (v) => formatShort(v) }, grid: { color: colors.line } },
         },
       },
     });
   };
   destroyChart(key);
-  register(key, factory);
+  register(key, canvas, factory);
 }
 
 function formatShort(n) {
@@ -279,7 +292,7 @@ export function renderDonut(key, canvas, labels, values, opts = {}) {
     });
   };
   destroyChart(key);
-  register(key, factory);
+  register(key, canvas, factory);
 }
 
 /* ---------- horizontal bar (channel success rate) ---------- */
@@ -316,7 +329,7 @@ export function renderHBar(key, canvas, labels, values, opts = {}) {
     });
   };
   destroyChart(key);
-  register(key, factory);
+  register(key, canvas, factory);
 }
 
 /* ---------- sparkline (inline SVG, no Chart.js needed) ---------- */

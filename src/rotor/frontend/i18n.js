@@ -3,7 +3,9 @@
 const STORAGE_KEY = "rotor.locale";
 const config = window.ROTOR_UI_CONFIG;
 
-export let locale = localStorage.getItem(STORAGE_KEY) || config.defaultLocale;
+let savedLocale;
+try { savedLocale = localStorage.getItem(STORAGE_KEY); } catch {}
+export let locale = config.locales[savedLocale] ? savedLocale : config.defaultLocale;
 
 export function t(key) {
   return key.split(".").reduce((value, part) => value?.[part], config.locales[locale]) ?? key;
@@ -21,13 +23,16 @@ export function applyLocale() {
   document.querySelectorAll("[data-i18n-title]").forEach((el) => {
     el.title = t(el.dataset.i18nTitle);
   });
-  const localeLabel = document.getElementById("localeLabel");
-  if (localeLabel) localeLabel.textContent = locale === "zh-CN" ? "EN" : "中";
   document.dispatchEvent(new CustomEvent("localechange", { detail: { locale } }));
 }
 
-export function toggleLocale() {
-  locale = locale === "zh-CN" ? "en" : "zh-CN";
+export function setLocale(value) {
+  if (!config.locales[value] || value === locale) return;
+  locale = value;
   try { localStorage.setItem(STORAGE_KEY, locale); } catch (e) {}
   applyLocale();
+}
+
+export function toggleLocale() {
+  setLocale(locale === "zh-CN" ? "en" : "zh-CN");
 }

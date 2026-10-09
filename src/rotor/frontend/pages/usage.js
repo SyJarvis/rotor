@@ -1,393 +1,367 @@
-// Usage page — per-model token histograms + model donut + channel success bars.
+// Usage page — shared filtered totals, usage trends, model and channel breakdowns.
 
 import { api } from "../api.js?v=2";
-import { t } from "../i18n.js";
+import { t, locale } from "../i18n.js";
 import {
-  escapeHtml, formatNumber, formatRequestCount, formatLatency, skeletonKpis, refreshIcons, badge,
-  toast,
-} from "../ui.js?v=11";
-import { renderStackedBar, renderDonut, renderHBar, isAvailable } from "../charts.js?v=8";
+  escapeHtml, formatNumber, formatRequestCount, formatLatency, skeletonKpis, refreshIcons, badge, toast,
+} from "../ui.js?v=12";
+import { renderLine, renderDonut, renderHBar, destroyChart, isAvailable } from "../charts.js?v=9";
 import {
   TIME_RANGES, bucketKey, bucketLabel, createCustomTimeRange, createTimeRange,
   dateInTimezone, expectedRangeBuckets,
-} from "../periods.js?v=2";
+} from "../periods.js?v=3";
 
 let state = {
-  range: "today",
-  timeRange: null,
-  startDate: "",
-  endDate: "",
-  displayTimezone: "",
-  modelFilter: "",
-  channelFilter: "",
-  stats: null,
-  timeline: [],       // raw long-format rows from timeseries_by_model
-  timelineLoaded: false,
-  modelsAgg: [],      // /logs/models
-  channels: [],
+  range: "today", timeRange: null, startDate: "", endDate: "", displayTimezone: "",
+  modelFilter: "", channelFilter: "", metric: "tokens", byModel: false, currency: "",
+  stats: null, timeline: null, modelsAgg: null, channelStats: null,
+  channels: null, knownModels: new Set(), errors: {}, loading: false,
 };
+let generation = 0;
+let requestController = null;
+let active = false;
+const chartKeys = new Set();
 
-export async function load() {
-  const container = document.getElementById("usage");
-  skeletonKpis(container);
-  try {
-    if (state.channels.length === 0) {
-      state.channels = await api("/api/admin/channels").catch(() => []);
-    }
-    if (!state.displayTimezone) {
-      const settings = await api("/api/admin/settings").catch(() => null);
-      state.displayTimezone = settings?.display_timezone || "Asia/Shanghai";
-    }
-    await fetchAll();
-    render();
-  } catch (e) {
-    container.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><h3>${escapeHtml(e.message)}</h3></div>`;
-    refreshIcons(container);
-  }
+function clearCharts() {
+  for (const key of chartKeys) destroyChart(key);
+  chartKeys.clear();
 }
 
-async function fetchAll() {
-  const range = state.range === "custom"
+function selectedRange() {
+  return state.range === "custom"
     ? createCustomTimeRange(state.startDate, state.endDate)
     : createTimeRange(state.range, state.displayTimezone);
+}
+
+export async function load() {
+  active = true;
+  const current = ++generation;
+  requestController?.abort();
+  const controller = new AbortController();
+  requestController = controller;
+  const options = { signal: controller.signal };
+  clearCharts();
+  state.loading = true;
+  state.errors = {};
+  state.stats = state.timeline = state.modelsAgg = state.channelStats = null;
+  const container = document.getElementById("usage");
+  if (state.displayTimezone) {
+    state.timeRange = selectedRange();
+    state.startDate = state.timeRange.startDate;
+    state.endDate = state.timeRange.endDate;
+    render();
+  } else {
+    skeletonKpis(container);
+  }
+
+  const [settings, channels] = await Promise.allSettled([
+    state.displayTimezone ? Promise.resolve({ display_timezone: state.displayTimezone }) : api("/api/admin/settings", options),
+    state.channels ? Promise.resolve(state.channels) : api("/api/admin/channels", options),
+  ]);
+  if (!active || current !== generation) return;
+  if (settings.status !== "fulfilled" || !settings.value?.display_timezone) {
+    state.loading = false;
+    container.innerHTML = `<div class="empty-state" role="status"><h3>${t("usageUnavailable")}</h3><p>${t("usageTimezoneUnavailable")}</p><button class="btn-secondary mt-4" id="retryUsage">${t("retry")}</button></div>`;
+    document.getElementById("retryUsage")?.addEventListener("click", load);
+    return;
+  }
+  state.displayTimezone = settings.value.display_timezone;
+  if (channels.status === "fulfilled" && Array.isArray(channels.value)) state.channels = channels.value;
+  else state.errors.channelOptions = errorMessage(channels);
+
+  const range = selectedRange();
+  state.timeRange = range;
   state.startDate = range.startDate;
   state.endDate = range.endDate;
   const params = new URLSearchParams(range.query);
   if (state.channelFilter) params.set("channel_id", state.channelFilter);
   if (state.modelFilter) params.set("model", state.modelFilter);
   const query = params.toString();
-  const [stats, timeline, modelsAgg] = await Promise.all([
-    api(`/api/admin/logs/stats?${query}`).catch(() => null),
-    api(`/api/admin/logs/timeseries_by_model?${query}&bucket=${range.apiBucket || range.bucket}`).catch(() => null),
-    api(`/api/admin/logs/models?${query}&limit=8`).catch(() => []),
+  const keys = ["stats", "timeline", "modelsAgg", "channelStats"];
+  const results = await Promise.allSettled([
+    api(`/api/admin/logs/stats?${query}`, options),
+    // Aggregate hourly rows locally so calendar-day labels follow the display timezone.
+    api(`/api/admin/logs/timeseries_by_model?${query}&bucket=hour`, options),
+    api(`/api/admin/logs/models?${query}&limit=8`, options),
+    api(`/api/admin/logs/channels?${query}`, options),
   ]);
-  state.timeRange = range;
-  state.stats = stats;
-  state.timelineLoaded = Array.isArray(timeline);
-  state.timeline = timeline || [];
-  state.modelsAgg = modelsAgg;
+  if (!active || current !== generation) return;
+  results.forEach((result, index) => {
+    const key = keys[index];
+    const valid = result.status === "fulfilled" && (key === "stats"
+      ? result.value && !Array.isArray(result.value) && Number.isFinite(result.value.total_requests)
+      : Array.isArray(result.value));
+    if (valid) state[key] = result.value;
+    else state.errors[key] = errorMessage(result);
+  });
+  for (const row of [...(state.timeline || []), ...(state.modelsAgg || [])]) state.knownModels.add(row.model);
+  if (state.modelFilter) state.knownModels.add(state.modelFilter);
+  state.loading = false;
+  render();
 }
 
-export async function setRange(rangeKey) {
-  const range = createTimeRange(rangeKey, state.displayTimezone);
-  state.range = range.key;
-  state.startDate = range.startDate;
-  state.endDate = range.endDate;
+function errorMessage(result) {
+  return result.status === "rejected" ? result.reason?.message || t("usageUnavailable") : t("usageUnavailable");
+}
+
+export function unload() {
+  active = false;
+  generation += 1;
+  requestController?.abort();
+  clearCharts();
+}
+
+export async function setRange(key) { state.range = key; await load(); }
+export async function setFilter(key, value) {
+  if (!["modelFilter", "channelFilter"].includes(key)) return;
+  state[key] = value;
   await load();
 }
-export async function setFilter(key, value) { state[key] = value; await load(); }
 export function setDisplayTimezone(value) { state.displayTimezone = value || "Asia/Shanghai"; }
 
+function rangeLabel(range) {
+  return range.key === "custom" ? t("customDateRange") : t(`usageRange_${range.key}`);
+}
+
+function sectionMessage(key, rows) {
+  if (state.loading) return `<div class="empty-state" role="status">${t("usageLoading")}</div>`;
+  if (state.errors[key]) return `<div class="empty-state usage-unavailable" role="status"><h3>${t("usageUnavailable")}</h3><p>${escapeHtml(state.errors[key])}</p></div>`;
+  if (!rows?.length) return `<div class="empty-state"><h3>${t("noData")}</h3></div>`;
+  return "";
+}
+
+function number(value, formatter = formatNumber) {
+  return value === null || value === undefined ? "—" : formatter(value);
+}
+
+function costEntries(row) {
+  if (!row || !(Number(row.costed_requests) > 0)) return [];
+  const entries = Object.entries(row.cost_totals_by_currency || {})
+    .filter(([, value]) => value !== null && Number.isFinite(Number(value)))
+    .map(([currency, value]) => [currency, Number(value)]);
+  if (!entries.length && row.currency && row.total_cost !== null && Number.isFinite(Number(row.total_cost))) {
+    entries.push([row.currency, Number(row.total_cost)]);
+  }
+  return entries.sort(([a], [b]) => a.localeCompare(b));
+}
+
+function formatCost(value) {
+  return Number(value).toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 8 });
+}
+
+function renderKpis() {
+  const s = state.stats;
+  const rate = s?.total_requests ? s.success_requests / s.total_requests * 100 : null;
+  const cacheRate = s?.prompt_tokens ? Number(s.cache_hit_rate || 0).toFixed(1) + "%" : "—";
+  const costs = costEntries(s);
+  const coverage = s?.total_requests ? Number(s.costed_requests || 0) / s.total_requests * 100 : null;
+  const costValue = costs.length ? costs.map(([currency, value]) => `<span>${escapeHtml(currency)} ${formatCost(value)}</span>`).join("") : "—";
+  return `${state.errors.stats ? `<div class="inline-result error mb-4" role="status">${t("usageStatsUnavailable")} · ${escapeHtml(state.errors.stats)}</div>` : ""}
+    <div class="kpi-grid usage-kpis">
+      <div class="kpi"><div class="kpi-label"><i data-lucide="activity"></i>${t("metrics")[0]}</div>
+        <div class="kpi-value">${number(s?.total_requests, formatRequestCount)}</div>
+        <div class="kpi-delta">${t("failed")} ${number(s?.failed_requests, formatRequestCount)}</div></div>
+      <div class="kpi"><div class="kpi-label"><i data-lucide="coins"></i>${t("metrics")[3]}</div>
+        <div class="kpi-value">${number(s?.total_tokens)}</div>
+        <div class="usage-kpi-details"><span>${t("metrics")[4]} ${number(s?.prompt_tokens)} · ${t("metrics")[5]} ${number(s?.completion_tokens)}</span>
+        <span>${t("cacheHitTokens")} ${number(s?.cached_tokens)} (${cacheRate}) · ${t("usageCacheWrite")} ${number(s?.cache_write_tokens)}</span>
+        <small>${t("usageCacheIncluded")}</small></div></div>
+      <div class="kpi"><div class="kpi-label"><i data-lucide="credit-card"></i>${t("usageCosted")}</div>
+        <div class="kpi-value usage-cost-value">${costValue}</div>
+        <div class="usage-kpi-details"><span>${t("usageCostCoverage")} ${number(s?.costed_requests, formatRequestCount)} / ${number(s?.total_requests, formatRequestCount)}${coverage === null ? "" : ` (${coverage.toFixed(1)}%)`}</span>
+        <small>${s && !costs.length ? t("usageCostUnknown") : t("usageCostHint")}</small></div></div>
+      <div class="kpi"><div class="kpi-label"><i data-lucide="check-circle"></i>${t("successRate")}</div>
+        <div class="kpi-value">${rate === null ? "—" : rate.toFixed(1) + "%"}</div>
+        <div class="kpi-delta">${t("successLabel")} ${number(s?.success_requests, formatRequestCount)}</div></div>
+      <div class="kpi"><div class="kpi-label"><i data-lucide="gauge"></i>${t("metrics")[7]}</div>
+        <div class="kpi-value">${s?.total_requests ? number(s.avg_latency, formatLatency) : "—"}</div>
+        <div class="kpi-delta">${t("usageSelectedScope")}</div></div>
+    </div>`;
+}
+
 export function render() {
+  if (!active || !state.displayTimezone) return;
+  clearCharts();
   const container = document.getElementById("usage");
-  // The chart rows are already constrained to the selected range and filters.
-  // Derive the headline token total from those same rows so the KPI can never
-  // accidentally show an all-time aggregate while the request KPI/chart show
-  // only the selected window.
-  const rangedTokenTotal = state.timeline.reduce(
-    (total, row) => total + Number(row.tokens || 0),
-    0,
-  );
-  const s = {
-    ...(state.stats || {}),
-    total_tokens: state.timelineLoaded
-      ? rangedTokenTotal
-      : (state.stats?.total_tokens || 0),
-  };
-  const range = state.timeRange || createTimeRange(state.range, state.displayTimezone);
-  const rangeLabel = range.key === "custom" ? t("customDateRange") : range.label;
+  const range = state.timeRange || selectedRange();
   const today = dateInTimezone(new Date(), state.displayTimezone);
-  const successRate = s.total_requests ? ((s.success_requests / s.total_requests) * 100) : 0;
   const chartAvailable = isAvailable();
   const filtering = state.modelFilter || state.channelFilter;
-
-  // distinct models for the filter dropdown
-  const knownModels = new Set(state.modelsAgg.map((m) => m.model));
-  for (const row of state.timeline) knownModels.add(row.model);
-
+  const allGroups = trendGroups(state.timeline || [], range);
+  if (state.metric === "cost" && !allGroups.some((group) => group.unit === state.currency)) state.currency = allGroups[0]?.unit || "";
+  const groups = state.metric === "cost" ? allGroups.filter((group) => group.unit === state.currency) : allGroups;
+  const channelItems = filteredChannels();
+  const channelOptions = [...(state.channels || [])];
+  if (state.channelFilter && !channelOptions.some((channel) => String(channel.id) === state.channelFilter)) {
+    channelOptions.push({ id: state.channelFilter, name: `${t("channels")} #${state.channelFilter}` });
+  }
   container.innerHTML = `
     <div class="section-head">
       <div><h2>${t("usage")}</h2><p>${t("usageHint")}</p></div>
       <div class="usage-period-controls">
-        <div class="range-switch" id="rangeSwitch">
-        ${TIME_RANGES.map((r) => `<button data-range="${r.key}" class="${r.key === state.range ? "active" : ""}">${r.label}</button>`).join("")}
-        </div>
-        <label class="usage-date-picker">
-          <span>${t("startDate")}</span>
-          <input class="input" id="usageStartDate" type="date" value="${state.startDate}" max="${state.endDate || today}">
-        </label>
-        <label class="usage-date-picker">
-          <span>${t("endDate")}</span>
-          <input class="input" id="usageEndDate" type="date" value="${state.endDate}" min="${state.startDate}" max="${today}">
-        </label>
+        <div class="range-switch" id="rangeSwitch">${TIME_RANGES.map((r) => `<button data-range="${r.key}" class="${r.key === state.range ? "active" : ""}">${t(`usageRange_${r.key}`)}</button>`).join("")}</div>
+        <label class="usage-date-picker"><span>${t("startDate")}</span><input class="input" id="usageStartDate" type="date" value="${state.startDate}" max="${state.endDate || today}"></label>
+        <label class="usage-date-picker"><span>${t("endDate")}</span><input class="input" id="usageEndDate" type="date" value="${state.endDate}" min="${state.startDate}" max="${today}"></label>
       </div>
     </div>
-
-    <div class="filter-bar">
-      <label class="filter-label">
-        <span class="muted text-sm">${t("columns").models}</span>
-        <select class="select" id="usageModelFilter">
-          <option value="">${t("allModels") || "全部模型"}</option>
-          ${[...knownModels].sort().map((m) => `<option value="${escapeHtml(m)}" ${state.modelFilter === m ? "selected" : ""}>${escapeHtml(m)}</option>`).join("")}
-        </select>
-      </label>
-      <label class="filter-label">
-        <span class="muted text-sm">${t("channels")}</span>
-        <select class="select" id="usageChannelFilter">
-          <option value="">${t("allChannels")}</option>
-          ${state.channels.map((c) => `<option value="${c.id}" ${String(state.channelFilter) === String(c.id) ? "selected" : ""}>${escapeHtml(c.name)} #${c.id}</option>`).join("")}
-        </select>
-      </label>
+    <div class="filter-bar usage-filters">
+      <label class="filter-label"><span class="muted text-sm">${t("columns").models}</span><select class="select" id="usageModelFilter">
+        <option value="">${t("allModels")}</option>${[...state.knownModels].sort().map((model) => `<option value="${escapeHtml(model)}" ${state.modelFilter === model ? "selected" : ""}>${escapeHtml(model)}</option>`).join("")}</select></label>
+      <label class="filter-label"><span class="muted text-sm">${t("channels")}</span><select class="select" id="usageChannelFilter">
+        <option value="">${t("allChannels")}</option>${channelOptions.map((channel) => `<option value="${escapeHtml(channel.id)}" ${String(state.channelFilter) === String(channel.id) ? "selected" : ""}>${escapeHtml(channel.name)} #${escapeHtml(channel.id)}</option>`).join("")}</select></label>
       ${filtering ? `<button class="btn-ghost" id="clearUsageFilter"><i data-lucide="x"></i>${t("clearFilter")}</button>` : ""}
+      <span class="usage-scope">${escapeHtml(rangeLabel(range))} · ${escapeHtml(state.displayTimezone)}</span>
+      ${Object.keys(state.errors).length ? `<button class="btn-secondary" id="retryUsage">${t("retry")}</button>` : ""}
     </div>
-
-    <div class="kpi-grid">
-      <div class="kpi">
-        <div class="kpi-label"><i data-lucide="activity"></i>${t("metrics")[0]}</div>
-        <div class="kpi-value">${formatRequestCount(s.total_requests)}</div>
-        <div class="kpi-delta">${formatRequestCount(s.failed_requests)} ${t("failed")}</div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-label"><i data-lucide="coins"></i>${t("metrics")[3]}</div>
-        <div class="kpi-value">${formatNumber(s.total_tokens)}</div>
-        <div class="kpi-delta">${formatNumber(s.completion_tokens || 0)} out</div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-label"><i data-lucide="check-circle"></i>${t("successRate") || "Success"}</div>
-        <div class="kpi-value">${successRate.toFixed(1)}%</div>
-        <div class="kpi-delta">${formatRequestCount(s.success_requests)} ok</div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-label"><i data-lucide="gauge"></i>${t("metrics")[7]}</div>
-        <div class="kpi-value">${formatLatency(s.avg_latency)}</div>
-        <div class="kpi-delta">${state.timeline.length} ${t("buckets")}</div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-label"><i data-lucide="zap"></i>${t("cacheHitRate") || "Cache hit"}</div>
-        <div class="kpi-value">${
-          (s.prompt_tokens || 0) > 0
-            ? Number(s.cache_hit_rate || 0).toFixed(1) + "%"
-            : "—"
-        }</div>
-        <div class="kpi-delta">${formatNumber(s.cached_tokens || 0)} ${t("cacheHitTokens") || "hits"}</div>
-      </div>
-    </div>
-
+    ${state.errors.channelOptions ? `<p class="usage-unavailable mb-4" role="status">${t("usageChannelOptionsUnavailable")}</p>` : ""}
+    ${renderKpis()}
     <div class="chart-card">
-      <div class="card-head">
-        <div class="card-title">${t("tokenByModel") || "按模型的 Token 消耗"}</div>
-        <div class="card-sub">${chartAvailable ? `${rangeLabel} · ${distinctModels(state.timeline).length} ${t("models")}` : t("chartUnavailable")}</div>
-      </div>
-      <div class="chart-canvas-wrap" style="height:320px">
-        ${chartAvailable ? `<canvas id="stackedChart"></canvas>` : renderStackedFallback()}
-      </div>
+      <div class="card-head usage-trend-head"><div><div class="card-title">${t("usageTrend")}</div><div class="card-sub">${escapeHtml(rangeLabel(range))} · ${escapeHtml(state.displayTimezone)}</div></div>
+        <div class="usage-trend-controls"><div class="range-switch" id="usageMetricSwitch">${["tokens", "requests", "cost"].map((metric) => `<button type="button" data-metric="${metric}" aria-pressed="${metric === state.metric}" class="${metric === state.metric ? "active" : ""}">${metricLabel(metric)}</button>`).join("")}</div>
+        ${state.metric === "cost" && allGroups.length > 1 ? `<label class="usage-currency">${t("usageCurrency")}<select class="select" id="usageCurrency">${allGroups.map((group) => `<option value="${escapeHtml(group.unit)}" ${group.unit === state.currency ? "selected" : ""}>${escapeHtml(group.unit)}</option>`).join("")}</select></label>` : ""}
+        <label class="usage-split"><input type="checkbox" id="usageByModel" ${state.byModel ? "checked" : ""}>${t("usageByModel")}</label></div></div>
+      ${sectionMessage("timeline", state.timeline) || (groups.length ? groups.map((group, index) => `<div class="usage-trend-group">${state.metric === "cost" ? `<div class="card-sub mb-2">${escapeHtml(group.unit)}</div>` : ""}<div class="chart-canvas-wrap usage-main-chart">${chartAvailable ? `<canvas id="usageTrend${index}"></canvas>` : renderTrendFallback(group)}</div></div>`).join("") : `<div class="empty-state"><h3>—</h3><p>${t("usageCostUnknown")}</p></div>`)}
+      ${state.metric === "cost" ? `<p class="usage-chart-note">${t("usageCostTrendHint")}</p>` : ""}
     </div>
-
     <div class="usage-grid">
-      <div class="chart-card">
-        <div class="card-head">
-          <div class="card-title">${t("modelDist")}</div>
-          <div class="card-sub">${state.modelsAgg.length} models</div>
-        </div>
-        <div class="chart-canvas-wrap" style="height:240px">
-          ${chartAvailable ? `<canvas id="donutChart"></canvas>` : renderModelsFallback()}
-        </div>
-      </div>
-      <div class="chart-card">
-        <div class="card-head">
-          <div class="card-title">${t("channelSuccess")}</div>
-          <div class="card-sub">${state.channels.length} channels</div>
-        </div>
-        <div class="chart-canvas-wrap" style="height:240px">
-          ${chartAvailable ? `<canvas id="hbarChart"></canvas>` : renderChannelsFallback()}
-        </div>
-      </div>
+      <div class="chart-card"><div class="card-head"><div class="card-title">${t("modelDist")}</div><div class="card-sub">${t("usageModelLimit")}</div></div>
+        <div class="chart-canvas-wrap usage-breakdown-chart">${sectionMessage("modelsAgg", state.modelsAgg) || (chartAvailable ? '<canvas id="donutChart"></canvas>' : renderModelsFallback())}</div></div>
+      <div class="chart-card"><div class="card-head"><div class="card-title">${t("channelSuccess")}</div><div class="card-sub">${t("usageSelectedScope")}</div></div>
+        <div class="chart-canvas-wrap usage-breakdown-chart">${sectionMessage("channelStats", state.channelStats) || (chartAvailable ? '<canvas id="hbarChart"></canvas>' : renderChannelsFallback(channelItems))}</div></div>
     </div>
-
-    <div class="chart-card" style="margin-top:14px">
-      <div class="card-head">
-        <div class="card-title">${t("modelTableTitle") || "按模型明细"}</div>
-        <div class="card-sub">${t("modelTableHint") || "输入/输出/缓存命中按模型拆分"}</div>
-      </div>
-      <div class="table-wrap">
-      <div class="table-scroll">
-        <table>
-          <thead>
-            <tr>
-              <th>${t("columns").models}</th>
-              <th>${t("metrics")[0]}</th>
-              <th>${t("metrics")[4] || "输入"}</th>
-              <th>${t("metrics")[5] || "输出"}</th>
-              <th>${t("cacheHitTokens") || "缓存命中"}</th>
-              <th>${t("cacheHitRate") || "命中率"}</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${(state.modelsAgg || []).map((m) => {
-              const prompt = Number(m.prompt_tokens || 0);
-              const completion = Number(m.completion_tokens || 0);
-              const cached = Number(m.cached_tokens || 0);
-              const rate = Number(m.cache_hit_rate || 0);
-              const rateBadge = cached > 0
-                ? badge(rate.toFixed(1) + "%", rate >= 50 ? "success" : rate >= 10 ? "info" : "")
-                : '<span class="muted">—</span>';
-              return `<tr>
-                <td><code>${escapeHtml(m.model)}</code></td>
-                <td class="mono">${formatRequestCount(m.request_count)}</td>
-                <td class="mono">${formatNumber(prompt)}</td>
-                <td class="mono">${formatNumber(completion)}</td>
-                <td class="mono">${formatNumber(cached)}</td>
-                <td>${rateBadge}</td>
-              </tr>`;
-            }).join("")}
-          </tbody>
-        </table>
-      </div>
-      </div>
-    </div>
-  `;
-
+    <div class="chart-card"><div class="card-head"><div class="card-title">${t("modelTableTitle")}</div><div class="card-sub">${t("modelTableHint")} · ${t("usageModelLimit")}</div></div>
+      ${sectionMessage("modelsAgg", state.modelsAgg) || renderModelTable()}
+    </div>`;
   bindControls();
   refreshIcons(container);
-  if (chartAvailable) drawCharts(range);
+  if (chartAvailable && !state.loading) drawCharts(groups, channelItems);
+}
+
+function renderModelTable() {
+  return `<div class="table-wrap"><div class="table-scroll"><table><thead><tr>
+    <th>${t("columns").models}</th><th>${t("metrics")[0]}</th><th>${t("metrics")[4]}</th><th>${t("metrics")[5]}</th><th>${t("cacheHitTokens")}</th><th>${t("cacheHitRate")}</th>
+    </tr></thead><tbody>${state.modelsAgg.map((model) => {
+      const cached = Number(model.cached_tokens || 0);
+      const rate = Number(model.cache_hit_rate || 0);
+      const rateBadge = cached > 0 ? badge(rate.toFixed(1) + "%", rate >= 50 ? "success" : rate >= 10 ? "info" : "") : '<span class="muted">—</span>';
+      return `<tr><td><code>${escapeHtml(model.model)}</code></td><td class="mono">${formatRequestCount(model.request_count)}</td><td class="mono">${formatNumber(model.prompt_tokens)}</td><td class="mono">${formatNumber(model.completion_tokens)}</td><td class="mono">${formatNumber(cached)}</td><td>${rateBadge}</td></tr>`;
+    }).join("")}</tbody></table></div></div>`;
 }
 
 function bindControls() {
-  document.getElementById("rangeSwitch")?.addEventListener("click", (e) => {
-    const btn = e.target.closest("button[data-range]");
-    if (btn) setRange(btn.dataset.range);
+  document.getElementById("rangeSwitch")?.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-range]");
+    if (button) setRange(button.dataset.range);
   });
-  document.getElementById("usageModelFilter")?.addEventListener("change", (e) => setFilter("modelFilter", e.target.value));
-  document.getElementById("usageChannelFilter")?.addEventListener("change", (e) => setFilter("channelFilter", e.target.value));
-  document.getElementById("usageStartDate")?.addEventListener("change", (e) => {
-    setCustomDate("startDate", e.target.value);
-  });
-  document.getElementById("usageEndDate")?.addEventListener("change", (e) => {
-    setCustomDate("endDate", e.target.value);
-  });
+  document.getElementById("usageModelFilter")?.addEventListener("change", (event) => setFilter("modelFilter", event.target.value));
+  document.getElementById("usageChannelFilter")?.addEventListener("change", (event) => setFilter("channelFilter", event.target.value));
+  document.getElementById("usageStartDate")?.addEventListener("change", (event) => setCustomDate("startDate", event.target.value));
+  document.getElementById("usageEndDate")?.addEventListener("change", (event) => setCustomDate("endDate", event.target.value));
   document.getElementById("clearUsageFilter")?.addEventListener("click", () => {
-    state.modelFilter = "";
-    state.channelFilter = "";
+    state.modelFilter = state.channelFilter = "";
     load();
+  });
+  document.getElementById("retryUsage")?.addEventListener("click", load);
+  document.getElementById("usageMetricSwitch")?.addEventListener("click", (event) => {
+    const metric = event.target.closest("button[data-metric]")?.dataset.metric;
+    if (!["tokens", "requests", "cost"].includes(metric)) return;
+    state.metric = metric;
+    render();
+  });
+  document.getElementById("usageCurrency")?.addEventListener("change", (event) => {
+    state.currency = event.target.value;
+    render();
+  });
+  document.getElementById("usageByModel")?.addEventListener("change", (event) => {
+    state.byModel = event.target.checked;
+    render();
   });
 }
 
 function setCustomDate(key, value) {
   const startDate = key === "startDate" ? value : state.startDate;
   const endDate = key === "endDate" ? value : state.endDate;
-  if (!startDate || !endDate || startDate > endDate) {
-    toast(t("invalidDateRange"), "error");
-    render();
-    return;
-  }
-  if (endDate > dateInTimezone(new Date(), state.displayTimezone)) {
-    toast(t("futureEndDate"), "error");
-    render();
-    return;
-  }
+  if (!startDate || !endDate || startDate > endDate) { toast(t("invalidDateRange"), "error"); render(); return; }
+  if (endDate > dateInTimezone(new Date(), state.displayTimezone)) { toast(t("futureEndDate"), "error"); render(); return; }
   state.startDate = startDate;
   state.endDate = endDate;
   state.range = "custom";
   load();
 }
 
-function drawCharts(range) {
-  // Grouped histogram: every model starts from the same baseline, with one
-  // colored bar per model inside each time bucket.
-  const { labels, datasets } = pivotByModel(state.timeline, range);
-  const stackedCanvas = document.getElementById("stackedChart");
-  if (stackedCanvas) {
-    if (datasets.length) {
-      renderStackedBar("stacked", stackedCanvas, labels, datasets, {
-        yTitle: t("metrics")[3] || "Tokens",
-        tooltipCallbacks: {
-          label: (ctx) => ` ${ctx.dataset.label}: ${formatNumber(ctx.parsed.y)}`,
-        },
-      });
-    } else {
-      stackedCanvas.parentElement.innerHTML = `<div class="empty-state"><i data-lucide="line-chart"></i><h3>${t("noData")}</h3></div>`;
-    }
-  }
-
-  const donutCanvas = document.getElementById("donutChart");
-  if (donutCanvas) {
-    const labels = state.modelsAgg.map((m) => m.model);
-    const values = state.modelsAgg.map((m) => m.request_count);
-    if (labels.length) renderDonut("donut", donutCanvas, labels, values);
-    else donutCanvas.parentElement.innerHTML = `<div class="empty-state"><i data-lucide="pie-chart"></i><h3>${t("noData")}</h3></div>`;
-  }
-
-  const hbarCanvas = document.getElementById("hbarChart");
-  if (hbarCanvas) {
-    const items = state.channels
-      .map((c) => ({ name: c.name, rate: c.total_requests ? (c.success_requests / c.total_requests) * 100 : 0 }))
-      .sort((a, b) => b.rate - a.rate)
-      .slice(0, 8);
-    if (items.length) {
-      renderHBar("hbar", hbarCanvas, items.map((i) => i.name), items.map((i) => i.rate), { label: "%" });
-    } else {
-      hbarCanvas.parentElement.innerHTML = `<div class="empty-state"><i data-lucide="bar-chart-3"></i><h3>${t("noData")}</h3></div>`;
-    }
-  }
+function metricLabel(metric) {
+  return metric === "tokens" ? t("metrics")[3] : metric === "requests" ? t("metrics")[0] : t("usageCosted");
 }
 
-function distinctModels(rows) {
-  return [...new Set(rows.map((r) => r.model))];
-}
-
-function pivotByModel(rows, range) {
-  const buckets = expectedRangeBuckets(range, state.displayTimezone);
-  const models = distinctModels(rows).sort();
-  const lookup = new Map();
-  rows.forEach((row) => {
-    const key = `${bucketKey(row.bucket, range.bucket, state.displayTimezone)}|${row.model}`;
-    lookup.set(key, (lookup.get(key) || 0) + Number(row.tokens || 0));
-  });
+function trendGroups(rows, range) {
+  const currentBucket = bucketKey(new Date().toISOString(), range.bucket, state.displayTimezone);
+  const buckets = expectedRangeBuckets(range, state.displayTimezone).filter((bucket) => bucket <= currentBucket);
   const labels = buckets.map((bucket) => bucketLabel(bucket, range));
-  const datasets = models
-    .map((m) => {
-      const data = buckets.map((b) => lookup.get(`${b}|${m}`) || 0);
+  const models = state.byModel ? [...new Set(rows.map((row) => row.model))].sort() : [null];
+  const units = state.metric === "cost" ? [...new Set(rows.flatMap((row) => costEntries(row).map(([currency]) => currency)))].sort() : [state.metric];
+  return units.map((unit) => {
+    const datasets = models.map((model) => {
+      const values = new Map();
+      const unknownBuckets = new Set();
+      for (const row of rows) {
+        if (model !== null && row.model !== model) continue;
+        const key = bucketKey(row.bucket, range.bucket, state.displayTimezone);
+        if (state.metric === "cost" && Number(row.costed_requests || 0) < Number(row.requests || 0)) unknownBuckets.add(key);
+        const value = state.metric === "cost" ? costEntries(row).find(([currency]) => currency === unit)?.[1] : Number(row[state.metric] || 0);
+        if (value !== undefined) values.set(key, (values.get(key) || 0) + value);
+      }
       return {
-        label: m,
-        data,
-        total: data.reduce((sum, value) => sum + value, 0),
+        label: model === null ? t("usageTotal") : model,
+        data: buckets.map((bucket) => values.has(bucket) ? values.get(bucket) : state.metric === "cost" && unknownBuckets.has(bucket) ? null : 0),
       };
-    })
-    .sort((a, b) => b.total - a.total || a.label.localeCompare(b.label));
-  return { labels, datasets };
+    }).filter((dataset) => state.metric !== "cost" || dataset.data.some((value) => value !== null));
+    return { unit, labels, datasets };
+  });
 }
 
-function renderStackedFallback() {
-  const total = state.timeline.reduce((a, b) => a + (b.tokens || 0), 0);
-  return `<div class="empty-state">
-    <i data-lucide="bar-chart-3"></i>
-    <h3>${formatNumber(total)} ${t("metrics")[3]}</h3>
-    <p class="muted">${t("chartUnavailable")}</p>
-  </div>`;
+function filteredChannels() {
+  return (state.channelStats || []).filter((channel) => channel.total_requests > 0)
+    .map((channel) => ({ name: channel.channel_name, rate: channel.success_requests / channel.total_requests * 100 }))
+    .sort((a, b) => b.rate - a.rate).slice(0, 8);
+}
+
+function drawCharts(groups, channels) {
+  if (!state.errors.timeline && state.timeline?.length) groups.forEach((group, index) => {
+    const canvas = document.getElementById(`usageTrend${index}`);
+    if (!canvas) return;
+    const key = `usage-trend-${index}`;
+    const metric = state.metric;
+    chartKeys.add(key);
+    renderLine(key, canvas, group.labels, group.datasets, {
+      fill: !state.byModel,
+      yTitle: state.metric === "cost" ? group.unit : metricLabel(state.metric),
+      tooltipCallbacks: { label: (context) => ` ${context.dataset.label}: ${metric === "cost" ? `${group.unit} ${formatCost(context.parsed.y)}` : formatRequestCount(context.parsed.y)}` },
+    });
+  });
+  if (!state.errors.modelsAgg && state.modelsAgg?.length) {
+    chartKeys.add("usage-donut");
+    renderDonut("usage-donut", document.getElementById("donutChart"), state.modelsAgg.map((model) => model.model), state.modelsAgg.map((model) => model.request_count));
+  }
+  if (!state.errors.channelStats && channels.length) {
+    chartKeys.add("usage-channels");
+    renderHBar("usage-channels", document.getElementById("hbarChart"), channels.map((channel) => channel.name), channels.map((channel) => channel.rate), { label: "%" });
+  }
+}
+
+function renderTrendFallback(group) {
+  return `<div class="usage-chart-fallback"><p>${t("chartUnavailable")}</p>${group.datasets.map((dataset) => {
+    const total = dataset.data.reduce((sum, value) => sum + (value ?? 0), 0);
+    return `<div><span>${escapeHtml(dataset.label)}</span><strong>${state.metric === "cost" ? `${escapeHtml(group.unit)} ${formatCost(total)}` : formatNumber(total)}</strong></div>`;
+  }).join("")}</div>`;
 }
 
 function renderModelsFallback() {
-  if (!state.modelsAgg.length) return `<div class="empty-state"><i data-lucide="pie-chart"></i></div>`;
-  const max = Math.max(...state.modelsAgg.map((m) => m.request_count), 1);
-  return state.modelsAgg.map((m) => `
-    <div class="row" style="gap:10px;margin-bottom:8px">
-      <code style="min-width:140px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(m.model)}</code>
-      <div class="progress" style="flex:1"><span style="width:${(m.request_count / max) * 100}%"></span></div>
-      <span class="mono text-sm" style="min-width:60px;text-align:right">${formatRequestCount(m.request_count)}</span>
-    </div>`).join("");
+  const max = Math.max(...state.modelsAgg.map((model) => model.request_count), 1);
+  return `<div class="usage-chart-fallback">${state.modelsAgg.map((model) => `<div><code>${escapeHtml(model.model)}</code><div class="progress"><span style="width:${model.request_count / max * 100}%"></span></div><span class="mono">${formatRequestCount(model.request_count)}</span></div>`).join("")}</div>`;
 }
 
-function renderChannelsFallback() {
-  if (!state.channels.length) return `<div class="empty-state"><i data-lucide="bar-chart-3"></i></div>`;
-  return state.channels.slice(0, 8).map((c) => {
-    const rate = c.total_requests ? Math.round((c.success_requests / c.total_requests) * 100) : 0;
-    const cls = rate >= 95 ? "" : rate >= 80 ? "warn" : "danger";
-    return `<div class="row" style="gap:10px;margin-bottom:8px">
-      <code style="min-width:100px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(c.name)}</code>
-      <div class="progress ${cls}" style="flex:1"><span style="width:${rate}%"></span></div>
-      <span class="mono text-sm" style="min-width:50px;text-align:right">${rate}%</span>
-    </div>`;
-  }).join("");
+function renderChannelsFallback(channels) {
+  return `<div class="usage-chart-fallback">${channels.map((channel) => `<div><code>${escapeHtml(channel.name)}</code><div class="progress ${channel.rate >= 95 ? "" : channel.rate >= 80 ? "warn" : "danger"}"><span style="width:${channel.rate}%"></span></div><span class="mono">${channel.rate.toFixed(1)}%</span></div>`).join("")}</div>`;
 }
 
 export async function onClick() { return false; }

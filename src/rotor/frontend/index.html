@@ -6,8 +6,8 @@
     <title>Rotor 管理控制台</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
-    <link rel="stylesheet" href="/styles.css?v=32">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap">
+    <link rel="stylesheet" href="/styles.css?v=42">
     <script>
       // FOUC guard — must run before body paints.
       (function () {
@@ -60,24 +60,9 @@
           <button class="nav-item" data-tab="monitoring">
             <i data-lucide="radio-tower"></i><span data-i18n="monitoringTitle">监控</span>
           </button>
-          <button class="nav-item" data-tab="mindagent">
-            <i data-lucide="bot"></i><span data-i18n="mindagentChat">MindAgent 对话</span>
+          <button class="nav-item" data-tab="chat">
+            <i data-lucide="messages-square"></i><span data-i18n="chatChat">对话</span>
           </button>
-          <section class="sidebar-conversations" id="mindagentHistory" aria-label="最近对话">
-            <div class="sidebar-conversations-head">
-              <span data-i18n="recentConversations">最近对话</span>
-              <button
-                class="sidebar-conversations-new"
-                type="button"
-                data-agent-action="new"
-                title="新对话"
-                aria-label="新对话"
-              >
-                <i data-lucide="square-pen"></i>
-              </button>
-            </div>
-            <div class="agent-thread-list" id="agentThreadList"></div>
-          </section>
         </nav>
         <div class="sidebar-footer">
           <button class="nav-item" id="openSettings" type="button">
@@ -89,7 +74,11 @@
 
       <div class="main">
         <header class="topbar">
-          <button class="icon-btn menu-toggle" id="menuToggle" aria-label="Menu">
+          <button class="icon-btn sidebar-collapse-toggle" id="sidebarCollapseToggle" type="button" aria-label="收起侧栏" aria-expanded="true" aria-controls="sidebar">
+            <i class="sidebar-collapse-icon" data-lucide="panel-left-close"></i>
+            <i class="sidebar-expand-icon" data-lucide="panel-left-open"></i>
+          </button>
+          <button class="icon-btn menu-toggle" id="menuToggle" type="button" aria-label="打开导航" aria-expanded="false" aria-controls="sidebar">
             <i data-lucide="menu"></i>
           </button>
           <h1 class="page-title" id="pageTitle">接入信息</h1>
@@ -98,15 +87,6 @@
               <i data-lucide="search"></i>
               <input id="searchInput" placeholder="搜索..." data-i18n-placeholder="search">
             </div>
-            <button class="icon-btn" id="refreshBtn" title="刷新">
-              <i data-lucide="refresh-cw"></i>
-            </button>
-            <button class="icon-btn" id="themeToggle" title="切换主题">
-              <i data-lucide="sun-moon"></i>
-            </button>
-            <button class="icon-btn" id="localeToggle" title="Language">
-              <span id="localeLabel">EN</span>
-            </button>
             <button class="icon-btn" id="logoutBtn" title="退出登录" data-i18n-title="signOut">
               <i data-lucide="log-out"></i>
             </button>
@@ -120,10 +100,12 @@
           <section id="usage" class="panel"></section>
           <section id="logs" class="panel"></section>
           <section id="monitoring" class="panel"></section>
-          <section id="mindagent" class="panel"></section>
+          <section id="chat" class="panel"></section>
         </main>
       </div>
     </div>
+
+    <div class="sidebar-tooltip" id="sidebarTooltip" role="tooltip" hidden></div>
 
     <div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
@@ -278,25 +260,64 @@
     </div>
 
     <div class="modal hidden" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
-      <div class="modal-backdrop" data-close-modal></div>
-      <div class="modal-panel settings-modal-panel">
+      <div class="modal-backdrop" data-settings-close></div>
+      <div class="modal-panel settings-modal-panel" tabindex="-1">
         <header class="modal-head">
           <div>
             <h2 id="settingsModalTitle" data-i18n="settings">设置</h2>
-            <p data-i18n="settingsDescription">配置 Rotor 的运行参数。</p>
+            <p data-i18n="settingsDescription">管理外观、语言与运行参数。</p>
           </div>
-          <button class="icon-btn" data-close-modal aria-label="Close">
+          <button type="button" class="icon-btn" id="settingsClose" data-settings-close data-i18n-title="close" title="关闭" aria-label="关闭">
             <i data-lucide="x"></i>
           </button>
         </header>
-        <form id="settingsForm">
+        <form id="settingsForm" novalidate>
           <div class="settings-layout">
-            <nav class="settings-nav" aria-label="Settings sections">
-              <button type="button" class="settings-nav-item active">
-                <i data-lucide="route"></i><span data-i18n="routingSettings">路由设置</span>
+            <nav class="settings-nav" role="tablist" aria-label="设置分类">
+              <button type="button" id="settingsTabGeneral" class="settings-nav-item active" role="tab" aria-selected="true" aria-controls="settingsGeneral" data-settings-tab="general">
+                <i data-lucide="sliders-horizontal"></i><span data-i18n="generalSettings">通用</span>
+              </button>
+              <button type="button" id="settingsTabRouting" class="settings-nav-item" role="tab" aria-selected="false" aria-controls="settingsRouting" data-settings-tab="routing" tabindex="-1">
+                <i data-lucide="route"></i><span data-i18n="routingSettings">路由</span>
               </button>
             </nav>
             <div class="settings-content">
+              <div id="settingsLoadNotice" class="settings-load-notice hidden" role="status">
+                <span id="settingsLoadMessage"></span>
+                <button type="button" class="btn-secondary" id="settingsRetry" data-i18n="retrySettings">重试加载</button>
+              </div>
+              <section id="settingsGeneral" role="tabpanel" aria-labelledby="settingsTabGeneral" data-settings-panel="general">
+                <h3 data-i18n="generalSettings">通用</h3>
+                <p class="settings-section-description" data-i18n="generalSettingsDescription">调整此浏览器的显示偏好与服务端时区。</p>
+                <div class="settings-fields">
+                  <div class="settings-preference">
+                    <span id="settingsThemeLabel" data-i18n="appearanceSetting">外观</span>
+                    <div class="settings-theme-options" role="group" aria-labelledby="settingsThemeLabel">
+                      <button type="button" id="settingsThemeLight" class="btn-secondary settings-theme-choice" data-settings-theme="light" aria-pressed="false" data-i18n="lightTheme">浅色</button>
+                      <button type="button" id="settingsThemeDark" class="btn-secondary settings-theme-choice" data-settings-theme="dark" aria-pressed="false" data-i18n="darkTheme">深色</button>
+                    </div>
+                  </div>
+                  <label>
+                    <span data-i18n="languageSetting">语言</span>
+                    <select id="settingsLocale">
+                      <option value="zh-CN">简体中文</option>
+                      <option value="en">English</option>
+                    </select>
+                  </label>
+                  <label class="settings-server-row">
+                    <span data-i18n="displayTimezone">日期与时间</span>
+                    <small data-i18n="displayTimezoneDescription">用于用量和请求日志的自然日边界与日期范围。</small>
+                    <input name="display_timezone" list="displayTimezoneOptions" data-server-setting disabled required>
+                    <small data-i18n="settingsSaveRequired">保存设置后生效。</small>
+                    <datalist id="displayTimezoneOptions">
+                      <option value="Asia/Shanghai"></option><option value="UTC"></option>
+                      <option value="Asia/Tokyo"></option><option value="America/Los_Angeles"></option>
+                      <option value="America/New_York"></option><option value="Europe/London"></option>
+                    </datalist>
+                  </label>
+                </div>
+              </section>
+              <section id="settingsRouting" role="tabpanel" aria-labelledby="settingsTabRouting" data-settings-panel="routing" hidden>
               <h3 data-i18n="routingSettings">路由设置</h3>
               <p class="settings-section-description" data-i18n="routingSettingsDescription">
                 控制多个渠道之间的选择方式和会话粘性。
@@ -304,9 +325,10 @@
               <div class="settings-fields">
                 <label>
                   <span data-i18n="routingStrategy">路由策略</span>
-                  <select name="strategy">
+                  <select name="strategy" data-server-setting disabled>
                     <option value="priority_weighted" data-i18n="strategyPriorityWeighted">优先级 + 权重分摊</option>
                     <option value="fallback_order" data-i18n="strategyFallbackOrder">固定主备顺序</option>
+                    <option value="adaptive" data-i18n="strategyAdaptive">自适应</option>
                     <option value="weighted" data-i18n="strategyWeighted">全局权重分摊</option>
                   </select>
                 </label>
@@ -315,60 +337,50 @@
                     <strong data-i18n="affinityEnabled">启用会话亲和</strong>
                     <small data-i18n="affinityDescription">为尚无租约的会话提供稳定分配；关闭后 Session Lease 也停用。</small>
                   </span>
-                  <input name="affinity_enabled" type="checkbox">
+                  <input data-server-setting disabled name="affinity_enabled" type="checkbox">
                 </label>
                 <label class="setting-toggle">
                   <span>
                     <strong data-i18n="sessionLeaseEnabled">启用 Session Lease</strong>
                     <small data-i18n="sessionLeaseDescription">将活跃会话固定在最后成功的渠道，fallback 成功后迁移；关闭会话亲和时同时失效。</small>
                   </span>
-                  <input name="session_lease_enabled" type="checkbox">
+                  <input data-server-setting disabled name="session_lease_enabled" type="checkbox">
                 </label>
                 <label>
                   <span data-i18n="sessionLeaseIdleTtl">Session Lease 空闲 TTL（秒）</span>
                   <small data-i18n="sessionLeaseIdleTtlDescription">租约在最后一次成功请求后保持的时间；可在 Channel extra 中按渠道或模型覆盖。</small>
-                  <input name="session_lease_idle_ttl_seconds" type="number" min="60" max="86400" step="1" value="1800" required>
-                </label>
-                <label>
-                  <span data-i18n="displayTimezone">日期与时间</span>
-                  <small data-i18n="displayTimezoneDescription">用于用量和请求日志的自然日、周和月边界。</small>
-                  <input name="display_timezone" list="displayTimezoneOptions" value="Asia/Shanghai" required>
-                  <datalist id="displayTimezoneOptions">
-                    <option value="Asia/Shanghai">Asia/Shanghai (UTC+08:00)</option>
-                    <option value="UTC">UTC (UTC+00:00)</option>
-                    <option value="Asia/Tokyo">Asia/Tokyo (UTC+09:00)</option>
-                    <option value="America/Los_Angeles">America/Los_Angeles</option>
-                    <option value="America/New_York">America/New_York</option>
-                    <option value="Europe/London">Europe/London</option>
-                  </datalist>
+                  <input data-server-setting disabled name="session_lease_idle_ttl_seconds" type="number" min="60" max="86400" step="1" value="1800" required>
                 </label>
                 <div class="settings-file">
                   <span data-i18n="settingsFile">配置文件</span>
-                  <code id="settingsPath">~/.rotor/settings.json</code>
+                  <code id="settingsPath">—</code>
                 </div>
               </div>
+              </section>
             </div>
           </div>
-          <footer class="modal-actions">
-            <button type="button" class="btn-secondary" data-close-modal data-i18n="cancel">取消</button>
-            <button type="submit" class="btn-primary">
-              <i data-lucide="save"></i><span data-i18n="saveSettings">保存设置</span>
-            </button>
+          <footer class="modal-actions settings-actions">
+            <span id="settingsStatus" role="status" aria-live="polite"></span>
+            <div class="settings-action-buttons">
+              <button type="submit" class="btn-primary" id="settingsSave" disabled>
+                <i data-lucide="save"></i><span data-i18n="saveSettings">保存设置</span>
+              </button>
+            </div>
           </footer>
         </form>
       </div>
     </div>
 
-    <div class="modal hidden" id="mindagentDeleteModal" role="dialog" aria-modal="true" aria-labelledby="mindagentDeleteModalTitle">
+    <div class="modal hidden" id="chatDeleteModal" role="dialog" aria-modal="true" aria-labelledby="chatDeleteModalTitle">
       <div class="modal-backdrop" data-agent-action="cancel-delete"></div>
-      <div class="modal-panel mindagent-delete-modal">
+      <div class="modal-panel chat-delete-modal">
         <header class="modal-head">
           <div>
-            <h2 id="mindagentDeleteModalTitle" data-i18n="deleteConversation">删除对话</h2>
+            <h2 id="chatDeleteModalTitle" data-i18n="deleteConversation">删除对话</h2>
             <p data-i18n="confirmDeleteConversation">确定删除这条本地对话记录吗？</p>
           </div>
         </header>
-        <p class="mindagent-delete-name" id="mindagentDeleteConversationName"></p>
+        <p class="chat-delete-name" id="chatDeleteConversationName"></p>
         <footer class="modal-actions">
           <button type="button" class="btn-secondary" data-agent-action="cancel-delete" data-i18n="cancel">取消</button>
           <button type="button" class="btn-danger" data-agent-action="confirm-delete" data-i18n="confirmDelete">确认删除</button>
@@ -376,7 +388,7 @@
       </div>
     </div>
 
-    <script src="/config.js?v=38"></script>
-    <script type="module" src="/auth.js?v=24"></script>
+    <script src="/config.js?v=46"></script>
+    <script type="module" src="/auth.js?v=35"></script>
   </body>
 </html>

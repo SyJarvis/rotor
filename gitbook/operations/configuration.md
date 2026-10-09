@@ -23,10 +23,7 @@ Pydantic Settings 从当前目录的 `.env` 和进程环境读取大写字段。
 | `ROTOR_CONTROL_API_SCOPES` | `channel:read`、`request_trace:read`、`usage:read` | Control API 允许的只读 scope |
 | `ROTOR_CONTROL_ACTOR_ID` | `rotor-agent` | 写入 Control API 审计事件的操作者标识 |
 | `ROTOR_CONTROL_CLIENT_ID` | `rotor-mcp` | 写入 Control API 审计事件的客户端标识 |
-| `ROTOR_CONTROL_API_URL` | `http://127.0.0.1:8000/api/control/v1` | MCP 与 MindAgent 使用的 Control API 基址 |
-| `ROTOR_MINDAGENT_MCP_COMMAND` | 未设置 | MindAgent 启动独立 MCP Server 的命令 |
-| `ROTOR_MINDAGENT_MCP_ARGS` | `[]` | 传给上述命令的参数列表 |
-| `ROTOR_MINDAGENT_MCP_CWD` | 未设置 | MCP Server 子进程的工作目录 |
+| `ROTOR_CONTROL_API_URL` | `http://127.0.0.1:8000/api/control/v1` | MCP 使用的 Control API 基址 |
 | `ROTOR_LOG_DIR` | `~/.cache/rotor/logs` | 按月分目录、按日保存运行日志的目录 |
 | `LOG_LEVEL` | `INFO` | 应用日志等级；`DEBUG` 时开放 `/docs` 和 `/redoc` |
 | `CORS_ORIGINS` | localhost 的 3000、8000 端口 | 允许的浏览器来源列表 |
@@ -47,6 +44,9 @@ CORS_ORIGINS=["https://admin.example.com"]
 ```
 
 环境变量在进程启动时读取，修改后需要重启 Rotor。
+
+旧的 `ROTOR_MINDAGENT_MCP_COMMAND`、`ROTOR_MINDAGENT_MCP_ARGS` 和
+`ROTOR_MINDAGENT_MCP_CWD` 配置已停用；升级时兼容忽略，不会启动 MCP 子进程。
 
 `ROTOR_DEFAULT_ADMIN_USERNAME` 和 `ROTOR_DEFAULT_ADMIN_PASSWORD` 只在
 `admin_users` 为空时生效，不会覆盖已经修改过的密码。

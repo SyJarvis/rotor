@@ -1,22 +1,23 @@
 // App entry — router, sidebar/topbar wiring, modal, theme/locale listeners.
 
-import { t, applyLocale, toggleLocale } from "./i18n.js";
-import { toggleTheme } from "./theme.js";
+import { t, applyLocale } from "./i18n.js";
+import { initSettings } from "./settings.js?v=3";
+import { initSidebar, closeSidebar } from "./sidebar.js?v=1";
 import { api, copyText } from "./api.js?v=2";
 import { parseCsv, parseJson, refreshIcons, toast } from "./ui.js?v=12";
-import { refreshTheme } from "./charts.js?v=8";
+import { refreshTheme } from "./charts.js?v=9";
 import { setChannelPresets, applyChannelDefaults, channelConnection } from "./channel-form.js?v=2";
 
 import * as overview from "./pages/overview.js?v=5";
 import * as channels from "./pages/channels.js?v=9";
 import { editState as channelEditState } from "./pages/channels.js?v=9";
 import * as tokens from "./pages/tokens.js?v=9";
-import * as usage from "./pages/usage.js?v=13";
-import * as logs from "./pages/logs.js?v=4";
+import * as usage from "./pages/usage.js?v=14";
+import * as logs from "./pages/logs.js?v=5";
 import * as monitoring from "./pages/monitoring.js?v=6";
-import * as mindagent from "./pages/mindagent.js?v=15";
+import * as chat from "./pages/chat.js?v=6";
 
-const PAGES = { overview, channels, tokens, usage, logs, monitoring, mindagent };
+const PAGES = { overview, channels, tokens, usage, logs, monitoring, chat };
 const TITLES = {
   overview: () => t("overview"),
   channels: () => t("channels"),
@@ -24,7 +25,7 @@ const TITLES = {
   usage: () => t("usage"),
   logs: () => t("logs"),
   monitoring: () => t("monitoringTitle"),
-  mindagent: () => t("mindagentChat"),
+  chat: () => t("chatChat"),
 };
 
 let current = "overview";
@@ -63,11 +64,14 @@ export async function refreshActive() {
 }
 
 function switchTab(tab) {
+  if (!PAGES[tab]) return;
   if (current === tab) return refreshActive();
   PAGES[current]?.unload?.();
   current = tab;
-  document.getElementById("content")?.classList.toggle("mindagent-content", tab === "mindagent");
-  document.querySelectorAll(".nav-item").forEach((el) => {
+  document.getElementById("content")?.classList.toggle("chat-content", tab === "chat");
+  document.querySelector(".main")?.classList.toggle("chat-main", tab === "chat");
+  document.querySelector(".app-shell")?.classList.toggle("chat-app", tab === "chat");
+  document.querySelectorAll(".nav-item[data-tab]").forEach((el) => {
     el.classList.toggle("active", el.dataset.tab === tab);
   });
   document.querySelectorAll(".panel").forEach((el) => {
@@ -76,44 +80,22 @@ function switchTab(tab) {
   const titleEl = document.getElementById("pageTitle");
   if (titleEl) titleEl.textContent = TITLES[tab]?.() || tab;
   document.title = `${TITLES[tab]?.()} · Rotor`;
+  closeSidebar();
   return refreshActive();
 }
 
 /* ---------- navigation ---------- */
-document.querySelectorAll(".nav-item").forEach((el) => {
+document.querySelectorAll(".nav-item[data-tab]").forEach((el) => {
   el.addEventListener("click", () => switchTab(el.dataset.tab));
 });
-document.addEventListener("mindagentconversationopen", () => switchTab("mindagent"));
+document.addEventListener("chatconversationopen", () => switchTab("chat"));
 document.addEventListener("logsopen", async (event) => {
   if (event.detail?.failedOnly) logs.showFailures?.();
   await switchTab("logs");
 });
 
-document.getElementById("themeToggle")?.addEventListener("click", () => {
-  toggleTheme();
-});
-document.getElementById("localeToggle")?.addEventListener("click", toggleLocale);
-document.getElementById("refreshBtn")?.addEventListener("click", () => refreshActive());
-
-/* ---------- mobile sidebar ---------- */
-const sidebar = document.getElementById("sidebar");
-const menuToggle = document.getElementById("menuToggle");
-let overlay = null;
-function openSidebar() {
-  sidebar?.classList.add("open");
-  overlay = document.createElement("div");
-  overlay.className = "sidebar-overlay";
-  overlay.addEventListener("click", closeSidebar);
-  document.body.appendChild(overlay);
-}
-function closeSidebar() {
-  sidebar?.classList.remove("open");
-  overlay?.remove();
-  overlay = null;
-}
-menuToggle?.addEventListener("click", () => {
-  sidebar?.classList.contains("open") ? closeSidebar() : openSidebar();
-});
+/* ---------- sidebar ---------- */
+initSidebar();
 
 /* ---------- global click delegation ---------- */
 document.addEventListener("click", async (event) => {
@@ -184,68 +166,13 @@ document.getElementById("closeChannelModal")?.addEventListener("click", () => {
 });
 
 /* ---------- settings modal ---------- */
-const settingsModal = document.getElementById("settingsModal");
-const settingsForm = document.getElementById("settingsForm");
-let currentApplicationSettings = null;
-
-async function openSettings() {
-  settingsModal.classList.remove("hidden");
-  closeSidebar();
-  try {
-    const currentSettings = await api("/api/admin/settings");
-    currentApplicationSettings = currentSettings;
-    settingsForm.elements.strategy.value = currentSettings.routing.strategy;
-    settingsForm.elements.affinity_enabled.checked =
-      currentSettings.routing.affinity_enabled;
-    settingsForm.elements.session_lease_enabled.checked =
-      currentSettings.routing.session_lease_enabled;
-    settingsForm.elements.session_lease_idle_ttl_seconds.value =
-      currentSettings.routing.session_lease_idle_ttl_seconds;
-    settingsForm.elements.display_timezone.value =
-      currentSettings.display_timezone;
-    document.getElementById("settingsPath").textContent =
-      currentSettings.settings_path;
-  } catch (error) {
-    settingsModal.classList.add("hidden");
-    toast(error.message, "error");
-  }
-}
-
-document.getElementById("openSettings")?.addEventListener("click", openSettings);
-settingsForm?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const submitBtn = event.currentTarget.querySelector('button[type="submit"]');
-  if (submitBtn.disabled) return;
-  submitBtn.disabled = true;
-  try {
-    const savedSettings = await api("/api/admin/settings", {
-      method: "PUT",
-      body: JSON.stringify({
-        routing: {
-          ...(currentApplicationSettings?.routing || {}),
-          strategy: settingsForm.elements.strategy.value,
-          affinity_enabled: settingsForm.elements.affinity_enabled.checked,
-          session_lease_enabled:
-            settingsForm.elements.session_lease_enabled.checked,
-          session_lease_idle_ttl_seconds: Number(
-            settingsForm.elements.session_lease_idle_ttl_seconds.value,
-          ),
-        },
-        display_timezone: settingsForm.elements.display_timezone.value,
-      }),
-    });
+initSettings({
+  onSaved(savedSettings) {
     for (const page of Object.values(PAGES)) {
       page.setDisplayTimezone?.(savedSettings.display_timezone);
     }
-    currentApplicationSettings = savedSettings;
-    settingsModal.classList.add("hidden");
-    toast(t("settingsSaved"), "success");
     refreshActive();
-  } catch (error) {
-    toast(error.message, "error");
-  } finally {
-    submitBtn.disabled = false;
-  }
+  },
 });
 
 document.getElementById("probeModels")?.addEventListener("click", async (event) => {
@@ -391,7 +318,7 @@ document.addEventListener("localechange", () => {
   channels.refreshAuthLabels();
   // re-render current page to apply new labels
   refreshActive();
-  mindagent.renderHistory();
+  chat.renderHistory();
   const titleEl = document.getElementById("pageTitle");
   if (titleEl) titleEl.textContent = TITLES[current]?.() || current;
 });
@@ -400,8 +327,7 @@ document.addEventListener("localechange", () => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (!channelModal.classList.contains("hidden")) channels.closeForm();
-    if (!settingsModal.classList.contains("hidden")) settingsModal.classList.add("hidden");
-    document.getElementById("mindagentDeleteModal")?.classList.add("hidden");
+    document.getElementById("chatDeleteModal")?.classList.add("hidden");
     closeSidebar();
   }
 });
@@ -431,7 +357,7 @@ async function loadServerVersion() {
 
 initIcons();
 applyLocale();
-mindagent.renderHistory();
+chat.renderHistory();
 loadServerVersion();
 loadChannelPresets().catch((error) => toast(error.message, "error"));
 refreshActive();

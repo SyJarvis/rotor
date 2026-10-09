@@ -6,11 +6,11 @@ import {
   escapeHtml, badge, formatNumber, formatTimeInTimezone, skeletonRows,
   refreshIcons, toast,
 } from "../ui.js?v=12";
-import { renderStackedBar, isAvailable } from "../charts.js?v=8";
+import { renderStackedBar, isAvailable } from "../charts.js?v=9";
 import {
   TIME_RANGES, bucketKey, bucketLabel, createCustomTimeRange, createTimeRange,
   dateInTimezone, expectedRangeBuckets,
-} from "../periods.js?v=2";
+} from "../periods.js?v=3";
 
 const PAGE_SIZE = 50;
 let state = {

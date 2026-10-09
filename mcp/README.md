@@ -1,6 +1,6 @@
 # Rotor MCP Server
 
-Rotor MCP Server 是 MindAgent 与 Rotor Backend 之间的 MCP 协议适配层。它只通过
+Rotor MCP Server 是独立 MCP Client 与 Rotor Backend 之间的协议适配层。它只通过
 Rotor Control API 读取数据，不导入 Rotor 后端模块，也不直接连接数据库。
 
 ## 当前实现
@@ -193,24 +193,6 @@ Session 和 Lease 事件等硬事实齐全；它不表示成本路由已经证�
 聚合接口不返回 Session ID。跨币种窗口会用 `multiple_currencies` 阻止直接比较，应按
 logical model、币种和更窄窗口重新查询。
 
-## 接入 Rotor 内置 MindAgent
-
-MindAgent 启动 MCP Server 时通过 `ROTOR_AGENT_RUN_ID` 绑定当前 Run。该字段不作为
-Tool 参数暴露给模型，防止模型改写调用身份。Rotor Backend 负责最终鉴权，并会隐藏
-同一 Agent Run 自身产生的诊断请求，避免递归诊断。
-
-Rotor Backend 自带 MCP Client（`rotor.mcp_toolset`，基于官方 MCP SDK），它是可选依赖，
-安装 `mcp` extra 并指定独立 Server 命令：
-
-```bash
-uv sync --extra mcp
-export ROTOR_CONTROL_API_TOKEN=replace-with-control-token
-export ROTOR_MINDAGENT_MCP_COMMAND=/absolute/path/to/rotor/mcp/.venv/bin/rotor-mcp
-```
-
-Backend 会自动向 MCP 子进程传递 Control API URL、Token、Agent ID 和当前 Run ID。
-未配置 `ROTOR_MINDAGENT_MCP_COMMAND` 时，管理端聊天保持原有的无 Rotor Tool 模式。
-
 ## 验证
 
 运行离线测试：
@@ -221,5 +203,4 @@ mcp/.venv/bin/pytest -q mcp/tests
 ```
 
 测试覆盖 Tool discovery、输入和输出 Schema、structured content、annotations、
-Provider 正文移除、Control API 错误映射、MindAgent allowlist 以及真实 stdio
-子进程连接。
+Provider 正文移除和 Control API 错误映射。
