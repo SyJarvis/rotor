@@ -85,7 +85,44 @@ def test_in_process_benchmark_reconciles_all_protocols_and_restores_patches(tmp_
 
 
 @pytest.mark.parametrize("protocol", ["chat", "responses", "anthropic"])
-def test_http_benchmark_observes_chunks_before_stream_completion(tmp_path, protocol):
+def test_http_benchmark_observes_chunks_before_stream_completion(tmp_path, protocol, monkeypatch):
+    from benchmarks import clients, mock_provider
+
+    received = set()
+    released = set()
+    gates = {}
+    delayed_events = mock_provider._delayed_events
+    extract_text = clients.extract_text_from_event
+
+    async def gated_events(events, config, *, first_text_index=0, text_indexes=None):
+        marker = f"stream-observed-{len(gates)}"
+        gate = gates[marker] = asyncio.Event()
+        # Every benchmark protocol routes through the mock OpenAI Chat channel.
+        # Identify each stream so concurrent consumers cannot release each other.
+        events = list(events)
+        first = json.loads(events[first_text_index].split("data: ", 1)[1])
+        first["choices"][0]["delta"]["content"] = marker
+        events[first_text_index] = f"data: {json.dumps(first)}\n\n"
+        async for event in delayed_events(
+            events, config, first_text_index=first_text_index, text_indexes=text_indexes,
+        ):
+            yield event
+            if event == events[first_text_index]:
+                # A buffering gateway/client cannot complete this handshake.
+                # The finite timeout fails instead of hanging the test suite.
+                await asyncio.wait_for(gate.wait(), timeout=5)
+                released.add(marker)
+
+    def observe_text(event, observed_protocol):
+        content = extract_text(event, observed_protocol)
+        if content in gates:
+            assert content not in released
+            received.add(content)
+            gates[content].set()
+        return content
+
+    monkeypatch.setattr(mock_provider, "_delayed_events", gated_events)
+    monkeypatch.setattr(clients, "extract_text_from_event", observe_text)
     outdir = tmp_path / "run"
     args = build_parser().parse_args([
         "--protocol", protocol,
@@ -96,7 +133,9 @@ def test_http_benchmark_observes_chunks_before_stream_completion(tmp_path, proto
     assert asyncio.run(main_async(args)) == 0
     results = [json.loads(line) for line in (outdir / "raw-results.jsonl").read_text().splitlines()]
     assert all(result["ttft_ms"] is not None for result in results)
-    assert all(result["duration_ms"] - result["ttft_ms"] >= 50 for result in results)
+    assert len(received) == args.requests + args.warmup
+    assert received == released == set(gates)
+    assert all(0 <= result["ttft_ms"] < result["duration_ms"] for result in results)
     metrics = json.loads((outdir / "db-metrics.json").read_text())
     assert metrics["integrity_errors"] == []
     assert metrics["row_and_counter_delta"]["ledger_tokens"] == metrics["row_and_counter_delta"]["token_tokens"]
