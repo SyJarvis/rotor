@@ -19,7 +19,7 @@ from rotor.services.chatgpt_oauth import (
     clear_credential_values,
     consume_session,
     credential_values,
-    fetch_model_catalog,
+    probe_saved_models,
     resolve_oauth_credentials,
     validate_configuration,
 )
@@ -338,15 +338,10 @@ async def probe_models(
 
     if channel.auth_type == "oauth":
         start = time.perf_counter()
-        original_refresh = channel.oauth_refresh_token
         try:
             # OAuth catalogs always use the fixed Codex endpoint, ignoring form overrides.
             async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
-                credential = await resolve_oauth_credentials(channel, client)
-                await db.refresh(channel)
-                models, raw_count = await fetch_model_catalog(
-                    client, credential, refresh_tokens=(original_refresh, channel.oauth_refresh_token),
-                )
+                models, raw_count = await probe_saved_models(db, client, channel)
         except OAuthError as exc:
             raise HTTPException(400 if exc.status_code == 401 else exc.status_code, str(exc)) from None
         return ProbeModelsResponse(
