@@ -10,7 +10,7 @@ import { parseCsv, parseJson, refreshIcons, toast } from "./ui.js?v=12";
 import { refreshTheme } from "./charts.js?v=9";
 import { setChannelPresets, applyChannelDefaults, channelConnection } from "./channel-form.js?v=2";
 
-import * as overview from "./pages/overview.js?v=7";
+import * as overview from "./pages/overview.js?v=8";
 import * as channels from "./pages/channels.js?v=10";
 import { editState as channelEditState } from "./pages/channels.js?v=10";
 import * as tokens from "./pages/tokens.js?v=10";
@@ -92,9 +92,8 @@ document.querySelectorAll(".nav-item[data-tab]").forEach((el) => {
   el.addEventListener("click", () => switchTab(el.dataset.tab));
 });
 document.addEventListener("chatconversationopen", () => switchTab("chat"));
-document.addEventListener("logsopen", async (event) => {
-  if (event.detail?.failedOnly) logs.showFailures?.();
-  await switchTab("logs");
+document.addEventListener("overviewnavigate", (event) => {
+  if (["tokens", "usage"].includes(event.detail?.tab)) switchTab(event.detail.tab);
 });
 
 /* ---------- sidebar ---------- */

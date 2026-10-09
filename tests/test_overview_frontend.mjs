@@ -4,117 +4,123 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const [overviewSource, appSource, configSource, html] = await Promise.all(['pages/overview.js', 'app.js', 'config.js', 'index.html'].map((path) => readFile(new URL(`../src/rotor/frontend/${path}`, import.meta.url), 'utf8')));
-function deferred() { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; }
+const origin = 'https://rotor.test:9000';
+const decode = (value) => value.replaceAll('&quot;', '"').replaceAll('&amp;', '&');
+function container() {
+  const node = { renders: 0, markup: '', details: null, protocols: new Map(), focused: null,
+    querySelector(selector) { return selector === 'details' ? this.details : this.protocols.get(selector.match(/data-overview-protocol="([^"]+)"/)?.[1]); },
+    get innerHTML() { return this.markup; },
+    set innerHTML(markup) {
+      this.markup = markup; this.renders++; this.protocols.clear();
+      this.details = markup.includes('<details') ? { open: /<details[^>]*\sopen[\s>]/.test(markup) } : null;
+      for (const match of markup.matchAll(/<button[^>]+data-overview-protocol="([^"]+)"[^>]*aria-pressed="([^"]+)"[^>]*>/g)) {
+        this.protocols.set(match[1], { pressed: match[2], focus: () => { this.focused = match[1]; } });
+      }
+    },
+  };
+  return node;
+}
+const action = (attribute, value) => ({ closest(selector) { return selector === `[${attribute}]` ? { dataset: { [attribute.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())]: value } } : null; } });
+const addresses = (markup) => [...markup.matchAll(/data-copy-value="([^"]+)"/g)].map((match) => decode(match[1]));
+const methods = (markup) => [...markup.matchAll(/<strong>([^<]+)<\/strong><span class="overview-endpoint-method">([^<]+)<\/span>/g)].map((match) => [match[1], match[2]]);
 
-async function overview({ admin = false, language = 'en', autoload = true } = {}) {
-  let owner = admin ? '1' : '7';
-  const calls = [], copied = [], events = {}, container = { innerHTML: '' };
-  const replies = new Map();
-  const window = { location: { origin: 'https://rotor.test' } };
+async function overview({ admin = false, language = 'en' } = {}) {
+  const node = container(), calls = [], copied = [], events = {}, dispatched = [];
+  const window = { location: { origin }, ROTOR_ACTOR: { id: admin ? 1 : 7, role: admin ? 'admin' : 'user' } };
   vm.runInNewContext(configSource, { window });
-  const api = async (url, options) => {
-    calls.push({ url, options });
-    const parsed = new URL(url, window.location.origin), path = parsed.pathname;
-    if (replies.has(path)) { const value = replies.get(path); if (value instanceof Error) throw value; return typeof value === 'function' ? value(url) : value; }
-    if (path.endsWith('/stats')) return { total_requests: 4, success_requests: 3, failed_requests: 1, total_tokens: 80, avg_latency: 0.2 };
-    if (path.endsWith('/timeseries')) return [{ requests: 4, tokens: 80 }];
-    if (path === '/api/admin/channels') return [{ id: 3, name: 'Global channel' }];
-    if (path.endsWith('/channels')) return [{ channel_id: 3, channel_name: 'My used channel' }];
-    if (path.endsWith('/logs')) return [{ id: 9, model: 'test-model', channel_id: 3, created_at: '2026-10-09T02:00:00Z', error_code: 'test-error' }];
-    if (path === '/api/me' || path === '/api/admin/settings') return { display_timezone: 'UTC' };
-    throw new Error(`Unexpected endpoint ${url}`);
+  const bindings = { t: (key) => window.ROTOR_UI_CONFIG.locales[language][key],
+    escapeHtml: (value) => String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;'), refreshIcons() {}, copy: (value) => copied.push(value),
+    api: (...args) => { calls.push(args); throw new Error('Overview must not request an API'); },
   };
-  const bindings = { api, locale: language, t: (key) => window.ROTOR_UI_CONFIG.locales[language][key], isAdmin: () => admin, accountId: () => owner,
-    escapeHtml: (value) => String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;'),
-    formatNumber: (value) => String(value || 0), formatRequestCount: (value) => String(value || 0), formatLatency: String,
-    formatTimeInTimezone: (value, zone) => `${zone}:${value}`, badge: (label) => label, refreshIcons() {},
-    skeletonKpis: (node) => { node.innerHTML = 'Loading'; }, copy: (value) => copied.push(value), sparkline: () => '',
-  };
-  const context = vm.createContext({ window, document: { getElementById: () => container, addEventListener(name, callback) { events[name] = callback; } }, URLSearchParams, Date, AbortController });
+  const context = vm.createContext({ window, document: { getElementById: () => node, addEventListener(name, callback) { events[name] = callback; }, dispatchEvent(event) { dispatched.push(event); } },
+    CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options?.detail; } }, fetch: (...args) => { calls.push(args); throw new Error('Overview must not fetch data'); },
+  });
   const page = new vm.SourceTextModule(overviewSource, { context });
   await page.link((specifier) => {
-    const names = specifier.includes('api.js') ? ['api'] : specifier.includes('i18n.js') ? ['locale', 't'] : specifier.includes('session.js') ? ['isAdmin', 'accountId'] : specifier.includes('charts.js') ? ['sparkline'] : ['escapeHtml', 'formatNumber', 'formatRequestCount', 'formatLatency', 'formatTimeInTimezone', 'badge', 'refreshIcons', 'skeletonKpis', 'copy'];
+    const names = specifier.includes('i18n.js') ? ['t'] : specifier.includes('api.js') ? ['api'] : ['escapeHtml', 'refreshIcons', 'copy'];
     return new vm.SyntheticModule(names, function () { for (const name of names) this.setExport(name, bindings[name]); }, { context });
   });
-  await page.evaluate(); if (autoload) await page.namespace.load();
-  return { page: page.namespace, calls, copied, replies, html: () => container.innerHTML,
-    changeActor(nextAdmin, id) { admin = nextAdmin; owner = id; }, endSession() { owner = ''; admin = false; events.sessionended(); },
-  };
+  await page.evaluate(); page.namespace.load();
+  return { page: page.namespace, node, calls, copied, dispatched, html: () => node.innerHTML, endSession: () => events.sessionended() };
 }
 
-for (const language of ['zh-CN', 'en']) {
-  test(`ordinary overview reads only personal reports and labels their scope (${language})`, async () => {
-    const h = await overview({ language });
-    assert.equal(h.calls.length, 7);
-    assert.ok(h.calls.every(({ url }) => url === '/api/me' || url.startsWith('/api/me/logs')));
-    assert.ok(h.calls.some(({ url }) => url === '/api/me/logs/channels'));
-    assert.match(h.html(), /My used channel/); assert.match(h.html(), /UTC:2026-10-09/);
-    assert.match(h.html(), language === 'en' ? /My request status/ : /本人调用状态/);
-    assert.match(h.html(), language === 'en' ? /My requests · Last 7 days/ : /本人调用 · 最近 7 天/);
-    assert.doesNotMatch(h.html(), /Global channel|System status|系统健康/);
-    const endpoints = [...h.html().matchAll(/data-copy-value="([^"]+)"/g)].map((match) => match[1]);
-    assert.deepEqual(endpoints, ['/v1/chat/completions', '/v1/embeddings', '/v1/responses', '/anthropic/v1/messages', '/v1/models'].map((path) => `https://rotor.test${path}`));
-    h.page.onClick({ closest: (selector) => selector === '[data-copy-value]' ? { dataset: { copyValue: endpoints[0] } } : null });
-    assert.deepEqual(h.copied, [endpoints[0]]);
+for (const admin of [false, true]) for (const language of ['zh-CN', 'en']) {
+  test(`overview is a request-free connection page (${admin ? 'admin' : 'user'}, ${language})`, async () => {
+    const h = await overview({ admin, language });
+    assert.match(h.html(), language === 'en' ? /Quick links/ : /快捷链接/);
+    assert.match(h.html(), language === 'en' ? /Connection settings/ : /接入配置/);
+    assert.deepEqual([...h.html().matchAll(/data-overview-tab="([^"]+)"/g)].map((match) => match[1]), ['tokens', 'usage']);
+    assert.doesNotMatch(h.html(), /kpi-grid|kpi-value|health|failure|data-overview-open-log/);
+    assert.equal(h.node.details.open, false);
+    assert.equal(h.node.protocols.get('openai').pressed, 'true'); assert.equal(h.node.protocols.get('anthropic').pressed, 'false');
+    assert.deepEqual(addresses(h.html()), ['/v1', '/v1/chat/completions', '/v1/responses', '/v1/embeddings', '/v1/models'].map((path) => `${origin}${path}`));
+    assert.deepEqual(methods(h.html()), [['OpenAI Chat', 'POST'], ['OpenAI Responses', 'POST'], ['OpenAI Embeddings', 'POST'], ['Models', 'GET']]);
+    for (const url of addresses(h.html())) h.page.onClick(action('data-copy-value', url));
+    assert.deepEqual(h.copied, addresses(h.html()));
+    h.page.load(); assert.equal(h.calls.length, 0);
   });
 }
 
-test('administrator overview keeps global endpoints and system labels', async () => {
-  const h = await overview({ admin: true });
-  assert.equal(h.calls.length, 7); assert.ok(h.calls.every(({ url }) => url.startsWith('/api/admin/')));
-  assert.deepEqual(h.calls.map(({ url }) => url.split('?')[0]), ['/api/admin/logs/stats', '/api/admin/channels', '/api/admin/logs/timeseries', '/api/admin/logs/stats', '/api/admin/logs', '/api/admin/logs', '/api/admin/settings']);
-  assert.match(h.html(), /System status/); assert.match(h.html(), /Global channel/); assert.doesNotMatch(h.html(), /My request status/);
-});
-
-test('personal request errors never fall back to admin or show previous global data', async () => {
-  const h = await overview({ admin: true }); assert.match(h.html(), /Global channel/);
-  h.changeActor(false, '8'); h.page.render(); assert.equal(h.html(), '');
-  h.calls.length = 0; h.replies.set('/api/me/logs/stats', Object.assign(new Error('<Forbidden>'), { status: 403 }));
-  await h.page.load();
-  assert.ok(h.calls.every(({ url }) => url === '/api/me' || url.startsWith('/api/me/logs')));
-  assert.match(h.html(), /&lt;Forbidden>/); assert.doesNotMatch(h.html(), /Global channel|kpi-value|System status/);
-  assert.equal([...h.html().matchAll(/data-copy-value=/g)].length, 5);
-});
-
-test('late global requests and session-ended results cannot repopulate a personal overview', async () => {
-  const gate = deferred(), h = await overview({ admin: true, autoload: false });
-  h.replies.set('/api/admin/logs/stats', gate.promise);
-  const pending = h.page.load(); const signal = h.calls[0].options.signal;
-  h.page.unload(); h.changeActor(false, '8'); await h.page.load();
-  const personal = h.html(); gate.resolve({ total_requests: 99999 }); await pending;
-  assert.equal(signal.aborted, true); assert.equal(h.html(), personal); assert.doesNotMatch(h.html(), /99999|Global channel/);
-  const other = deferred(); h.replies.set('/api/me/logs/stats', other.promise); const last = h.page.load();
-  h.endSession(); assert.equal(h.html(), ''); other.resolve({ total_requests: 77777 }); await last;
-  assert.equal(h.html(), '');
+test('protocol switching updates addresses and pressed state, preserves expanded details and focus, and uses no network', async () => {
+  const h = await overview(); h.node.details.open = true;
+  assert.equal(h.page.onClick(action('data-overview-protocol', 'anthropic')), true);
+  assert.deepEqual(addresses(h.html()), [`${origin}/anthropic`, `${origin}/anthropic/v1/messages`]);
+  assert.deepEqual(methods(h.html()), [['Anthropic Messages', 'POST']]);
+  assert.equal(h.node.protocols.get('anthropic').pressed, 'true'); assert.equal(h.node.protocols.get('openai').pressed, 'false');
+  assert.equal(h.node.details.open, true); assert.equal(h.node.focused, 'anthropic');
+  for (const url of addresses(h.html())) h.page.onClick(action('data-copy-value', url));
+  assert.deepEqual(h.copied, [`${origin}/anthropic`, `${origin}/anthropic/v1/messages`]);
+  const renders = h.node.renders; h.page.onClick(action('data-overview-protocol', 'anthropic')); assert.equal(h.node.renders, renders);
+  assert.equal(h.page.onClick(action('data-overview-protocol', '__proto__')), false);
+  h.page.onClick(action('data-overview-protocol', 'openai')); assert.equal(addresses(h.html())[0], `${origin}/v1`);
+  h.endSession(); assert.equal(h.html(), ''); h.page.load(); assert.equal(h.node.details.open, false); assert.equal(h.node.protocols.get('openai').pressed, 'true');
+  assert.equal(h.calls.length, 0);
 });
 
 async function navigation(admin) {
-  const loads = [], nodes = new Map();
-  function element(id, dataset = {}) { const classes = new Set(); return { id, dataset, hidden: false, listeners: {}, textContent: '', classList: { toggle(name, enabled) { enabled ? classes.add(name) : classes.delete(name); }, contains(name) { return classes.has(name); } }, addEventListener(name, callback) { this.listeners[name] = callback; } }; }
-  const nav = [...html.matchAll(/<button class="nav-item[^"]*"([^>]*data-tab="([^"]+)"[^>]*)>/g)].map((match) => ({ ...element(match[2], { tab: match[2] }), adminOnly: match[1].includes('data-admin-only') }));
-  const panels = nav.map((item) => element(item.id));
-  for (const id of ['content', 'pageTitle', '.main', '.app-shell']) nodes.set(id, element(id));
-  const context = vm.createContext({ window: {}, Element: class {}, document: { getElementById: (id) => nodes.get(id), querySelector: (selector) => nodes.get(selector), querySelectorAll: (selector) => selector === '.nav-item[data-tab]' ? nav : selector === '.panel' ? panels : selector === '[data-admin-only]' ? nav.filter((item) => item.adminOnly) : [], addEventListener() {} } });
-  const app = new vm.SourceTextModule(appSource, { context });
-  await app.link((specifier) => {
+  const loads = [], nodes = new Map(), events = {}, copied = [];
+  class Element {
+    constructor(id = '', dataset = {}) { this.id = id; this.dataset = dataset; this.hidden = false; this.listeners = {}; this.textContent = ''; const classes = new Set(); this.classList = { toggle(name, enabled) { enabled ? classes.add(name) : classes.delete(name); }, contains(name) { return classes.has(name); } }; }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+  }
+  const nav = [...html.matchAll(/<button class="nav-item[^"]*"([^>]*data-tab="([^"]+)"[^>]*)>/g)].map((match) => Object.assign(new Element(match[2], { tab: match[2] }), { adminOnly: match[1].includes('data-admin-only') }));
+  const panels = nav.map((item) => new Element(item.id));
+  for (const id of ['content', 'pageTitle', '.main', '.app-shell']) nodes.set(id, new Element(id));
+  nodes.set('overview', container());
+  const document = { getElementById: (id) => nodes.get(id), querySelector: (selector) => nodes.get(selector), querySelectorAll: (selector) => selector === '.nav-item[data-tab]' ? nav : selector === '.panel' ? panels : selector === '[data-admin-only]' ? nav.filter((item) => item.adminOnly) : [],
+    addEventListener(name, callback) { (events[name] ||= []).push(callback); }, dispatchEvent(event) { for (const callback of events[event.type] || []) callback(event); },
+  };
+  const context = vm.createContext({ window: { location: { origin } }, Element, document, CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options?.detail; } } });
+  const app = new vm.SourceTextModule(appSource, { context }), realOverview = new vm.SourceTextModule(overviewSource, { context });
+  const modules = new Map();
+  const link = (specifier) => {
+    if (specifier.includes('pages/overview.js')) return realOverview;
+    if (modules.has(specifier)) return modules.get(specifier);
     const page = specifier.match(/pages\/([^.?]+)[.]js/)?.[1];
-    const names = page ? ['load', 'unload', 'renderHistory', 'resetSession', 'editState'] : specifier.includes('i18n') ? ['t', 'applyLocale'] : specifier.includes('settings') ? ['initSettings'] : specifier.includes('session') ? ['isAdmin'] : specifier.includes('sidebar') ? ['initSidebar', 'closeSidebar'] : specifier.includes('api.js') ? ['api', 'copyText'] : specifier.includes('ui.js') ? ['parseCsv', 'parseJson', 'refreshIcons', 'toast'] : specifier.includes('charts') ? ['refreshTheme'] : ['setChannelPresets', 'applyChannelDefaults', 'channelConnection'];
-    return new vm.SyntheticModule(names, function () { for (const name of names) this.setExport(name, name === 'isAdmin' ? () => admin : name === 't' ? (key) => key : name === 'load' ? () => loads.push(page) : name === 'api' ? async () => [] : name === 'editState' ? {} : () => {}); }, { context });
-  });
-  await app.evaluate();
-  return { loads, nav, panels, async click(id) { await nav.find((item) => item.id === id).listeners.click(); } };
+    const names = page ? ['load', 'unload', 'renderHistory', 'resetSession', 'editState'] : specifier.includes('i18n') ? ['t', 'applyLocale'] : specifier.includes('settings') ? ['initSettings'] : specifier.includes('session') ? ['isAdmin'] : specifier.includes('sidebar') ? ['initSidebar', 'closeSidebar'] : specifier.includes('api.js') ? ['api', 'copyText'] : specifier.includes('ui.js') ? ['parseCsv', 'parseJson', 'refreshIcons', 'toast', 'escapeHtml', 'copy'] : specifier.includes('charts') ? ['refreshTheme'] : ['setChannelPresets', 'applyChannelDefaults', 'channelConnection'];
+    const bindings = { isAdmin: () => admin, t: (key) => key, load: () => loads.push(page), api: async () => [], editState: {}, escapeHtml: String, copy: (value) => copied.push(value), copyText: async (value) => { copied.push(value); return true; } };
+    const module = new vm.SyntheticModule(names, function () { for (const name of names) this.setExport(name, bindings[name] || (() => {})); }, { context }); modules.set(specifier, module); return module;
+  };
+  await app.link(link); await app.evaluate();
+  return { loads, nav, panels, nodes, copied,
+    async click(id) { await nav.find((item) => item.id === id).listeners.click(); },
+    async shortcut(id) { const target = Object.assign(new Element(), action('data-overview-tab', id)); for (const callback of events.click) await callback({ target }); },
+    async copy(url) { const target = Object.assign(new Element(), action('data-copy-value', url)); for (const callback of events.click) await callback({ target }); },
+    dispatch(tab) { document.dispatchEvent({ type: 'overviewnavigate', detail: { tab } }); },
+  };
 }
 
-test('real navigation exposes personal overview while keeping channels, monitoring and users restricted', async () => {
-  const h = await navigation(false); assert.deepEqual(h.loads, ['chat']);
+for (const admin of [false, true]) test(`overview shortcuts use the existing application router (${admin ? 'admin' : 'user'})`, async () => {
+  const h = await navigation(admin);
+  assert.deepEqual(h.loads, admin ? [] : ['chat']);
   assert.equal(h.nav.find((item) => item.id === 'overview').hidden, false);
-  await h.click('overview'); assert.deepEqual(h.loads, ['chat', 'overview']);
+  await h.click('overview'); assert.match(h.nodes.get('overview').innerHTML, /data-overview-tab="tokens"/);
+  await h.shortcut('tokens'); assert.equal(h.loads.at(-1), 'tokens'); assert.equal(h.panels.find((item) => item.id === 'tokens').classList.contains('active'), true);
+  await h.click('overview'); await h.shortcut('usage'); assert.equal(h.loads.at(-1), 'usage');
+  await h.click('overview'); await h.copy(`${origin}/v1`); assert.deepEqual(h.copied, [`${origin}/v1`]);
+  const count = h.loads.length; await h.shortcut('channels'); h.dispatch('channels'); assert.equal(h.loads.length, count);
   for (const id of ['channels', 'monitoring', 'users']) {
-    assert.equal(h.nav.find((item) => item.id === id).hidden, true); await h.click(id);
+    assert.equal(h.nav.find((item) => item.id === id).hidden, !admin); await h.click(id);
   }
-  assert.deepEqual(h.loads, ['chat', 'overview']);
-  assert.equal(h.panels.find((item) => item.id === 'overview').classList.contains('active'), true);
-  const admin = await navigation(true); assert.equal(admin.loads[0], 'overview');
-  for (const id of ['channels', 'monitoring', 'users']) { assert.equal(admin.nav.find((item) => item.id === id).hidden, false); await admin.click(id); }
-  assert.deepEqual(admin.loads, ['overview', 'channels', 'monitoring', 'users']);
+  assert.equal(h.loads.length, count + (admin ? 3 : 0));
 });
