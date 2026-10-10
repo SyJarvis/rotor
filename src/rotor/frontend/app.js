@@ -16,7 +16,7 @@ import { editState as channelEditState } from "./pages/channels.js?v=10";
 import * as tokens from "./pages/tokens.js?v=10";
 import * as usage from "./pages/usage.js?v=16";
 import * as logs from "./pages/logs.js?v=8";
-import * as monitoring from "./pages/monitoring.js?v=7";
+import * as monitoring from "./pages/monitoring.js?v=8";
 import * as chat from "./pages/chat.js?v=9";
 
 const PAGES = { overview, channels, tokens, usage, logs, monitoring, chat, users };

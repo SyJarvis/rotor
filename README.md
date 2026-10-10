@@ -19,7 +19,7 @@ Rotor 同时提供浏览器管理页面、管理 API、面向机器调用的只�
 - **多渠道路由**：按模型、协议、优先级、权重和运行状态选择 Channel，支持 fallback、
   会话亲和与自适应评分；同协议渠道优先（可关闭），需要原生语义的请求不会被静默降级。
 - **可观测性**：记录请求日志、每次渠道尝试、归一化错误、延迟、Token 用量和缓存
-  Token；管理页的「监控」页展示进程内性能样本、客户端来源与增量对账。
+  Token；管理页的「监控」页展示进程内性能样本和客户端来源。
 - **管理与诊断**：通过管理页面维护 Channel 和用户 Token；通过独立鉴权的 Control
   API 向 MCP、CLI 和自动化任务提供只读诊断数据。
 - **账号接入**：网页对话和[客户端 OAuth](gitbook/guides/client-oauth.md)直接使用账号权限与额度，
@@ -185,7 +185,7 @@ Codex、Claude Code 和 OpenCode 的配置方式见
 | Anthropic | `POST /anthropic/v1/messages`、`POST /anthropic/v1/messages/count_tokens`、`GET /anthropic/v1/models` |
 | 模型 | `GET /v1/models` |
 | 管理 API | `/api/admin/channels`、`/api/admin/tokens`、`/api/admin/logs`、`/api/admin/settings` |
-| 监控 | `/api/admin/monitoring/sources`、`/api/admin/monitoring/performance`、`/api/admin/monitoring/reconciliation` |
+| 监控 | `/api/admin/monitoring/sources`、`/api/admin/monitoring/performance` |
 | Control API | `/api/control/v1/channels`、请求 trace、近期失败、模型用量和 Session Lease 评估 |
 
 Responses API 支持创建、查询、取消、删除、输入项查询、输入 Token 计数和 compact。

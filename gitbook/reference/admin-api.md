@@ -211,11 +211,6 @@ curl -X POST -b "$ROTOR_ADMIN_COOKIE_JAR" -H "X-CSRF-Token: $ROTOR_ADMIN_CSRF" \
 | --- | --- | --- |
 | `GET` | `/api/admin/monitoring/sources` | 按客户端来源汇总会话 |
 | `GET` | `/api/admin/monitoring/performance` | 进程内性能快照（含 PID 与启动时间） |
-| `GET` | `/api/admin/monitoring/reconciliation` | 账本与 Token 累计的增量对账 |
-| `POST` | `/api/admin/monitoring/reconciliation/reset` | 重建对账基线；不修账 |
-
-当前增量对账尚未覆盖账号计数；网页对话与 OAuth 成功账本可能使结果为 `invalid`，
-不能据此判断账户扣费错误。具体限制见[增量对账](../operations/observability.md#增量对账)。
 
 性能计数的窗口、样本上限与单进程边界见[日志、用量与数据存储](../operations/observability.md#监控页性能与会话来源)。
 

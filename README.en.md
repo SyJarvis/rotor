@@ -24,8 +24,7 @@ separately authenticated read-only Control API, and an independent
   needing native semantics are never silently downgraded.
 - **Observability**: request logs, individual channel attempts, normalized
   errors, latency, token usage, and cached tokens; the admin **Monitoring** page
-  shows process-local performance samples, client sources, and incremental
-  reconciliation.
+  shows process-local performance samples and client sources.
 - **Administration and diagnostics**: manage channels and user tokens in the
   admin UI; expose read-only diagnostic facts to MCP, CLIs, and automation
   through the Control API.
@@ -199,7 +198,7 @@ Claude Code, and OpenCode configuration.
 | Anthropic | `POST /anthropic/v1/messages`, `POST /anthropic/v1/messages/count_tokens`, `GET /anthropic/v1/models` |
 | Models | `GET /v1/models` |
 | Admin API | `/api/admin/channels`, `/api/admin/tokens`, `/api/admin/logs`, `/api/admin/settings` |
-| Monitoring | `/api/admin/monitoring/sources`, `/api/admin/monitoring/performance`, `/api/admin/monitoring/reconciliation` |
+| Monitoring | `/api/admin/monitoring/sources`, `/api/admin/monitoring/performance` |
 | Control API | `/api/control/v1/channels`, request traces, recent failures, model usage, and Session Lease evaluation |
 
 The Responses API supports creation, retrieval, cancellation, deletion, input

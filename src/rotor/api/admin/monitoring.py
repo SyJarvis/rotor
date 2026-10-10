@@ -374,17 +374,3 @@ async def get_performance():
     from rotor.observability import performance_metrics
 
     return {**performance_metrics.snapshot(), "store": conversation_store.status()}
-
-
-@router.get("/reconciliation")
-async def get_reconciliation():
-    from rotor.observability import reconciliation_monitor
-
-    return await reconciliation_monitor.check()
-
-
-@router.post("/reconciliation/reset")
-async def reset_reconciliation():
-    from rotor.observability import reconciliation_monitor
-
-    return await reconciliation_monitor.reset()
