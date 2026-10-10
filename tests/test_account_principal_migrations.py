@@ -18,7 +18,8 @@ from rotor.models.token import Token
 
 ROOT = Path(__file__).resolve().parents[1]
 PREVIOUS = "a3b4c5d6e7f8"
-HEAD = "b4c5d6e7f8a9"
+FOUNDATION = "b4c5d6e7f8a9"
+HEAD = "c5d6e7f8a9b0"
 TABLES = ("response_routes", "session_leases", "session_lease_events")
 
 
@@ -165,7 +166,7 @@ def test_partial_unversioned_account_schema_is_rejected_without_writes_or_backup
 @pytest.mark.parametrize("account_table", TABLES)
 def test_downgrade_refuses_account_owned_state_before_ddl(tmp_path, account_table):
     path = tmp_path / "account-state.db"
-    alembic(path, "upgrade", HEAD)
+    alembic(path, "upgrade", FOUNDATION)
     engine = create_engine(f"sqlite:///{path}")
     seed_key_state(engine)
     with engine.begin() as db:
@@ -177,7 +178,7 @@ def test_downgrade_refuses_account_owned_state_before_ddl(tmp_path, account_tabl
     assert path.read_bytes() == before
     engine = create_engine(f"sqlite:///{path}")
     with engine.connect() as db:
-        assert db.scalar(text("SELECT version_num FROM alembic_version")) == HEAD
+        assert db.scalar(text("SELECT version_num FROM alembic_version")) == FOUNDATION
         assert_account_schema(db)
         assert db.scalar(text(f"SELECT owner_id FROM {account_table}")) == 1
     engine.dispose()

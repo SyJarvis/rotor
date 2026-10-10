@@ -11,7 +11,7 @@ from rotor.migrations.runner import LegacyDatabaseError, run_startup_migrations
 
 ROOT = Path(__file__).resolve().parents[1]
 PREVIOUS_REVISION = "c9d0e1f2a3b4"
-HEAD_REVISION = "b4c5d6e7f8a9"
+HEAD_REVISION = "c5d6e7f8a9b0"
 _INSERT_CHANNEL = text(
     "INSERT INTO channels(name,type,key,base_url,models,model_mapping,priority,weight,enabled,test_only,protocol,extra) "
     "VALUES ('preserved','openai','test-key','https://example.invalid','[]','{}',1,1,1,0,'openai','{}')"

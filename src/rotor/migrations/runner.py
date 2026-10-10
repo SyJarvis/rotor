@@ -67,6 +67,8 @@ _REGISTERED_MODELS = (
 _PRE_USER_REVISION = "e1f2a3b4c5d6"
 _PRE_CLIENT_OAUTH_REVISION = "f2a3b4c5d6e7"
 _CLIENT_OAUTH_TABLES = frozenset({"client_oauth_codes", "client_oauth_grants", "client_oauth_credentials"})
+_CLIENT_OAUTH_BINDING_TABLES = frozenset({"client_oauth_codes", "client_oauth_grants"})
+_PRE_ACCOUNT_OAUTH_REVISION = "b4c5d6e7f8a9"
 _PRE_ACCOUNT_REVISION = "a3b4c5d6e7f8"
 _ACCOUNT_SCOPE_TABLES = frozenset({"response_routes", "session_leases", "session_lease_events"})
 _ACCOUNT_SCOPE_UNIQUES = {
@@ -146,6 +148,41 @@ def _validate_account_scope_generation(connection):
             if uniques.get(name) != fields:
                 raise LegacyDatabaseError("cannot safely adopt SQLite database: partial account identity constraints")
     return True
+
+
+def _validate_client_oauth_binding_generation(connection):
+    schema = inspect(connection)
+    tables = set(schema.get_table_names())
+    observed_tables = _CLIENT_OAUTH_TABLES & tables
+    if not observed_tables:
+        return False
+    if observed_tables != _CLIENT_OAUTH_TABLES:
+        raise LegacyDatabaseError("cannot safely adopt SQLite database: partial client OAuth schema")
+    columns = {table: {column["name"]: column for column in schema.get_columns(table)}
+               for table in _CLIENT_OAUTH_BINDING_TABLES}
+    observed = {table for table, fields in columns.items() if "token_id" in fields}
+    if not observed:
+        return False
+    for table in _CLIENT_OAUTH_BINDING_TABLES:
+        token_column = columns[table].get("token_id", {})
+        token_fks = [fk for fk in schema.get_foreign_keys(table) if "token_id" in fk["constrained_columns"]]
+        if (table not in observed or token_column["nullable"] or not isinstance(token_column["type"], Integer)
+                or len(token_fks) != 1 or token_fks[0]["constrained_columns"] != ["token_id"]
+                or token_fks[0]["referred_table"] != "tokens" or token_fks[0]["referred_columns"] != ["id"]
+                or token_fks[0].get("options", {}).get("ondelete", "").upper() != "CASCADE"):
+            raise LegacyDatabaseError("cannot safely adopt SQLite database: partial client OAuth Key binding schema")
+    return True
+
+
+def _is_client_oauth_binding_removal(difference):
+    operation = difference[0]
+    if operation == "remove_column" and len(difference) == 4:
+        return difference[1] is None and difference[2] in _CLIENT_OAUTH_BINDING_TABLES and difference[3].name == "token_id"
+    if operation == "remove_fk":
+        constraint = difference[1]
+        return (constraint.table.name in _CLIENT_OAUTH_BINDING_TABLES and list(constraint.column_keys) == ["token_id"]
+                and [element.target_fullname for element in constraint.elements] == ["tokens.id"])
+    return False
 
 
 def _is_account_scope_addition(difference):
@@ -296,6 +333,7 @@ def _schema_parity_signature(
 def _legacy_revision(connection: Connection) -> str:
     _validate_user_schema_generation(connection)
     _validate_account_scope_generation(connection)
+    _validate_client_oauth_binding_generation(connection)
     context = MigrationContext.configure(
         connection,
         opts={"compare_type": True},
@@ -325,10 +363,14 @@ def _legacy_revision(connection: Connection) -> str:
     client_oauth_additions = set()
     client_oauth_index_tables = set()
     account_scope_additions = False
+    client_oauth_binding_removals = set()
     for difference in diff_tuples:
         signature = _schema_parity_signature(difference)
         if signature is not None:
             parity_signatures.append(signature)
+        elif _is_client_oauth_binding_removal(difference):
+            table = difference[2] if difference[0] == "remove_column" else difference[1].table.name
+            client_oauth_binding_removals.add((difference[0], table))
         elif _is_account_scope_addition(difference):
             account_scope_additions = True
         elif difference[0] == "add_table" and getattr(difference[1], "name", None) in _CLIENT_OAUTH_TABLES:
@@ -364,6 +406,10 @@ def _legacy_revision(connection: Connection) -> str:
     if ((client_oauth_additions and client_oauth_additions != _CLIENT_OAUTH_TABLES)
             or not client_oauth_index_tables <= client_oauth_additions):
         raise LegacyDatabaseError("cannot safely adopt unversioned SQLite database: partial client OAuth schema")
+    if client_oauth_binding_removals and client_oauth_binding_removals != {
+        (operation, table) for operation in ("remove_column", "remove_fk") for table in _CLIENT_OAUTH_BINDING_TABLES
+    }:
+        raise LegacyDatabaseError("cannot safely adopt unversioned SQLite database: partial client OAuth Key binding schema")
 
     if oauth_columns or oauth_table_additions:
         if set(oauth_columns) != _OAUTH_CHANNEL_COLUMNS or len(oauth_columns) != len(_OAUTH_CHANNEL_COLUMNS) or oauth_table_additions != 1:
@@ -427,6 +473,8 @@ def _legacy_revision(connection: Connection) -> str:
         return _PRE_CLIENT_OAUTH_REVISION
     if account_scope_additions:
         return _PRE_ACCOUNT_REVISION
+    if client_oauth_binding_removals:
+        return _PRE_ACCOUNT_OAUTH_REVISION
     raise LegacyDatabaseError(
         "cannot safely adopt unversioned SQLite database: "
         "its schema does not match a known Rotor release"
@@ -474,6 +522,7 @@ def run_startup_migrations(database_url: str) -> Path | None:
     try:
         with engine.connect() as connection:
             _validate_account_scope_generation(connection)
+            _validate_client_oauth_binding_generation(connection)
             table_names = set(inspect(connection).get_table_names())
             current_heads = MigrationContext.configure(
                 connection

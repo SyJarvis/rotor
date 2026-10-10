@@ -14,7 +14,6 @@ class OAuthAuthorizationCode(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     secret_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     owner_id: Mapped[int] = mapped_column(ForeignKey("admin_users.id", ondelete="CASCADE"), nullable=False)
-    token_id: Mapped[int] = mapped_column(ForeignKey("tokens.id", ondelete="CASCADE"), nullable=False)
     client_id: Mapped[str] = mapped_column(String(100), nullable=False)
     redirect_uri: Mapped[str] = mapped_column(String(2048), nullable=False)
     code_challenge: Mapped[str] = mapped_column(String(43), nullable=False)
@@ -29,7 +28,6 @@ class OAuthGrant(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("admin_users.id", ondelete="CASCADE"), nullable=False, index=True)
-    token_id: Mapped[int] = mapped_column(ForeignKey("tokens.id", ondelete="CASCADE"), nullable=False)
     client_id: Mapped[str] = mapped_column(String(100), nullable=False)
     scope: Mapped[str] = mapped_column(String(100), nullable=False)
     account_auth_signature: Mapped[str] = mapped_column(String(64), nullable=False)

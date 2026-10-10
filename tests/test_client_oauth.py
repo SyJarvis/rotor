@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from rotor.api.admin.auth import router as auth_router
@@ -195,13 +195,13 @@ class ClientOAuthTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stored_code.secret_hash, secret_hash(code))
             self.assertEqual(stored_credential.access_hash, secret_hash(credentials["access_token"]))
             self.assertEqual(stored_credential.refresh_hash, secret_hash(credentials["refresh_token"]))
-            self.assertEqual(grant.token_id, self.token_id)
+            self.assertFalse(hasattr(grant, "token_id"))
             self.assertEqual(grant.owner_id, self.owner_id)
             self.assertEqual((grant.expires_at - grant.created_at).total_seconds(), GRANT_TTL)
             for secret in (code, credentials["access_token"], credentials["refresh_token"]):
                 self.assertNotIn(secret, str(stored_code.__dict__) + str(stored_credential.__dict__) + str(grant.__dict__))
-        self.assertEqual((await self.access(credentials)).json()["token_id"], self.token_id)
-        self.assertEqual((await self.access(credentials, "/optional")).json()["token_id"], self.token_id)
+        self.assertEqual((await self.access(credentials)).json(), {"token_id": None, "owner_id": self.owner_id})
+        self.assertIsNone((await self.access(credentials, "/optional")).json()["token_id"])
 
     async def test_authorization_code_claim_is_atomic(self):
         code = await self.authorize()
@@ -314,7 +314,7 @@ class ClientOAuthTests(unittest.IsolatedAsyncioTestCase):
         forbidden = await self.client.delete(f"/api/oauth/grants/{items[0]['id']}")
         self.assertEqual(forbidden.status_code, 403)
         async with self.sessions() as db:
-            alien = OAuthGrant(owner_id=999, token_id=self.token_id, client_id="rotor-client", scope="inference",
+            alien = OAuthGrant(owner_id=999, client_id="rotor-client", scope="inference",
                 account_auth_signature="h" * 64, created_at=utc_now(), expires_at=utc_now() + timedelta(days=1))
             db.add(alien)
             await db.commit()
@@ -324,14 +324,11 @@ class ClientOAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deleted.status_code, 204)
         self.assertNotIn(items[0]["id"], [item["id"] for item in (await self.client.get("/api/oauth/grants")).json()["items"]])
 
-    async def test_owner_status_token_ownership_and_password_changes_apply_immediately(self):
+    async def test_owner_status_and_password_changes_apply_immediately(self):
         credentials = await self.credentials()
         for model, changes, reset in (
             (AdminUser, {"enabled": False}, {"enabled": True}),
             (AdminUser, {"must_change_password": True}, {"must_change_password": False}),
-            (Token, {"enabled": False}, {"enabled": True}),
-            (Token, {"expired": True}, {"expired": False}),
-            (Token, {"owner_id": None}, {"owner_id": self.owner_id}),
         ):
             identifier = self.owner_id if model is AdminUser else self.token_id
             with self.subTest(changes=changes):
@@ -351,7 +348,7 @@ class ClientOAuthTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_quota_is_temporary_and_failed_refresh_rolls_back_claim(self):
         credentials = await self.credentials()
-        for model, identifier in ((AdminUser, self.owner_id), (Token, self.token_id)):
+        for model, identifier in ((AdminUser, self.owner_id),):
             with self.subTest(model=model):
                 await self.mutate(model, identifier, quota=0)
                 self.assertEqual((await self.access(credentials)).status_code, 429)
@@ -366,11 +363,40 @@ class ClientOAuthTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 credentials = response.json()
 
-    async def test_no_default_key_and_client_removal_block_authorization(self):
+    async def test_account_without_any_key_can_authorize_exchange_refresh_and_use_inference(self):
         await self.mutate(AdminUser, self.owner_id, default_token_id=None)
+        async with self.sessions() as db:
+            await db.execute(delete(Token))
+            await db.commit()
         metadata = await self.client.get("/api/oauth/authorization", params=self.params)
-        self.assertEqual(metadata.status_code, 403)
-        await self.mutate(AdminUser, self.owner_id, default_token_id=self.token_id)
+        self.assertEqual(metadata.status_code, 200, metadata.text)
+        self.assertEqual(metadata.json()["models"], ["allowed"])
+        credentials = await self.credentials()
+        self.assertEqual((await self.access(credentials)).json(), {"token_id": None, "owner_id": self.owner_id})
+        refreshed = await self.refresh(credentials)
+        self.assertEqual(refreshed.status_code, 200, refreshed.text)
+        self.assertEqual((await self.access(refreshed.json())).status_code, 200)
+        async with self.sessions() as db:
+            self.assertEqual((await db.scalars(select(Token))).all(), [])
+
+    async def test_key_status_default_and_deletion_do_not_affect_oauth(self):
+        credentials = await self.credentials()
+        for change in ({"enabled": False}, {"expired": True}, {"quota": 0}, {"owner_id": None},
+                       {"allowed_channels": []}, {"allowed_models": []}):
+            with self.subTest(change=change):
+                await self.mutate(Token, self.token_id, **change)
+                self.assertEqual((await self.access(credentials)).status_code, 200)
+        await self.mutate(AdminUser, self.owner_id, default_token_id=999)
+        self.assertEqual((await self.access(credentials)).status_code, 200)
+        async with self.sessions() as db:
+            await db.execute(delete(Token))
+            await db.commit()
+        refreshed = await self.refresh(credentials)
+        self.assertEqual(refreshed.status_code, 200)
+        self.assertEqual((await self.access(refreshed.json())).status_code, 200)
+        self.assertEqual((await self.client.get("/api/oauth/authorization", params=self.params)).status_code, 200)
+
+    async def test_client_removal_blocks_authorization(self):
         credentials = await self.credentials()
         with patch.object(settings, "ROTOR_OAUTH_CLIENTS", {}):
             self.assertEqual((await self.access(credentials)).status_code, 401)

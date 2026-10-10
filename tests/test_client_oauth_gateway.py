@@ -56,7 +56,7 @@ class SSEStream(httpx.AsyncByteStream):
 
 
 @asynccontextmanager
-async def gateway(tmp_path, monkeypatch, *, upstream_wait=None):
+async def gateway(tmp_path, monkeypatch, *, upstream_wait=None, with_api_keys=True):
     engine = create_database_engine(f"sqlite+aiosqlite:///{tmp_path / 'oauth.db'}")
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
@@ -65,13 +65,13 @@ async def gateway(tmp_path, monkeypatch, *, upstream_wait=None):
         db.add_all([
             AdminUser(id=1, username="alice", role="user", password_hash=hash_admin_password("login-password"),
                       enabled=True, must_change_password=False, quota=1000, allowed_channels=[1],
-                      allowed_models=["model-a"], default_token_id=11),
+                      allowed_models=["model-a"], default_token_id=11 if with_api_keys else None),
             AdminUser(id=2, username="bob", role="user", password_hash="unused", enabled=True,
-                      must_change_password=False, quota=1000, allowed_channels=[2], default_token_id=21),
-            Token(id=11, owner_id=1, name="base", key=API_KEY, enabled=True, is_base=True,
+                      must_change_password=False, quota=1000, allowed_channels=[2], default_token_id=21 if with_api_keys else None),
+            *([Token(id=11, owner_id=1, name="base", key=API_KEY, enabled=True, is_base=True,
                   allowed_channels=[1, 2], allowed_models=["model-a", "hidden-model", "channel-secret"]),
             Token(id=12, owner_id=1, name="other", key=OTHER_KEY, enabled=True),
-            Token(id=21, owner_id=2, name="base", key="sk-bob-default-key", enabled=True),
+            Token(id=21, owner_id=2, name="base", key="sk-bob-default-key", enabled=True)] if with_api_keys else []),
             Channel(id=1, name="allowed", type="openai", protocol="openai", key="upstream-key",
                     base_url="https://provider.invalid/v1", models=["model-a", "hidden-model"]),
             Channel(id=2, name="restricted", type="openai", protocol="openai", key="other-upstream-key",
@@ -138,7 +138,7 @@ async def gateway(tmp_path, monkeypatch, *, upstream_wait=None):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as browser:
             login = await browser.post("/api/auth/login", json={"username": "alice", "password": "login-password"})
             assert login.status_code == 200, login.text
-            assert login.json()["default_token_id"] == 11
+            assert login.json()["default_token_id"] == (11 if with_api_keys else None)
             csrf = browser.cookies[ADMIN_CSRF_COOKIE]
             challenge = base64.urlsafe_b64encode(hashlib.sha256(VERIFIER.encode()).digest()).decode().rstrip("=")
             authorization = await browser.post("/api/oauth/authorization", json={
@@ -179,9 +179,10 @@ async def infer(env, entrypoint="chat", *, stream=False, model="model-a", header
 
 @pytest.mark.parametrize("entrypoint", ["chat", "responses", "anthropic"])
 @pytest.mark.parametrize("stream", [False, True])
-def test_browser_login_bearer_reaches_all_protocols_and_owned_accounting(tmp_path, monkeypatch, entrypoint, stream):
+@pytest.mark.parametrize("with_api_keys", [False, True])
+def test_browser_login_bearer_reaches_all_protocols_and_owned_accounting(tmp_path, monkeypatch, entrypoint, stream, with_api_keys):
     async def exercise():
-        async with gateway(tmp_path, monkeypatch) as env:
+        async with gateway(tmp_path, monkeypatch, with_api_keys=with_api_keys) as env:
             response = await infer(env, entrypoint, stream=stream)
             assert response.status_code == 200, response.text
             assert "hello" in response.text
@@ -194,12 +195,16 @@ def test_browser_login_bearer_reaches_all_protocols_and_owned_accounting(tmp_pat
                 user, token = await db.get(AdminUser, 1), await db.get(Token, 11)
                 ledger = (await db.scalars(select(UsageLedger))).one()
                 log = (await db.scalars(select(RequestLog))).one()
-                assert (ledger.owner_id, ledger.token_id, ledger.channel_id) == (1, 11, 1)
-                assert (log.owner_id, log.token_id, log.channel_id) == (1, 11, 1)
+                assert (ledger.owner_id, ledger.token_id, ledger.channel_id) == (1, None, 1)
+                assert (log.owner_id, log.token_id, log.channel_id) == (1, None, 1)
                 assert ledger.request_protocol == {"chat": "openai_chat", "responses": "openai_responses", "anthropic": "anthropic_messages"}[entrypoint]
                 assert ledger.total_tokens == 6 and ledger.usage_source == "provider" and log.success
-                assert (user.used_quota, token.used_quota, token.request_count) == (6, 6, 1)
-                assert (await db.get(Token, 12)).used_quota == 0
+                assert user.used_quota == 6
+                if with_api_keys:
+                    assert (token.used_quota, token.request_count) == (0, 0)
+                    assert (await db.get(Token, 12)).used_quota == 0
+                else:
+                    assert (await db.scalars(select(Token))).all() == []
 
     asyncio.run(exercise())
 
@@ -235,13 +240,14 @@ def test_slow_oauth_inference_does_not_block_model_discovery_or_other_account_wr
             response = await pending
             assert response.status_code == 200, response.text
             async with env.sessions() as db:
-                assert (await db.get(Token, 11)).used_quota == 6
+                assert (await db.get(AdminUser, 1)).used_quota == 6
+                assert (await db.get(Token, 11)).used_quota == 0
 
     asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("limit", ["account_channels", "key_channels", "account_models", "key_models"])
-def test_model_discovery_and_three_protocols_enforce_live_permission_intersection(tmp_path, monkeypatch, limit):
+def test_model_discovery_and_three_protocols_use_account_permissions_and_keep_key_limits_separate(tmp_path, monkeypatch, limit):
     async def exercise():
         async with gateway(tmp_path, monkeypatch) as env:
             async with env.sessions() as db:
@@ -249,60 +255,63 @@ def test_model_discovery_and_three_protocols_enforce_live_permission_intersectio
                     allowed_channels=[1] if limit == "account_channels" else None,
                     allowed_models=["model-a"] if limit == "account_models" else None))
                 await db.execute(update(Token).where(Token.id == 11).values(
-                    allowed_channels=[1] if limit == "key_channels" else None,
-                    allowed_models=["model-a"] if limit == "key_models" else None))
+                    allowed_channels=[] if limit == "key_channels" else None,
+                    allowed_models=[] if limit == "key_models" else None))
                 await db.commit()
             hidden = "channel-secret" if limit.endswith("channels") else "hidden-model"
             for path in ("/v1/models", "/anthropic/v1/models"):
                 discovery = await env.client.get(path, headers=env.headers)
                 assert discovery.status_code == 200, discovery.text
                 visible = {item["id"] for item in discovery.json()["data"]}
-                assert "model-a" in visible and hidden not in visible
-            for entrypoint in PATHS:
-                forbidden = await infer(env, entrypoint, model=hidden)
-                assert forbidden.status_code == 404, forbidden.text
-            assert env.sent == []
+                assert "model-a" in visible
+                assert (hidden not in visible) is limit.startswith("account_")
+            if limit.startswith("account_"):
+                for entrypoint in PATHS:
+                    forbidden = await infer(env, entrypoint, model=hidden)
+                    assert forbidden.status_code == 404, forbidden.text
+                assert env.sent == []
+            else:
+                for entrypoint in PATHS:
+                    forbidden_key = await infer(env, entrypoint, headers={"Authorization": "Bearer " + API_KEY})
+                    assert forbidden_key.status_code == 404, forbidden_key.text
+                    allowed_account = await infer(env, entrypoint)
+                    assert allowed_account.status_code == 200, allowed_account.text
             async with env.sessions() as db:
                 assert (await db.get(Token, 11)).used_quota == 0
 
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("quota_owner", ["account", "key"])
-def test_oauth_and_api_key_share_quota_and_grant_keeps_original_default_key(tmp_path, monkeypatch, quota_owner):
+@pytest.mark.parametrize("first_auth", ["oauth", "api_key"])
+def test_oauth_and_api_key_debit_one_shared_account_quota_without_default_key_binding(tmp_path, monkeypatch, first_auth):
     async def exercise():
         async with gateway(tmp_path, monkeypatch) as env:
             async with env.sessions() as db:
                 await db.execute(update(AdminUser).where(AdminUser.id == 1).values(default_token_id=12))
-                if quota_owner == "account":
-                    await db.execute(update(AdminUser).where(AdminUser.id == 1).values(quota=12))
-                else:
-                    await db.execute(update(Token).where(Token.id == 11).values(quota=12))
+                await db.execute(update(AdminUser).where(AdminUser.id == 1).values(quota=12))
                 await db.commit()
-            assert (await infer(env)).status_code == 200
-            api = await infer(env, "anthropic", headers={"x-api-key": API_KEY})
-            assert api.status_code == 200, api.text
-            async with env.sessions() as db:
-                assert (await db.get(Token, 11)).enabled is (quota_owner == "account")
+            oauth_headers, api_headers = env.headers, {"x-api-key": API_KEY}
+            ordered = [oauth_headers, api_headers] if first_auth == "oauth" else [api_headers, oauth_headers]
+            for headers in ordered:
+                success = await infer(env, "anthropic", headers=headers)
+                assert success.status_code == 200, success.text
             for headers in (env.headers, {"Authorization": f"Bearer {API_KEY}"}):
                 blocked = await infer(env, headers=headers)
-                expected = 429 if quota_owner == "account" else 401
-                assert blocked.status_code == expected, blocked.text
+                assert blocked.status_code == 429, blocked.text
             assert len(env.sent) == 2
             async with env.sessions() as db:
                 assert (await db.get(AdminUser, 1)).used_quota == 12
-                assert (await db.get(Token, 11)).used_quota == 12
+                assert (await db.get(Token, 11)).used_quota == 6
                 assert (await db.get(Token, 12)).used_quota == 0
-                assert {row.token_id for row in (await db.scalars(select(UsageLedger))).all()} == {11}
+                assert {row.token_id for row in (await db.scalars(select(UsageLedger))).all()} == {11, None}
 
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("quota_owner", ["account", "key"])
-def test_temporarily_exhausted_quota_does_not_consume_refresh_credential(tmp_path, monkeypatch, quota_owner):
+def test_temporarily_exhausted_account_quota_does_not_consume_refresh_credential(tmp_path, monkeypatch):
     async def exercise():
         async with gateway(tmp_path, monkeypatch) as env:
-            quota_model, identity = (AdminUser, 1) if quota_owner == "account" else (Token, 11)
+            quota_model, identity = AdminUser, 1
             async with env.sessions() as db:
                 await db.execute(update(quota_model).where(quota_model.id == identity).values(quota=0))
                 await db.commit()
@@ -323,7 +332,77 @@ def test_temporarily_exhausted_quota_does_not_consume_refresh_credential(tmp_pat
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("failure", ["revoke", "access_expired", "grant_expired", "user_disabled", "password_changed", "client_removed", "key_disabled", "key_deleted", "key_expired", "key_owner_changed"])
+@pytest.mark.parametrize("key_change", ["disabled", "expired", "deleted", "owner_changed", "quota_exhausted", "default_changed"])
+def test_key_lifecycle_does_not_change_account_oauth_inference_or_refresh(tmp_path, monkeypatch, key_change):
+    async def exercise():
+        async with gateway(tmp_path, monkeypatch) as env:
+            async with env.sessions() as db:
+                if key_change == "deleted":
+                    await db.execute(delete(Token).where(Token.id == 11))
+                elif key_change == "default_changed":
+                    await db.execute(update(AdminUser).where(AdminUser.id == 1).values(default_token_id=12))
+                else:
+                    values = {"disabled": {"enabled": False}, "expired": {"expire_time": datetime.now(timezone.utc) - timedelta(seconds=1)},
+                              "owner_changed": {"owner_id": 2}, "quota_exhausted": {"quota": 0, "enabled": False}}[key_change]
+                    await db.execute(update(Token).where(Token.id == 11).values(**values))
+                await db.commit()
+            for path in ("/v1/models", "/anthropic/v1/models"):
+                discovery = await env.client.get(path, headers=env.headers)
+                assert discovery.status_code == 200, discovery.text
+                assert {item["id"] for item in discovery.json()["data"]} == {"model-a"}
+            for entrypoint in PATHS:
+                success = await infer(env, entrypoint)
+                assert success.status_code == 200, success.text
+            refreshed = await env.client.post("/oauth/token", data={"grant_type": "refresh_token", "client_id": "rotor-client",
+                "refresh_token": env.credentials["refresh_token"]})
+            assert refreshed.status_code == 200, refreshed.text
+            async with env.sessions() as db:
+                assert (await db.get(AdminUser, 1)).used_quota == 18
+                assert {row.token_id for row in (await db.scalars(select(UsageLedger))).all()} == {None}
+                token = await db.get(Token, 11)
+                assert token is None or token.used_quota == 0
+
+    asyncio.run(exercise())
+
+
+def test_real_key_quota_exhaustion_does_not_disable_account_oauth(tmp_path, monkeypatch):
+    async def exercise():
+        async with gateway(tmp_path, monkeypatch) as env:
+            async with env.sessions() as db:
+                await db.execute(update(Token).where(Token.id == 11).values(quota=6))
+                await db.commit()
+            key_headers = {"Authorization": "Bearer " + API_KEY}
+            assert (await infer(env, headers=key_headers)).status_code == 200
+            async with env.sessions() as db:
+                key = await db.get(Token, 11)
+                assert key.used_quota == 6 and key.enabled is False
+            assert (await infer(env, headers=key_headers)).status_code == 401
+            assert (await infer(env)).status_code == 200
+            async with env.sessions() as db:
+                assert (await db.get(AdminUser, 1)).used_quota == 12
+                assert (await db.get(Token, 11)).used_quota == 6
+                assert {row.token_id for row in (await db.scalars(select(UsageLedger))).all()} == {11, None}
+
+    asyncio.run(exercise())
+
+
+def test_account_without_keys_can_refresh_before_three_protocol_inference(tmp_path, monkeypatch):
+    async def exercise():
+        async with gateway(tmp_path, monkeypatch, with_api_keys=False) as env:
+            refreshed = await env.client.post("/oauth/token", data={"grant_type": "refresh_token", "client_id": "rotor-client",
+                "refresh_token": env.credentials["refresh_token"]})
+            assert refreshed.status_code == 200, refreshed.text
+            headers = {"Authorization": "Bearer " + refreshed.json()["access_token"]}
+            for entrypoint in PATHS:
+                assert (await infer(env, entrypoint, headers=headers)).status_code == 200
+            async with env.sessions() as db:
+                assert (await db.scalars(select(Token))).all() == []
+                assert (await db.get(AdminUser, 1)).used_quota == 18
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure", ["revoke", "access_expired", "grant_expired", "user_disabled", "password_changed", "client_removed"])
 def test_unavailable_authorization_rejects_inference_and_optional_model_discovery(tmp_path, monkeypatch, failure):
     async def exercise():
         async with gateway(tmp_path, monkeypatch) as env:
@@ -346,12 +425,6 @@ def test_unavailable_authorization_rejects_inference_and_optional_model_discover
                         await db.execute(update(AdminUser).where(AdminUser.id == 1).values(enabled=False))
                     elif failure == "password_changed":
                         await db.execute(update(AdminUser).where(AdminUser.id == 1).values(password_hash="reset-password-hash"))
-                    elif failure == "key_deleted":
-                        await db.execute(delete(Token).where(Token.id == 11))
-                    else:
-                        values = {"key_disabled": {"enabled": False}, "key_expired": {"expire_time": past},
-                                  "key_owner_changed": {"owner_id": 2}}[failure]
-                        await db.execute(update(Token).where(Token.id == 11).values(**values))
                     await db.commit()
             for entrypoint in PATHS:
                 response = await infer(env, entrypoint)

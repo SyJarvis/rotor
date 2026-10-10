@@ -13,10 +13,9 @@ from sqlalchemy import select, update
 
 from rotor.config import OAuthClientSettings, oauth_redirect_parts, settings
 from rotor.core.exceptions import AuthenticationException
-from rotor.core.user_access import accessible_models, validate_token_access
+from rotor.core.user_access import accessible_models, resolve_account_principal
 from rotor.models.admin_auth import AdminUser
 from rotor.models.client_oauth import OAuthAuthorizationCode, OAuthCredential, OAuthGrant
-from rotor.models.token import Token
 
 
 ACCESS_PREFIX = "rotor-access-"
@@ -107,35 +106,30 @@ def authorization_request(values: dict) -> AuthorizationRequest:
     return AuthorizationRequest(client_id, redirect_uri, "inference", state, challenge, client)
 
 
-async def owner_token(db, owner_id: int, token_id: int | None = None, signature: str | None = None):
+async def owner_principal(db, owner_id: int, signature: str | None = None):
     owner = await db.get(AdminUser, owner_id, populate_existing=True)
     if owner is None or not owner.enabled:
         raise HTTPException(403, "Account is disabled")
     if owner.must_change_password or (signature is not None and not secrets.compare_digest(signature, secret_hash(owner.password_hash))):
         raise HTTPException(403, "Account login has changed; authorize again")
-    token_id = owner.default_token_id if token_id is None else token_id
-    token = await db.get(Token, token_id, populate_existing=True) if token_id is not None else None
-    if token is None or token.owner_id != owner.id:
-        raise HTTPException(403, "Authorized API Key is unavailable")
-    await validate_token_access(token, db)
-    return owner, token
+    return owner, await resolve_account_principal(db, owner_id)
 
 
 async def authorization_details(db, actor, request: AuthorizationRequest):
-    owner, token = await owner_token(db, actor.user_id)
+    owner, principal = await owner_principal(db, actor.user_id)
     return {"client_id": request.client_id, "client_name": request.client.name,
             "redirect_uri": request.redirect_uri, "scope": request.scope,
-            "username": owner.username, "models": await accessible_models(token, db),
+            "username": owner.username, "models": await accessible_models(principal, db),
             "quota": owner.quota, "used_quota": owner.used_quota}
 
 
 async def authorize(db, actor, request: AuthorizationRequest, approve: bool):
     if not approve:
         return request.redirect_uri + "?" + urlencode({"error": "access_denied", "state": request.state})
-    owner, token = await owner_token(db, actor.user_id)
+    owner, _ = await owner_principal(db, actor.user_id)
     now = utc_now()
     code = "rotor-code-" + secrets.token_urlsafe(32)
-    db.add(OAuthAuthorizationCode(secret_hash=secret_hash(code), owner_id=owner.id, token_id=token.id,
+    db.add(OAuthAuthorizationCode(secret_hash=secret_hash(code), owner_id=owner.id,
         client_id=request.client_id, redirect_uri=request.redirect_uri, code_challenge=request.code_challenge,
         account_auth_signature=secret_hash(owner.password_hash), created_at=now, expires_at=now + timedelta(seconds=CODE_TTL)))
     await db.commit()
@@ -148,7 +142,7 @@ def invalid_grant():
 
 async def validate_grant_owner(db, grant):
     try:
-        return await owner_token(db, grant.owner_id, grant.token_id, grant.account_auth_signature)
+        return await owner_principal(db, grant.owner_id, grant.account_auth_signature)
     except HTTPException as error:
         await db.rollback()
         if error.status_code == 429:
@@ -184,7 +178,7 @@ async def exchange_code(db, values):
     if code_row is None:
         raise invalid_grant()
     await validate_grant_owner(db, code_row)
-    grant = OAuthGrant(owner_id=code_row.owner_id, token_id=code_row.token_id, client_id=client_id,
+    grant = OAuthGrant(owner_id=code_row.owner_id, client_id=client_id,
         scope="inference", account_auth_signature=code_row.account_auth_signature, created_at=now,
         expires_at=now + timedelta(seconds=GRANT_TTL))
     db.add(grant)
@@ -238,7 +232,7 @@ async def resolve_access_token(db, access: str):
         error.headers = {"WWW-Authenticate": "Bearer"}
         raise error
     try:
-        _, token = await owner_token(db, grant.owner_id, grant.token_id, grant.account_auth_signature)
+        _, principal = await owner_principal(db, grant.owner_id, grant.account_auth_signature)
     except HTTPException as denied:
         if denied.status_code == 429:
             raise
@@ -248,4 +242,4 @@ async def resolve_access_token(db, access: str):
     await db.execute(update(OAuthGrant).where(OAuthGrant.id == grant.id).values(last_used_at=now))
     # Release SQLite's write lock before the gateway awaits an upstream model.
     await db.commit()
-    return token
+    return principal
