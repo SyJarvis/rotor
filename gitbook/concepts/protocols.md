@@ -18,7 +18,8 @@ Rotor 将客户端请求统一路由到 Channel，但 Channel 可以使用与客
 
 `protocol=openai_responses` 表示上游原生实现 Responses API。Rotor 会保留原生
 Responses 事件对象的语义字段，并由网关重建客户端 SSE framing（不是字节级透传）；同时
-持久化 response ID 到渠道和 Rotor Token 的绑定。检索、取消、删除、
+持久化 response ID 到渠道和认证范围的绑定：API Key 按 Key ID 隔离，OAuth/网页对话
+按账户 ID 隔离；账号范围与 Key 范围不能互相访问。检索、取消、删除、
 输入项列表、input token 计数、compaction 和 `previous_response_id` 会回到原始
 上游账号。
 

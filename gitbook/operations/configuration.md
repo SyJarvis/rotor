@@ -11,11 +11,13 @@ Pydantic Settings 从当前目录的 `.env` 和进程环境读取大写字段。
 | --- | --- | --- |
 | `DATABASE_URL` | `sqlite+aiosqlite:///~/.cache/rotor/rotor.db` | SQLAlchemy 异步数据库 URL |
 | `API_KEY_PREFIX` | `sk-` | Rotor 用户 Key 格式前缀 |
+| `ROTOR_OAUTH_CLIENTS` | `rotor-client` 的回环回调登记 | 客户端 OAuth 的公开客户端名称与允许回调地址 |
+| `ROTOR_OAUTH_ISSUER` | 未设置 | 客户端 OAuth 的外部 HTTPS issuer；未设置时使用请求基址 |
 | `ROTOR_DEFAULT_ADMIN_USERNAME` | `admin` | 空数据库首次初始化时创建的管理员用户名 |
 | `ROTOR_DEFAULT_ADMIN_PASSWORD` | `123456` | 空数据库首次初始化密码；首次登录必须修改 |
-| `ROTOR_ADMIN_SESSION_IDLE_SECONDS` | `1800` | 管理员 Session 空闲超时 |
-| `ROTOR_ADMIN_SESSION_TTL_SECONDS` | `43200` | 管理员 Session 绝对有效期 |
-| `ROTOR_ADMIN_COOKIE_SECURE` | `false` | 是否仅通过 HTTPS 发送管理员 Cookie；生产 HTTPS 必须开启 |
+| `ROTOR_ADMIN_SESSION_IDLE_SECONDS` | `1800` | 账户网页 Session 空闲超时 |
+| `ROTOR_ADMIN_SESSION_TTL_SECONDS` | `43200` | 账户网页 Session 绝对有效期 |
+| `ROTOR_ADMIN_COOKIE_SECURE` | `false` | 是否仅通过 HTTPS 发送账户 Cookie；生产 HTTPS 必须开启 |
 | `ROTOR_ADMIN_LOGIN_MAX_FAILURES` | `5` | 同一用户名和客户端 IP 在计数窗口内允许的失败次数 |
 | `ROTOR_ADMIN_LOGIN_WINDOW_SECONDS` | `300` | 管理员登录失败计数窗口秒数 |
 | `ROTOR_ADMIN_LOGIN_LOCK_SECONDS` | `900` | 达到失败上限后的锁定秒数 |
@@ -45,6 +47,12 @@ CORS_ORIGINS=["https://admin.example.com"]
 ```
 
 环境变量在进程启动时读取，修改后需要重启 Rotor。
+
+`ROTOR_OAUTH_CLIENTS` 是完整的公开客户端登记表，替换它时需显式保留仍要使用的
+客户端；仅支持已登记回调。生产部署应设置可信的外部 HTTPS `ROTOR_OAUTH_ISSUER`
+并开启安全 Cookie。默认回环地址、PKCE 登录流程和 JSON 配置示例见
+[客户端网页登录授权](../guides/client-oauth.md#客户端与回调登记)。这些配置用于调用方
+登录 Rotor，与渠道的 ChatGPT OAuth 登录配置不同。
 
 用户聊天在 `CHAT_STORE_DIR/<user_id>/index.json` 保存索引，在
 `<user_id>/<conversation_id>/conversation.json` 保存对话、设置与草稿，在同一会话的

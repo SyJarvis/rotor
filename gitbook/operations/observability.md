@@ -127,7 +127,9 @@ scope 保持请求发生时的快照，不随之后的 Channel 配置变化。
 
 ## Session Lease 事实
 
-`session_leases` 保存当前权威绑定，唯一键为 Rotor Token、Session ID 和 logical model。
+`session_leases` 保存当前权威绑定，唯一键为认证范围、Session ID 和 logical model。
+API Key 请求使用 Key ID；网页对话与 OAuth 使用账户 ID，同账户多个 OAuth 授权
+共享账号范围，与 Key 范围隔离。租约及事件的 `token_id`、`owner_id` 只能有一个非空。
 `session_lease_events` 追加记录 `assigned`、`renewed`、`migrated`、`expired`，以及旧/新
 Channel 和原因。事件通过 `request_id` 出现在 Control API request trace 的
 `session_lease_events` 中；routing decision 的 feature snapshot 同时说明本次是否读到
@@ -200,6 +202,9 @@ POST /api/admin/monitoring/reconciliation/reset
 
 对账接口比较基线之后成功账本与 Token 累计的增量，并在同一读取快照中比较。检查结果
 缓存 30 秒，不会因每次页面刷新而扫描全部历史账本。
+
+当前仅核对 Key 计数，尚未覆盖账户计数。基线后新增网页对话或 OAuth 成功账本的
+`token_id` 为空，会返回 `invalid`；不能据此判断账户扣费错误。
 
 - `baseline`：刚建立基线，尚不能证明历史数据一致；
 - `ok`：基线之后的增量一致；

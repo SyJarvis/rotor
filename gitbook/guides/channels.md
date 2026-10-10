@@ -1,11 +1,14 @@
 # 配置与维护渠道
 
-Channel 表示一个具体的上游调用入口：一个供应商地址、一把上游 Key、一组模型和
+Channel 表示一个具体的上游调用入口：一个供应商地址、一组上游认证配置、模型和
 一套路由属性。
 
 ## 创建渠道
 
-可以在浏览器管理页中添加渠道，也可以调用 `POST /api/admin/channels`：
+可以在浏览器管理页中添加渠道，也可以调用 `POST /api/admin/channels`。下面示例
+使用上游 API Key；“认证登录”目前仅支持 [ChatGPT OAuth](chatgpt-oauth.md)，使用
+`openai_codex` 服务商、固定的 `openai_responses` 协议和 ChatGPT 上游地址。
+这是 Rotor 访问上游的认证，与客户端访问 Rotor 的[网页登录授权](client-oauth.md)分别管理。
 
 HTTP 调用需要先按[管理 API 认证](../reference/admin-api.md#认证端点)建立 Session；
 下面的读取示例使用 `ROTOR_ADMIN_COOKIE_JAR`，写操作还需要

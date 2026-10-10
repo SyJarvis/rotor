@@ -1,6 +1,8 @@
 # 管理 API
 
-管理 API 位于 `/api/admin`，使用服务端管理员 Session 鉴权。首次启动会创建
+管理 API 位于 `/api/admin`，管理功能使用服务端账户 Session 鉴权，并要求 `admin`
+角色。普通用户 Session、Rotor API Key 和客户端 OAuth 凭证不能访问这些管理功能。
+首次启动会创建
 `admin / 123456`；该账号首次登录后必须修改密码，完成前除认证和改密端点外的管理
 接口都返回 `403`。
 
@@ -45,6 +47,17 @@ curl -sS -b "$ROTOR_ADMIN_COOKIE_JAR" \
 后续 `GET` 请求携带 `-b "$ROTOR_ADMIN_COOKIE_JAR"`；除退出登录外，`POST`、
 `PUT`、`PATCH` 和 `DELETE` 还必须携带 `X-CSRF-Token`。Session 默认空闲 30 分钟、
 最长 12 小时。
+
+登录、当前账户、改密和退出端点也通过 `/api/auth/*` 提供，供普通账户网页登录使用。
+网页对话与客户端 OAuth 授权直接绑定账户，不依赖基础或默认 API Key。
+“设置 → 登录与安全 → 设备管理”通过 `GET /api/oauth/grants` 查看自己的授权记录，
+通过 `DELETE /api/oauth/grants/{grant_id}` 配合 Session 与 CSRF 撤销一项授权。
+这些是个人接口，不要求管理员角色；旧 `/oauth/apps` 会跳转到 `/?settings=security`。
+
+管理员可通过 `POST /api/admin/users/{user_id}/reset-password` 重置指定账户密码，
+JSON 请求体为 `{"password":"replace-with-a-strong-password"}`，需要完整管理员 Session 与 CSRF。
+操作撤销该账户全部网页 Session、使旧 OAuth 授权失效，并要求用户下次登录后改密；
+这不是公开的密码找回接口。
 
 登录默认按“用户名 + 客户端 IP”限流：5 分钟内失败 5 次后锁定 15 分钟。触发或处于
 锁定状态时返回 `429`，`Retry-After` 给出剩余秒数。相关阈值可通过
@@ -143,7 +156,11 @@ Channel 请求字段见 [Channel 字段](channel-schema.md)。
 - `POST /api/admin/tokens/generate` 使用 **query 参数**（`name`、`quota`、`group`、
   `allowed_channels`、`expire_time`），由服务端生成 `sk-` Key。
 
-管理页面使用前者；`generate` 保留给直接调用 HTTP 的脚本：
+这两个管理端点创建无所属账户的 Key。账户所属 Key 通过个人 `/api/me/tokens`
+接口管理，其权限是账号与 Key 限制的交集，用量同时累计账号和 Key 各自的已用额度。
+
+API Key 页面默认“我的”范围使用 `/api/me/tokens`；管理员切到“全部”范围时使用
+`/api/admin/tokens`，快捷生成使用 `generate`。脚本也可以直接调用 `generate`：
 
 ```bash
 curl -X POST -b "$ROTOR_ADMIN_COOKIE_JAR" -H "X-CSRF-Token: $ROTOR_ADMIN_CSRF" \
@@ -196,6 +213,9 @@ curl -X POST -b "$ROTOR_ADMIN_COOKIE_JAR" -H "X-CSRF-Token: $ROTOR_ADMIN_CSRF" \
 | `GET` | `/api/admin/monitoring/performance` | 进程内性能快照（含 PID 与启动时间） |
 | `GET` | `/api/admin/monitoring/reconciliation` | 账本与 Token 累计的增量对账 |
 | `POST` | `/api/admin/monitoring/reconciliation/reset` | 重建对账基线；不修账 |
+
+当前增量对账尚未覆盖账号计数；网页对话与 OAuth 成功账本可能使结果为 `invalid`，
+不能据此判断账户扣费错误。具体限制见[增量对账](../operations/observability.md#增量对账)。
 
 性能计数的窗口、样本上限与单进程边界见[日志、用量与数据存储](../operations/observability.md#监控页性能与会话来源)。
 

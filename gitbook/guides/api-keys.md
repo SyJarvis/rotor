@@ -1,7 +1,12 @@
 # 管理 API Key 与配额
 
-Rotor API Key 用于认证客户端请求，并可限制配额、有效期和允许访问的渠道。
+Rotor API Key 用于认证客户端请求，并可限制配额、有效期和允许访问的渠道、模型。
 它不同于存放在 Channel 中的上游供应商 Key。
+
+网页对话和[客户端网页登录授权](client-oauth.md)直接使用 Rotor 账户，不依赖基础 Key
+或默认 Key。账户所属的 API Key、网页对话与 OAuth 请求共同累计账户已用额度；
+API Key 请求还受该 Key 自身的配额、有效期和权限限制。无所属账户的旧 Key 保留
+独立配额，不会扣除某个账户的额度。
 
 ## 生成 Key
 
@@ -14,8 +19,9 @@ curl -X POST -b "$ROTOR_ADMIN_COOKIE_JAR" \
   "http://127.0.0.1:8000/api/admin/tokens/generate?name=team-a&quota=1000000"
 ```
 
-`quota` 的单位是 Token；省略或设为空表示不限制。响应中的 `key` 是供客户端
-使用的 Rotor Key，应将其视为凭据保存。
+`quota` 的单位是 Token；省略表示不限制该 Key。此管理端点生成无所属账户的
+Key；账户所属 Key 可通过个人 API Key 页面创建。响应中的 `key` 是供客户端使用的
+Rotor Key，应将其视为凭据保存。
 
 ## 客户端认证
 
@@ -32,11 +38,16 @@ x-api-key: sk-...
 ```
 
 Rotor 同时接受这两种方式。Key 必须以 `API_KEY_PREFIX` 开头，默认前缀为 `sk-`。
+Bearer 也可携带 Rotor OAuth access token，`x-api-key` 仅用于 API Key；授权码和
+refresh token 不能用于推理。网页登录 Cookie 不替代这些客户端认证头。
 
 ## 限制可访问渠道
 
-Token 的 `allowed_channels` 是渠道 ID 列表。值为 `null` 时可以访问所有启用渠道；
-设置列表后，模型发现和请求路由都会限制在这些渠道内。
+Token 的 `allowed_channels` 是渠道 ID 列表，`allowed_models` 是模型 ID 列表。
+账户所属 Key 的实际权限是账户与 Key 限制的交集；任一层设为 `null` 表示该层不额外
+限制，空列表表示不允许访问。模型发现和请求路由都使用实际权限。
+无所属账户的旧 Key 只使用自身限制，其中 `allowed_channels` 的 `null` 和空列表均
+按兼容规则视为不限制渠道；`allowed_models` 的空列表仍表示不允许模型。
 
 ```json
 {

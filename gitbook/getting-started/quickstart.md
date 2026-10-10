@@ -1,7 +1,9 @@
 # 完成第一次请求
 
-本页从一个正在运行的 Rotor 实例开始，完成渠道创建、用户 Key 签发和第一条
-Chat Completions 请求。
+本页从一个正在运行的 Rotor 实例开始，使用 API Key 完成渠道创建和第一条
+Chat Completions 请求。网页对话直接绑定登录账户，无需创建或填写 Key；支持 Rotor
+登录流程的客户端也可使用[网页登录授权](../guides/client-oauth.md)。同一账户的这些请求共享
+账户额度，API Key 请求另外受 Key 自身的权限与额度限制。
 
 ## 1. 登录管理页面
 
@@ -36,7 +38,8 @@ Chat Completions 请求。
 ```
 
 `base_url` 是上游 API 根地址，`key` 是上游 Key。不同供应商或不同 Key 应建立为
-不同渠道。
+不同渠道。若使用 ChatGPT 认证登录，请按 [ChatGPT OAuth 渠道指南](../guides/chatgpt-oauth.md)
+完成浏览器授权；该上游认证与客户端登录 Rotor 分开。
 
 ## 3. 检查模型
 
@@ -49,7 +52,8 @@ curl http://127.0.0.1:8000/v1/models
 
 ## 4. 签发 Rotor API Key
 
-在管理页面的“API Key”中创建名称为 `quickstart`、配额为 `1000000` 的 Key。
+在管理页面的“API Key → 我的 Key”中创建名称为 `quickstart` 的 Key，使其归属
+当前账户并共享账户额度。
 
 保存响应中的 `key`：
 
@@ -72,5 +76,10 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 成功响应会携带 `X-Rotor-Channel` 和 `X-Rotor-Provider-Model` 响应头，分别指出
 实际渠道和映射后的上游模型。
+
+渠道配置后也可以打开“对话”，选择模型并发送消息或进行连接测试；两者都不依赖
+默认或 `base` Key。Temperature 和 Max Tokens 留空时使用模型默认值，连接测试
+会发起真实模型请求。个人资料在“设置 → 账户”中修改，密码在“设置 → 登录与安全”
+中修改；该页面的“设备管理”用于查看和撤销客户端 OAuth 授权记录。
 
 接下来可以[配置更多渠道](../guides/channels.md)，或[接入常用客户端](../guides/client-integrations.md)。

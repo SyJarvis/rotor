@@ -2,8 +2,9 @@
 
 [简体中文](README.md) | [English](README.en.md)
 
-Rotor is a self-hosted LLM API gateway. It organizes model providers and API
-keys as channels, exposes unified OpenAI Chat Completions, OpenAI Responses,
+Rotor is a self-hosted LLM API gateway. It organizes model providers and their
+authentication settings as channels, exposes unified OpenAI Chat Completions,
+OpenAI Responses,
 OpenAI Images, and Anthropic Messages endpoints, and handles protocol
 conversion, routing, fallback, token accounting, and runtime observability.
 
@@ -28,6 +29,9 @@ separately authenticated read-only Control API, and an independent
 - **Administration and diagnostics**: manage channels and user tokens in the
   admin UI; expose read-only diagnostic facts to MCP, CLIs, and automation
   through the Control API.
+- **Account access**: browser chat and [client OAuth](gitbook/guides/client-oauth.md)
+  use account permissions and quota directly, without a default or `base` Key.
+  API keys remain supported with additional per-key permissions and quota.
 - **Local-first storage**: file-backed SQLite, with local conversation storage.
 
 ## How it works
@@ -135,8 +139,11 @@ to use a separate image.
 
 ### 1. Add a channel
 
-Sign in to the admin interface and add the provider URL, API key, model, and
-protocol under Channels. HTTP automation must first establish an authenticated
+Sign in to the admin interface and add the provider URL, authentication, model,
+and protocol under Channels. Upstream authentication supports API keys or
+[ChatGPT OAuth](gitbook/guides/chatgpt-oauth.md). ChatGPT login authorizes Rotor to
+access the upstream; client OAuth authorizes callers to access Rotor.
+HTTP automation must first establish an authenticated
 admin session as described in [Admin API](gitbook/reference/admin-api.md).
 
 `protocol` describes the API exposed by the upstream:
@@ -152,7 +159,9 @@ and conversion behavior.
 
 ### 2. Create a Rotor user token
 
-Generate a Rotor user token from **API Keys** in the admin interface.
+This example uses API key authentication. Generate a Rotor user token from
+**API Keys → My keys** so it belongs to the signed-in account. Browser chat needs
+no key; clients implementing Rotor login can use [browser authorization](gitbook/guides/client-oauth.md).
 
 Save the returned `sk-` token:
 
@@ -253,18 +262,28 @@ does not accept ordinary `sk-` user tokens.
 ## User chat
 
 Administrators and regular users can chat after signing in. Administrators can
-create accounts or issue invitation codes to enter on the registration page. Each
-new account receives a `base` Key. Model listings, connection tests, and chat
-requests use the account’s current default Key and respect both account and Key
-quotas, channel access, and model restrictions. If the default Key is unavailable,
-resolve its status or select another default Key.
+create accounts or issue invitation codes to enter on the registration page.
+Model listings, connection tests, and chat requests use the signed-in account
+directly and respect its quota, channel access, and model restrictions, without
+depending on a default or `base` Key.
+
+Browser chat, Rotor client OAuth, and API key requests owned by the same account
+share its quota. API key requests also follow that key’s permissions and quota;
+creating, switching, or disabling a key does not affect browser chat or client
+OAuth. Edit personal details under **Settings → Account**. Password changes and
+client authorizations are under **Settings → Login and security**.
+**Device management** shows a separate record for each client OAuth authorization,
+with its name, authorization time, last use, and expiry, and confirmation before
+revoking an individual record. These records are not physical devices or browser
+sessions.
 
 Chat uses the OpenAI SDK to call the Rotor gateway, retaining channel
 routing, usage accounting, and request logging. Chat Completions is the
 default protocol; Responses is also available. Each conversation saves its
 own model, API format, System Prompt, temperature, and max_tokens in the right-hand
-settings panel. Leave temperature and max_tokens blank to use upstream
-defaults. The System Prompt is limited to 100,000 characters.
+settings panel. Leave temperature and max_tokens blank to omit those parameters
+from upstream requests and use the model’s defaults. The System Prompt is limited
+to 100,000 characters.
 **Test connection** makes a short, real text generation request with
 the current parameters and may incur upstream charges. It does not validate
 the model’s image or document understanding.

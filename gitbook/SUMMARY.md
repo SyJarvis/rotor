@@ -9,6 +9,7 @@
 ## 使用指南
 
 - [配置与维护渠道](guides/channels.md)
+- [ChatGPT OAuth 渠道](guides/chatgpt-oauth.md)
 - [管理 API Key 与配额](guides/api-keys.md)
 - [选择路由策略](guides/routing.md)
 - [接入 Codex、Claude Code 与 OpenCode](guides/client-integrations.md)

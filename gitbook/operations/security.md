@@ -4,23 +4,44 @@ Rotor 的客户端 API、管理 API 和 Control API 使用彼此独立的认证�
 
 ## 客户端 API
 
-生成和状态类请求通过 Rotor Token 认证，接受：
+生成和状态类请求接受 Rotor API Key 或客户端 OAuth access token：
 
 ```text
 Authorization: Bearer sk-...
+Authorization: Bearer <Rotor OAuth access token>
 x-api-key: sk-...
 ```
 
-认证会检查 Key 格式、数据库记录、启用状态、过期状态和配额。Token 还可以使用
-`allowed_channels` 限制可访问渠道。
+`x-api-key` 仅接受 API Key。授权码和 refresh token 不能用于推理，OAuth access token
+不能访问管理 API 或 Control API。账户网页登录 Cookie 用于网页和个人接口，不替代
+客户端推理认证头。
 
-`GET /v1/models` 允许不带 Token 调用；提供有效 Token 时会按其渠道权限过滤模型。
+认证会检查 Key 格式、数据库记录、启用状态、过期状态和配额。账户所属 Key 同时
+检查账户状态、配额和账号与 Key 的渠道、模型权限交集；无所属账户的旧 Key 保留
+自身权限和独立配额。网页对话与 OAuth 直接检查账户权限和配额，不依赖基础或默认
+Key；三种账户接入方式共同累计账户已用额度。
+
+`GET /v1/models` 允许无凭证调用，列出启用渠道的模型及映射键；提供有效 API Key
+或 OAuth access token 时，按实际渠道和模型权限过滤。
+
+## 客户端网页登录授权
+
+Rotor 的客户端登录使用授权码与 PKCE S256，授权绑定账户。访问凭证、刷新凭证和
+授权码只在数据库中保存哈希；续期轮换刷新凭证，复用旧刷新凭证会撤销整项授权。
+账户密码变更或重置后，已有 OAuth 凭证不能继续使用，需要重新授权。
+
+“设置 → 登录与安全 → 设备管理”显示当前账户的每次客户端授权，包括授权时间、
+最后使用时间和到期时间。它是授权记录列表，不识别物理设备，也不提供在线状态、
+操作系统或 IP。撤销一项会使该项的访问及刷新凭证失效，不影响其他授权或 API Key。
+旧地址 `/oauth/apps` 会跳转到 `/?settings=security`。流程和配置见
+[客户端网页登录授权](../guides/client-oauth.md)。
 
 ## 管理 API
 
-`/api/admin/*` 使用管理员账号和服务端 Session。首次启动创建 `admin / 123456`，
+管理功能使用 `admin` 角色账户和服务端 Session；普通账户仅能访问自己的网页对话、
+个人资料、Key、日志和客户端授权。首次启动创建 `admin / 123456`，
 密码以 scrypt 哈希保存；首次登录只得到受限 Session，必须修改密码后才能访问其他
-管理接口。浏览器 Session Cookie 使用 `HttpOnly` 和 `SameSite=Strict`，管理写操作
+管理接口。浏览器 Session Cookie 使用 `HttpOnly` 和 `SameSite=Strict`，管理和个人写操作
 还要求匹配的 CSRF Cookie/Header。
 
 管理员登录限流状态保存在数据库中，默认按规范化用户名和客户端 IP 统计：5 分钟内
@@ -37,16 +58,28 @@ x-api-key: sk-...
 - 在绑定非本机网络地址前完成首次登录和默认密码修改；
 - HTTPS 部署设置 `ROTOR_ADMIN_COOKIE_SECURE=true`；
 - 使用防火墙、私有网络或受保护的反向代理进一步限制管理面；
-- 不可信客户端只能访问所需的 `/v1/*` 或 `/anthropic/v1/*` 路径；
+- 仅使用 API Key 的模型客户端按需开放 `/v1/*` 和 `/anthropic/v1/*`；客户端 OAuth
+  还需服务发现、`/oauth/*` 以及浏览器登录、授权所需页面和个人认证接口，范围见
+  [客户端网页登录授权](../guides/client-oauth.md)；
 - 管理 API 响应和渠道配置可能涉及上游凭据，应按敏感数据处理。
 
 默认用户名和密码环境变量只在空数据库首次初始化时使用，修改它们不会重置已有
-管理员密码。遗失密码时当前版本不提供远程重置端点，应通过受控数据库维护流程恢复。
+管理员密码。已登录且完成首次改密的管理员可通过
+`POST /api/admin/users/{user_id}/reset-password` 配合 CSRF 重置指定账户密码；该操作
+撤销其全部网页 Session，并要求下次登录改密。没有公开的密码找回接口；若已无可用的
+管理员访问，应通过受控数据库维护流程恢复。
 
-## 上游 Key
+自行修改密码会保留当前网页 Session、撤销该账户其他 Session，并使旧 OAuth 授权
+失效。退出网页登录只撤销当前 Session，不自动撤销客户端 OAuth 授权。改密与重置
+不会删除 API Key；账户必须改密期间，账户所属 Key 的请求也会被拒绝。
+
+## 上游凭证
 
 上游供应商 Key 存储在 Channel 数据库记录中，并用于构造 Bearer、`x-api-key`
-或 `api-key` 请求头。数据库备份、管理 API 和进程环境都应处于受信任边界。
+或 `api-key` 请求头。[ChatGPT OAuth 渠道](../guides/chatgpt-oauth.md)则由后端持有上游
+访问和刷新凭证，只使用 Responses 上行。它与客户端登录 Rotor 的 OAuth 分别管理
+凭证；上游凭证不通过渠道详情返回浏览器，也不能放入 `extra`。数据库中包含这些
+敏感凭证，备份、管理 API 和进程环境都应处于受信任边界。
 
 ## 会话和错误正文
 
