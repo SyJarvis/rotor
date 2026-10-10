@@ -167,12 +167,48 @@ class ClientOAuthTests(unittest.IsolatedAsyncioTestCase):
             params = self.params if register is None else {**self.params, "register": register}
             page = await self.client.get("/oauth/authorize", params=params)
             self.assertEqual(page.status_code, 200, page.text)
+            self.assertEqual(page.headers["cache-control"], "no-store")
             self.assertEqual(page.headers["referrer-policy"], "no-referrer")
             self.assertEqual(page.headers["x-frame-options"], "DENY")
+            self.assertEqual(page.headers["content-security-policy"], "frame-ancestors 'none'; base-uri 'self'")
         invalid = await self.client.get("/oauth/authorize", params={**self.params, "register": "false"})
         self.assertEqual(invalid.status_code, 400)
         api = await self.client.get("/api/oauth/authorization", params={**self.params, "register": "1"})
         self.assertEqual(api.status_code, 400)
+
+    async def test_authorized_apps_redirect_is_public_and_does_not_forward_credentials(self):
+        credentials = await self.credentials()
+        before = (await self.client.get("/api/oauth/grants")).json()
+        async with AsyncClient(transport=ASGITransport(app=self.app), base_url="http://127.0.0.1") as anonymous:
+            for client in (self.client, anonymous):
+                with self.subTest(authenticated=client is self.client):
+                    response = await client.get("/oauth/apps", params={
+                        "redirect_uri": "https://evil.invalid/callback", "settings": "other",
+                        "access_token": credentials["access_token"], "refresh_token": credentials["refresh_token"],
+                    }, follow_redirects=False)
+                    self.assertEqual(response.status_code, 307)
+                    self.assertEqual(response.headers["location"], "/?settings=security")
+                    self.assertEqual(response.headers["cache-control"], "no-store")
+                    self.assertEqual(response.headers["pragma"], "no-cache")
+                    self.assertEqual(response.headers["referrer-policy"], "no-referrer")
+                    self.assertEqual(response.content, b"")
+                    self.assertNotIn(credentials["access_token"], str(response.headers))
+                    self.assertNotIn(credentials["refresh_token"], str(response.headers))
+            self.assertEqual((await anonymous.get("/api/oauth/grants")).status_code, 401)
+        self.assertEqual((await self.client.get("/api/oauth/grants")).json(), before)
+        self.assertEqual((await self.access(credentials)).status_code, 200)
+
+    async def test_authorized_apps_redirect_reaches_settings_security_page(self):
+        from rotor.main import frontend_index
+
+        self.app.add_api_route("/", frontend_index)
+        async with AsyncClient(transport=ASGITransport(app=self.app), base_url="http://127.0.0.1") as anonymous:
+            response = await anonymous.get("/oauth/apps", follow_redirects=True)
+        self.assertEqual([previous.status_code for previous in response.history], [307])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.url.path, "/")
+        self.assertEqual(response.url.query, b"settings=security")
+        self.assertIn("text/html", response.headers["content-type"])
 
     async def test_pkce_binding_single_use_and_secret_storage(self):
         code = await self.authorize()

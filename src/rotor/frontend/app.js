@@ -1,7 +1,7 @@
 // App entry — router, sidebar/topbar wiring, modal, theme/locale listeners.
 
 import { t, applyLocale } from "./i18n.js";
-import { initSettings } from "./settings.js?v=4";
+import { initSettings } from "./settings.js?v=5";
 import { isAdmin } from "./session.js?v=1";
 import * as users from "./pages/users.js?v=3";
 import { initSidebar, closeSidebar } from "./sidebar.js?v=1";
@@ -168,7 +168,7 @@ document.getElementById("closeChannelModal")?.addEventListener("click", () => {
 });
 
 /* ---------- settings modal ---------- */
-initSettings({
+const settings = initSettings({
   onSaved(savedSettings) {
     for (const page of Object.values(PAGES)) {
       page.setDisplayTimezone?.(savedSettings.display_timezone);
@@ -347,6 +347,13 @@ document.addEventListener("sessionended", () => {
   document.querySelectorAll(".panel").forEach((element) => { element.innerHTML = ""; });
   document.querySelectorAll("[data-admin-only]").forEach((element) => { element.hidden = true; });
 });
+
+const entryUrl = new URL(window.location.href);
+if (entryUrl.searchParams.get("settings") === "security") {
+  entryUrl.searchParams.delete("settings");
+  window.history.replaceState(null, "", `${entryUrl.pathname}${entryUrl.search}${entryUrl.hash}`);
+  settings?.open("security");
+}
 
 /* ---------- bootstrap ---------- */
 function initIcons() {

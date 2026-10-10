@@ -5,7 +5,8 @@ const LOGIN_ENDPOINT = "/api/auth/login";
 const CHANGE_PASSWORD_ENDPOINT = "/api/auth/change-password";
 const LOGOUT_ENDPOINT = "/api/auth/logout";
 const registrationRequested = new URL(window.location.href).searchParams.get("register") === "1";
-const clientAuthorizationPage = ["/oauth/authorize", "/oauth/apps"].includes(window.location.pathname);
+const clientAuthorizationPage = window.location.pathname === "/oauth/authorize";
+const securityRequested = new URL(window.location.href).searchParams.get("settings") === "security";
 
 let appLoaded = false;
 
@@ -117,7 +118,7 @@ function authScreen() {
     </main>
   `;
   document.body.appendChild(screen);
-  if (clientAuthorizationPage) screen.querySelector("#openRegistration").href = authPageUrl(true);
+  if (clientAuthorizationPage || securityRequested) screen.querySelector("#openRegistration").href = authPageUrl(true);
   screen.querySelector("#adminLoginForm")
     ?.addEventListener("submit", submitLogin);
   screen.querySelector("#adminPasswordForm")
@@ -149,11 +150,11 @@ function showLogin(message = "") {
 }
 
 function authPageUrl(register) {
-  if (!clientAuthorizationPage) return `${window.location.pathname}${register ? "?register=1" : ""}`;
+  if (!clientAuthorizationPage && !securityRequested) return `${window.location.pathname}${register ? "?register=1" : ""}`;
   const url = new URL(window.location.href);
   if (register) url.searchParams.set("register", "1");
   else url.searchParams.delete("register");
-  return `${url.pathname}${url.search}`;
+  return `${url.pathname}${url.search}${url.hash}`;
 }
 
 function switchAuthPage(register) {
@@ -174,8 +175,8 @@ async function startApp(actor) {
   }
   if (!appLoaded) {
     try {
-      if (clientAuthorizationPage) await import("./client-authorization.js?v=1");
-      else await import("./app.js?v=65");
+      if (clientAuthorizationPage) await import("./client-authorization.js?v=2");
+      else await import("./app.js?v=66");
       appLoaded = true;
       authScreen().classList.add("hidden");
       document.body.classList.remove("auth-pending");

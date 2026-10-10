@@ -76,7 +76,7 @@ async function environment({ language = 'en', start = session(), parses = [], co
       getElementById: getNode, querySelectorAll: () => [], querySelector: () => null,
       addEventListener: (event, fn) => { (documentListeners[event] ||= []).push(fn); },
     },
-    window: {}, Element: class {}, URL,
+    window: { location: { href: "http://localhost/" } }, Element: class {}, URL,
     confirm: (message) => { confirmations.push(message); return confirmResult; },
     Date: class extends Date { static now() { return now * 1000; } },
     setTimeout: (fn, ms) => { timers.push({ fn, ms, cancelled: false }); return timers.length; },

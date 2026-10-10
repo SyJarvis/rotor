@@ -185,14 +185,14 @@ test('rejected registration preserves all fields and allows replacing the invita
 
 const oauthQuery = 'response_type=code&client_id=coding-agent&redirect_uri=http%3A%2F%2Flocalhost%3A8123%2Fcallback&state=state%2Bvalue&code_challenge=challenge&code_challenge_method=S256&scope=inference';
 
-test('authorization and grant pages load their standalone module while the console retains its app module', async () => {
-  for (const path of ['/oauth/authorize', '/oauth/apps']) {
+test('authorization loads its standalone module while the console retains its app module', async () => {
+  for (const path of ['/oauth/authorize']) {
     const h = await environment({ href: `http://localhost${path}?${oauthQuery}` });
-    assert.deepEqual(h.importPaths, ['./client-authorization.js?v=1']);
+    assert.deepEqual(h.importPaths, ['./client-authorization.js?v=2']);
     assert.equal(h.document.body.classList.contains('auth-pending'), false);
   }
   const console = await environment();
-  assert.deepEqual(console.importPaths, ['./app.js?v=65']);
+  assert.deepEqual(console.importPaths, ['./app.js?v=66']);
 });
 
 test('authorization parameters survive registration switching, registration completion and page refresh', async () => {
@@ -212,7 +212,7 @@ test('authorization parameters survive registration switching, registration comp
   h.get('openRegistration').click();
   await fillRegistration(h).submit();
   assert.equal(h.window.location.href, href);
-  assert.deepEqual(h.importPaths, ['./client-authorization.js?v=1']);
+  assert.deepEqual(h.importPaths, ['./client-authorization.js?v=2']);
 });
 
 test('authorization parameters survive ordinary login and required password change', async () => {
@@ -222,12 +222,24 @@ test('authorization parameters survive ordinary login and required password chan
   loginForm.elements.username.value = 'test-user'; loginForm.elements.password.value = 'test-password';
   await loginForm.submit();
   assert.equal(login.window.location.href, href);
-  assert.deepEqual(login.importPaths, ['./client-authorization.js?v=1']);
+  assert.deepEqual(login.importPaths, ['./client-authorization.js?v=2']);
   const reset = await environment({ mustChangePassword: true, href });
   const resetForm = reset.get('adminPasswordForm');
   resetForm.elements.current_password.value = 'old-password';
   resetForm.elements.new_password.value = 'new-password'; resetForm.elements.confirm_password.value = 'new-password';
   await resetForm.submit();
   assert.equal(reset.window.location.href, href);
-  assert.deepEqual(reset.importPaths, ['./client-authorization.js?v=1']);
+  assert.deepEqual(reset.importPaths, ['./client-authorization.js?v=2']);
+});
+
+test('security deep link survives sign-in and registration while root registration keeps its clean URL', async () => {
+  const href = 'http://localhost/?settings=security&other=preserved#anchor';
+  const h = await environment({ status: 401, href });
+  const link = new URL(h.get('openRegistration').href, href);
+  assert.equal(link.searchParams.get('settings'), 'security'); assert.equal(link.hash, '#anchor');
+  h.get('openRegistration').click(); await fillRegistration(h).submit();
+  assert.equal(h.window.location.href, href); assert.deepEqual(h.importPaths, ['./app.js?v=66']);
+  const login = await environment({ status: 401, href });
+  login.get('adminLoginForm').elements.username.value = 'test-user'; login.get('adminLoginForm').elements.password.value = 'test-password';
+  await login.get('adminLoginForm').submit(); assert.equal(login.window.location.href, href);
 });

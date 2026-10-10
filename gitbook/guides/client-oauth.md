@@ -162,7 +162,8 @@ curl "$ROTOR_BASE_URL/oauth/revoke" \
 ```
 
 撤销接口接受 access token 或 refresh token，撤销其整项授权。用户也可在 Rotor
-的 `/oauth/apps` 页面查看并撤销已授权应用；撤销某一项不会停用其他授权或 API Key。
+的“设置 → 登录与安全 → 设备管理”中查看并撤销已授权客户端；撤销某一项不会停用
+其他授权或 API Key。旧地址 `/oauth/apps` 会跳转到 `/?settings=security`。
 
 ## 服务发现与既有接入
 

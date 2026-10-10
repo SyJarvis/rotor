@@ -6,7 +6,7 @@ import re
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.routing import APIRoute
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -105,8 +105,7 @@ async def authorization_page(request: Request):
 
 @router.get("/oauth/apps", include_in_schema=False)
 async def authorized_apps_page():
-    return FileResponse(_FRONTEND_DIR / "oauth.html", headers={**_NO_STORE,
-        "X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'; base-uri 'self'"})
+    return RedirectResponse("/?settings=security", status_code=307, headers=_NO_STORE)
 
 
 @router.get("/api/oauth/authorization")

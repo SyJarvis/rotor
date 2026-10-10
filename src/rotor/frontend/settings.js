@@ -1,7 +1,8 @@
 // Browser preferences apply immediately; server settings keep a draft until saved.
 import { api } from "./api.js?v=3";
 import { isAdmin } from "./session.js?v=1";
-import { initAccount } from "./account.js?v=1";
+import { initAccount } from "./account.js?v=2";
+import { initSecurity } from "./security.js?v=1";
 import { t, locale, toggleLocale } from "./i18n.js";
 import { currentTheme, setTheme } from "./theme.js";
 import { closeSidebar } from "./sidebar.js?v=1";
@@ -26,6 +27,7 @@ export function initSettings({ onSaved = () => {} } = {}) {
   const serverFields = [...form.querySelectorAll("[data-server-setting]")];
   const shell = document.querySelector(".app-shell");
   const account = initAccount();
+  const security = initSecurity();
   let baseline = null, draft = null, tab = "general", opened = false;
   let loading = null, saving = false, revision = 0, loadEpoch = 0;
   let loadError = "", statusKey = "", saveError = "", returnFocus = null, background = null;
@@ -42,7 +44,7 @@ export function initSettings({ onSaved = () => {} } = {}) {
     if (!isAdmin() && tab === "routing") tab = "general";
     get("settingsGeneralDescription").textContent = t(isAdmin() ? "generalSettingsDescription" : "personalSettingsDescription");
     modal.querySelectorAll("[data-admin-setting]").forEach((element) => { element.hidden = !isAdmin(); });
-    get("settingsFooter").hidden = !isAdmin() || tab === "account";
+    get("settingsFooter").hidden = !isAdmin() || ["account", "security"].includes(tab);
     themeButtons.forEach((button) => {
       const active = button.dataset.settingsTheme === currentTheme();
       button.classList.toggle("active", active);
@@ -64,7 +66,7 @@ export function initSettings({ onSaved = () => {} } = {}) {
     get("settingsSave").setAttribute("aria-busy", String(saving));
     get("settingsRetry").disabled = Boolean(loading) || saving;
     get("settingsRetry").hidden = !loadError;
-    get("settingsLoadNotice").classList.toggle("hidden", !loading && !loadError);
+    get("settingsLoadNotice").classList.toggle("hidden", ["account", "security"].includes(tab) || (!loading && !loadError));
     get("settingsLoadMessage").textContent = loading ? t("settingsLoading") : loadError ? `${t("settingsLoadFailed")} ${loadError}` : "";
     get("settingsStatus").textContent = saving ? t("saving") : statusKey ? `${t(statusKey)}${saveError ? ` ${saveError}` : ""}` : dirty() ? t("settingsDirty") : "";
     get("settingsStatus").classList.toggle("error", Boolean(saveError) || statusKey.startsWith("settingsInvalid"));
@@ -95,8 +97,9 @@ export function initSettings({ onSaved = () => {} } = {}) {
     return [...modal.querySelectorAll('button, input, select, [tabindex="0"]')]
       .filter((element) => !element.disabled && !element.closest("[hidden]") && element.getClientRects().length);
   }
-  function open() {
-    if (opened) return;
+  function open(section) {
+    if (tabs.some((button) => button.dataset.settingsTab === section && !button.hidden)) tab = section;
+    if (opened) { render(); if (tab === "security") security.open(); else security.close(); return; }
     opened = true;
     returnFocus = document.activeElement;
     closeSidebar();
@@ -109,11 +112,13 @@ export function initSettings({ onSaved = () => {} } = {}) {
     render();
     get("settingsClose").focus();
     account.load();
+    if (tab === "security") security.open();
     if (isAdmin() && !dirty() && !saving) load();
   }
   function close(restoreFocus = true) {
     if (!opened) return;
     opened = false;
+    security.close(); account.close();
     ++loadEpoch;
     loading?.abort();
     loading = null;
@@ -121,7 +126,8 @@ export function initSettings({ onSaved = () => {} } = {}) {
     if (shell) shell.inert = background.inert;
     document.body.style.overflow = background.overflow;
     document.body.style.paddingRight = background.paddingRight;
-    const target = returnFocus?.getClientRects().length && !returnFocus.closest("[inert]") ? returnFocus : get("menuToggle");
+    const target = returnFocus !== document.body && returnFocus?.getClientRects().length && !returnFocus.closest("[inert]") ? returnFocus
+      : [get("menuToggle"), get("openSettings")].find((button) => button?.getClientRects().length && !button.closest("[inert]"));
     if (restoreFocus) target?.focus();
   }
   function updateDraft(event) {
@@ -140,7 +146,7 @@ export function initSettings({ onSaved = () => {} } = {}) {
   }
   async function save(event) {
     event.preventDefault();
-    if (!isAdmin() || saving || loading || loadError || !dirty()) return;
+    if (!isAdmin() || ["account", "security"].includes(tab) || saving || loading || loadError || !dirty()) return;
     const ttl = Number(draft.session_lease_idle_ttl_seconds);
     if (!Number.isInteger(ttl) || ttl < 60 || ttl > 86400) return invalid("settingsInvalidTtl", "session_lease_idle_ttl_seconds", "routing");
     const timezone = draft.display_timezone.trim();
@@ -174,7 +180,7 @@ export function initSettings({ onSaved = () => {} } = {}) {
     event.stopPropagation();
     if (event.target.closest("[data-settings-close]")) close();
     const button = event.target.closest("[data-settings-tab]");
-    if (button) { tab = button.dataset.settingsTab; render(); }
+    if (button) { tab = button.dataset.settingsTab; render(); if (tab === "security") security.open(); else security.close(); }
   });
   modal.addEventListener("keydown", (event) => {
     if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); }
@@ -189,7 +195,7 @@ export function initSettings({ onSaved = () => {} } = {}) {
       const availableTabs = tabs.filter((button) => !button.hidden);
       const index = availableTabs.findIndex((button) => button.dataset.settingsTab === tab);
       const next = event.key === "Home" ? availableTabs[0] : event.key === "End" ? availableTabs.at(-1) : availableTabs[(index + (["ArrowLeft", "ArrowUp"].includes(event.key) ? -1 : 1) + availableTabs.length) % availableTabs.length];
-      tab = next.dataset.settingsTab; render(); next.focus();
+      tab = next.dataset.settingsTab; render(); if (tab === "security") security.open(); else security.close(); next.focus();
     }
   });
   window.addEventListener("rotorauthrequired", () => close(false));

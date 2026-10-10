@@ -111,8 +111,6 @@ body.auth-pending .client-oauth-page { visibility: hidden; }
 .client-oauth-models { padding-left: 20px; overflow-wrap: anywhere; }
 .client-oauth-feedback { margin-top: 20px; }
 .client-oauth-feedback > p { margin-bottom: 12px; }
-.client-oauth-grant { border-top: 1px solid var(--line); padding: 4px 0 20px; }
-.client-oauth-grant p { overflow-wrap: anywhere; margin-bottom: 16px; }
 @media (max-width: 480px) {
   .client-oauth-page { padding: 16px; }
   .client-oauth-card { padding: 20px; }
@@ -2476,3 +2474,31 @@ svg.lucide { flex-shrink: 0; stroke-width: 1.5; }
 @media (max-width: 480px) { .chat-sync-status { flex-wrap: wrap; } .settings-nav { gap: 2px; } .settings-nav-item { padding-inline: 8px; } }
 
 .account-identity { display: block; min-height: 36px; padding: 9px 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-2); overflow-wrap: anywhere; }
+
+/* Login and security settings. */
+.security-section { margin-top: 26px; padding-top: 24px; border-top: 1px solid var(--line); }
+.security-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.security-section-heading h4 { margin: 0 0 6px; font-size: 14px; color: var(--text-strong); }
+.security-section-heading .muted { font-size: 12px; line-height: 1.6; }
+.security-section-heading > button { flex-shrink: 0; }
+.security-password-fields { gap: 16px; }
+.security-password-actions, .security-device-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+#securityPasswordStatus, #securityDevicesStatus, #securityDevicesCount { margin-top: 12px; font-size: 12px; color: var(--muted); }
+#securityPasswordStatus.error { color: var(--danger); }
+#securityPasswordStatus:empty, #securityDevicesStatus:empty, #securityDevicesCount:empty { display: none; }
+.security-devices-list { display: grid; gap: 12px; margin-top: 16px; }
+.security-device-card { min-width: 0; border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 16px; background: var(--panel); }
+.security-device-card h5 { margin: 0 0 14px; color: var(--text-strong); font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.security-device-details { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; margin: 0 0 16px; font-size: 12px; line-height: 1.5; }
+.security-device-details dt { color: var(--muted); }
+.security-device-details dd { margin: 0; overflow-wrap: anywhere; }
+.security-device-confirm { margin: 12px 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.security-devices-empty { padding: 26px 16px; text-align: center; background: var(--panel-2); border-radius: var(--radius); font-size: 13px; }
+.security-devices-empty .muted { margin-top: 8px; font-size: 12px; }
+.security-signout { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); }
+@media (max-width: 640px) {
+  .settings-nav { min-width: 0; overflow-x: auto; }
+  .settings-nav-item { flex: 0 0 auto; white-space: nowrap; }
+  .security-section-heading { flex-wrap: wrap; }
+  .security-device-details { gap: 6px 12px; }
+}

@@ -8,12 +8,12 @@ const sources = Object.fromEntries(await Promise.all(['client-authorization.js',
 const callback = 'http://localhost:8123/callback';
 const query = new URLSearchParams({ response_type: 'code', client_id: 'coding-agent', redirect_uri: callback, state: 'state+value', code_challenge: 'challenge-value', code_challenge_method: 'S256', scope: 'inference' });
 const details = { client_id: 'coding-agent', client_name: 'Trusted coding agent', redirect_uri: callback, scope: 'inference', username: 'alice', models: ['gpt-example'], quota: 10000, used_quota: 2000 };
-const grant = { id: 5, client_id: 'coding-agent', client_name: 'Trusted coding agent', created_at: '2026-10-10T01:00:00Z', last_used_at: null, expires_at: '2026-11-10T01:00:00Z' };
+
 
 function deferred() { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; }
 function response(body, status = 200) { return { ok: status >= 200 && status < 300, status, statusText: 'Error', headers: { get: () => 'application/json' }, json: async () => body }; }
 
-async function environment({ mode = 'authorize', language = 'zh-CN', metadata = details, grants = [grant], handler, search = query.toString() } = {}) {
+async function environment({ language = 'zh-CN', metadata = details, handler, search = query.toString() } = {}) {
   function events() {
     const listeners = new Map();
     return {
@@ -46,7 +46,7 @@ async function environment({ mode = 'authorize', language = 'zh-CN', metadata = 
   const document = { ...events(), cookie: 'rotor_admin_session=session-cookie; rotor_admin_csrf=csrf%2Btoken', documentElement: { lang: language }, title: '',
     getElementById: (id) => nodes.get(id), createElement: () => element(), querySelectorAll: (selector) => selector === '[data-i18n]' ? translatable : [],
   };
-  const redirects = [], window = { ...events(), ROTOR_ACTOR: { id: 7, username: 'alice', role: 'user' }, location: { pathname: `/oauth/${mode}`, href: `http://localhost/oauth/${mode}?${search}`, assign: (url) => redirects.push(url) } };
+  const redirects = [], window = { ...events(), ROTOR_ACTOR: { id: 7, username: 'alice', role: 'user' }, location: { pathname: '/oauth/authorize', href: `http://localhost/oauth/authorize?${search}`, assign: (url) => redirects.push(url) } };
   const requests = [], context = vm.createContext({ document, window, URL, URLSearchParams, AbortController, DOMException, Date,
     CustomEvent: class { constructor(type, options = {}) { this.type = type; this.detail = options.detail; } },
     localStorage: { getItem: () => language, setItem() {} },
@@ -55,8 +55,6 @@ async function environment({ mode = 'authorize', language = 'zh-CN', metadata = 
       const custom = await handler?.(request, requests);
       if (custom !== undefined) return custom;
       if (path.startsWith('/api/oauth/authorization?')) return response(metadata);
-      if (path === '/api/oauth/grants') return response({ items: grants });
-      if (options.method === 'DELETE') return response(null, 204);
       const body = JSON.parse(options.body);
       const result = new URL(callback); result.searchParams.set(body.approve ? 'code' : 'error', body.approve ? 'one-time-code' : 'access_denied'); result.searchParams.set('state', body.state);
       return response({ redirect_url: result.href });
@@ -196,25 +194,28 @@ test('unauthorized response requests sign-in, and untrusted callback responses n
   }
 });
 
-test('authorized clients list supports owner-scoped revocation with CSRF and retained rows on failure', async () => {
-  let fail = true;
-  const h = await environment({ mode: 'apps', grants: [{ ...grant, client_name: '<b>Agent</b>' }], handler: ({ options }) => options.method === 'DELETE' && fail ? response({ detail: 'Try again' }, 503) : undefined });
-  assert.equal(h.requests[0].path, '/api/oauth/grants');
-  assert.equal(h.get('clientAppsList').children[0].children[0].textContent, '<b>Agent</b>');
-  await h.get('clientAppsList').children[0].children[2].click();
-  assert.equal(h.get('clientAppsList').children.length, 1); assert.equal(h.get('clientOAuthError').textContent, 'Try again');
-  fail = false;
-  await h.get('clientAppsList').children[0].children[2].click();
-  const request = h.requests[2];
-  assert.equal(request.path, '/api/oauth/grants/5'); assert.equal(request.options.method, 'DELETE');
-  assert.equal(request.options.headers['X-CSRF-Token'], 'csrf+token'); assert.equal(request.options.headers.Authorization, undefined);
-  assert.equal(h.get('clientAppsList').children[0].textContent, '暂无已授权客户端');
-  assert.equal(h.get('clientOAuthStatus').textContent, '授权已撤销');
-  h.session.endSession(); assert.equal(h.get('clientAppsList').children.length, 0); assert.equal(h.get('clientAppsAccount').textContent, '');
-});
-
 test('authorization document only loads same-origin assets and applies no-referrer', () => {
   assert.match(sources['oauth.html'], /name="referrer" content="no-referrer"/);
   const assets = [...sources['oauth.html'].matchAll(/(?:src|href)="([^"]+)"/g)].map((match) => match[1]);
   assert.ok(assets.length > 0); assert.ok(assets.every((path) => path.startsWith('/') && !path.startsWith('//')));
+});
+
+test('same-account profile changes retain consent metadata without a new lookup', async () => {
+  const h = await environment(); h.session.setActor({ id: 7, username: 'alice', display_name: 'Renamed', role: 'user' });
+  assert.equal(h.get('clientOAuthUsername').textContent, 'alice'); assert.equal(h.get('clientOAuthApprove').disabled, false);
+  assert.equal(h.requests.length, 1);
+});
+
+test('same-account sign-in after session end reloads consent metadata and preserves approval parameters', async () => {
+  for (const approve of [true, false]) {
+    const h = await environment(); h.session.endSession();
+    assert.equal(h.get('clientOAuthApprove').disabled, true);
+    h.session.setActor({ id: 7, username: 'alice', role: 'user' });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(h.requests.length, 2); assert.equal(h.get('clientOAuthApprove').disabled, false); assert.equal(h.get('clientOAuthDeny').disabled, false);
+    assert.equal(h.get('clientOAuthUsername').textContent, 'alice');
+    await h.get(approve ? 'clientOAuthApprove' : 'clientOAuthDeny').click();
+    assert.deepEqual(JSON.parse(h.requests[2].options.body), { ...Object.fromEntries(query), approve });
+    assert.equal(new URL(h.redirects[0]).searchParams.get('state'), 'state+value');
+  }
 });

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="referrer" content="no-referrer">
     <title>Rotor 客户端授权</title>
-    <link rel="stylesheet" href="/styles.css?v=46">
+    <link rel="stylesheet" href="/styles.css?v=47">
   </head>
   <body class="auth-pending">
     <main class="client-oauth-page" id="clientOAuthPage">
@@ -16,7 +16,7 @@
           <button type="button" class="btn-secondary" id="logoutBtn" data-i18n="signOut">退出登录</button>
         </div>
       </header>
-      <section class="client-oauth-card hidden" id="clientAuthorizationPanel">
+      <section class="client-oauth-card" id="clientAuthorizationPanel">
         <h1 data-i18n="clientAuthorizationTitle">授权客户端</h1>
         <p class="muted" data-i18n="clientAuthorizationDescription">允许此客户端使用你的 Rotor 账号调用模型。</p>
         <dl class="client-oauth-details">
@@ -27,18 +27,11 @@
         </dl>
         <h2 data-i18n="clientAvailableModels">可访问模型</h2>
         <ul id="clientOAuthModels" class="client-oauth-models"></ul>
-        <p class="muted" data-i18n="clientAuthorizationPermissions">调用遵循当前账号的模型权限与额度。你可以随时在已授权客户端中撤销授权。</p>
+        <p class="muted" data-i18n="clientAuthorizationPermissions">调用遵循当前账号的模型权限与额度。你可以随时在设置的设备管理中撤销授权。</p>
         <div class="actions">
           <button type="button" class="btn-primary" id="clientOAuthApprove" data-i18n="clientAuthorize" disabled>允许授权</button>
           <button type="button" class="btn-secondary" id="clientOAuthDeny" data-i18n="clientDeny" disabled>拒绝</button>
         </div>
-      </section>
-      <section class="client-oauth-card hidden" id="clientAppsPanel">
-        <h1 data-i18n="clientAppsTitle">已授权客户端</h1>
-        <p class="muted" data-i18n="clientAppsDescription">查看授权记录。撤销后，客户端需要重新登录授权才能继续使用。</p>
-        <p id="clientAppsAccount"></p>
-        <div id="clientAppsList" class="client-oauth-grants"></div>
-        <a href="/" class="auth-switch" data-i18n="clientBackToRotor">返回 Rotor</a>
       </section>
       <div class="client-oauth-feedback" aria-live="polite">
         <p id="clientOAuthStatus" role="status"></p>
@@ -46,7 +39,7 @@
         <button type="button" class="btn-secondary hidden" id="clientOAuthRetry" data-i18n="retry">重试</button>
       </div>
     </main>
-    <script src="/config.js?v=55"></script>
-    <script type="module" src="/auth.js?v=46"></script>
+    <script src="/config.js?v=56"></script>
+    <script type="module" src="/auth.js?v=47"></script>
   </body>
 </html>
