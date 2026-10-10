@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import rotor.api.admin.monitoring as monitoring_api
@@ -22,9 +23,11 @@ from rotor.models.usage import UsageLedger
 
 def _routing(
     request_id: str,
-    token_id: int,
+    token_id: int | None,
     source: str | None,
     created_at: datetime,
+    *,
+    owner_id: int | None = None,
 ) -> RoutingDecisionRecord:
     return RoutingDecisionRecord(
         request_id=request_id,
@@ -34,23 +37,26 @@ def _routing(
         strategy="priority_weighted",
         candidate_channel_ids=[1],
         required_capabilities=[],
-        feature_snapshot={"session_source": source},
+        feature_snapshot={"session_source": source, "owner_id": owner_id},
         created_at=created_at,
     )
 
 
 def _usage(
     request_id: str,
-    token_id: int,
+    token_id: int | None,
     session_id: str,
     model: str,
     total_tokens: int,
     created_at: datetime,
+    *,
+    owner_id: int | None = None,
 ) -> UsageLedger:
     return UsageLedger(
         request_id=request_id,
         conversation_id=session_id,
         token_id=token_id,
+        owner_id=owner_id,
         model=model,
         request_protocol="openai_responses",
         total_tokens=total_tokens,
@@ -77,6 +83,141 @@ async def _monitoring_client():
         base_url="http://test",
     )
     return engine, sessions, client
+
+
+def test_account_and_owned_key_monitoring_isolates_matching_request_and_session_ids(tmp_path, monkeypatch):
+    async def scenario():
+        engine, sessions, client = await _monitoring_client()
+        generated_at = datetime.now(timezone.utc)
+        monkeypatch.setattr(monitoring_api, "_utc_now", lambda: generated_at)
+        _, start, end = _today_window(generated_at, application_settings.get().display_timezone)
+        now = start + (end - start) / 2
+        try:
+            async with sessions() as db:
+                for owner_id, token_id, text, tokens, model in [
+                    (1, None, "Alice's first question", 11, "alice-model"),
+                    (2, None, "Bob's first question", 22, "bob-model"),
+                    (1, 1, "Key's first question", 33, "key-model"),
+                ]:
+                    archive = tmp_path / f"{owner_id}-{token_id}.jsonl"
+                    archive.write_text(json.dumps({"request_id": "same-request",
+                        "messages": [{"role": "user", "content": text}]}) + "\n", encoding="utf-8")
+                    route = _routing("same-request", token_id, "codex-session-id", now, owner_id=owner_id)
+                    if token_id is not None:
+                        # A Key's scope remains its token ID even if snapshot owner differs.
+                        route.feature_snapshot["owner_id"] = 2
+                    db.add_all([
+                        route,
+                        _usage("same-request", token_id, "shared-session", model, tokens, now, owner_id=owner_id),
+                        ConversationRecord(conversation_id=f"archive-{owner_id}-{token_id}", request_id="same-request",
+                            token_id=token_id, owner_id=owner_id, model=model, protocol="openai_responses",
+                            file_path=str(archive), created_at=now),
+                        SessionLease(token_id=token_id, owner_id=owner_id if token_id is None else None,
+                            session_id="shared-session", logical_model=model, channel_id=1,
+                            last_used_at=now, expires_at=generated_at.replace(tzinfo=None) + timedelta(hours=1)
+                            if owner_id == 1 and token_id is None else generated_at.replace(tzinfo=None) - timedelta(seconds=1)),
+                    ])
+                ungrouped = _routing("ungrouped-bob", None, None, now, owner_id=2)
+                ungrouped.feature_snapshot["client_source"] = "codex"
+                db.add_all([
+                    _routing("same-request", None, "codex-session-id", now, owner_id=1),
+                    _routing("alice-second", None, "codex-session-id", now + timedelta(seconds=1), owner_id=1),
+                    _usage("alice-second", None, "shared-session", "alice-next-model", 7, now + timedelta(seconds=1), owner_id=1),
+                    ungrouped,
+                    _usage("ungrouped-bob", None, "generated-conversation", "ungrouped-model", 5, now, owner_id=2),
+                    _routing("anonymous", None, "codex-session-id", now),
+                    _usage("anonymous", None, "shared-session", "anonymous-model", 1000, now),
+                    ConversationRecord(conversation_id="anonymous", request_id="same-request", token_id=None,
+                        owner_id=None, model="anonymous-model", protocol="openai_responses",
+                        file_path=str(tmp_path / "missing-anonymous.jsonl"), created_at=now),
+                ])
+                await db.commit()
+            response = await client.get("/api/admin/monitoring/sources")
+            assert response.status_code == 200, response.text
+            codex = response.json()["agents"][0]
+            assert (codex["request_count"], codex["ungrouped_request_count"], codex["session_count"],
+                    codex["active_session_count"], codex["turn_count"], codex["total_tokens"]) == (5, 1, 3, 1, 4, 78)
+            by_identity = {(item["owner_id"], item["token_id"]): item for item in codex["sessions"]}
+            assert set(by_identity) == {(1, None), (2, None), (1, 1)}
+            for identity, summary, tokens, turns, active in [
+                ((1, None), "Alice's first question", 18, 2, True),
+                ((2, None), "Bob's first question", 22, 1, False),
+                ((1, 1), "Key's first question", 33, 1, False),
+            ]:
+                item = by_identity[identity]
+                assert item["session_id"] == "shared-session"
+                assert (item["summary"], item["total_tokens"], item["turn_count"], item["active"]) == (summary, tokens, turns, active)
+            assert by_identity[(1, None)]["models"] == ["alice-model", "alice-next-model"]
+            assert "anonymous-model" not in response.text and "generated-conversation" not in response.text
+        finally:
+            await client.aclose()
+            await engine.dispose()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("other_owner_id", [2, None])
+def test_monitoring_omits_archive_summaries_when_same_request_belongs_to_different_scopes(tmp_path, other_owner_id):
+    async def scenario():
+        engine, sessions, client = await _monitoring_client()
+        _, start, end = _today_window(datetime.now(timezone.utc), application_settings.get().display_timezone)
+        now = start + (end - start) / 2
+        archive = tmp_path / "shared.jsonl"
+        archive.write_text("\n".join(json.dumps({"request_id": request_id,
+            "messages": [{"role": "user", "content": "must not be shared across tenants"}]})
+            for request_id in ("same-request", "unmonitored-collision")) + "\n", encoding="utf-8")
+        try:
+            async with sessions() as db:
+                for owner_id, token_id in [(1, None), (2, None), (1, 1)]:
+                    db.add_all([
+                        _routing("same-request", token_id, "codex-session-id", now, owner_id=owner_id),
+                        _usage("same-request", token_id, "shared-session", "model", 10, now, owner_id=owner_id),
+                        ConversationRecord(conversation_id=f"archive-{owner_id}-{token_id}", request_id="same-request",
+                            token_id=token_id, owner_id=owner_id, model="model", protocol="openai_responses",
+                            file_path=str(archive), created_at=now),
+                    ])
+                db.add_all([
+                    _routing("unmonitored-collision", None, "codex-session-id", now, owner_id=1),
+                    _usage("unmonitored-collision", None, "only-monitored-session", "model", 10, now, owner_id=1),
+                    ConversationRecord(conversation_id="monitored-archive", request_id="unmonitored-collision",
+                        owner_id=1, model="model", protocol="openai_responses", file_path=str(archive), created_at=now),
+                    # Other archive owners must be considered even without usage or agent routing.
+                    ConversationRecord(conversation_id="unmonitored-archive", request_id="unmonitored-collision",
+                        owner_id=other_owner_id, model="model", protocol="openai_responses", file_path=str(archive), created_at=now),
+                ])
+                await db.commit()
+            response = await client.get("/api/admin/monitoring/sources")
+            assert response.status_code == 200, response.text
+            codex = response.json()["agents"][0]
+            assert (codex["request_count"], codex["session_count"], codex["turn_count"], codex["total_tokens"]) == (4, 4, 4, 40)
+            assert all(item["summary"] is None for item in codex["sessions"])
+            assert "must not be shared" not in response.text
+        finally:
+            await client.aclose()
+            await engine.dispose()
+    asyncio.run(scenario())
+
+
+def test_monitoring_ignores_missing_or_invalid_account_identity_snapshots():
+    async def scenario():
+        engine, sessions, client = await _monitoring_client()
+        _, start, end = _today_window(datetime.now(timezone.utc), application_settings.get().display_timezone)
+        now = start + (end - start) / 2
+        try:
+            async with sessions() as db:
+                for index, owner_id in enumerate([None, True, "1", 0, -1]):
+                    request_id = f"invalid-{index}"
+                    route = _routing(request_id, None, "codex-session-id", now)
+                    route.feature_snapshot["owner_id"] = owner_id
+                    db.add_all([route, _usage(request_id, None, "same-session", "invalid-model", 1000, now, owner_id=1)])
+                await db.commit()
+            response = await client.get("/api/admin/monitoring/sources")
+            assert response.status_code == 200, response.text
+            codex = response.json()["agents"][0]
+            assert (codex["request_count"], codex["session_count"], codex["turn_count"], codex["total_tokens"]) == (0, 0, 0, 0)
+        finally:
+            await client.aclose()
+            await engine.dispose()
+    asyncio.run(scenario())
 
 
 def test_today_window_uses_display_timezone_midnight() -> None:
