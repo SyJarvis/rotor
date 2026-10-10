@@ -25,6 +25,7 @@ from rotor.models.admin_auth import (
 )
 from rotor.models.channel import Channel
 from rotor.models.channel_oauth import ChannelOAuthSession
+from rotor.models.client_oauth import OAuthAuthorizationCode, OAuthCredential, OAuthGrant
 from rotor.models.conversation import ConversationRecord
 from rotor.models.log import RequestLog
 from rotor.models.mcp_control_key import MCPControlKey
@@ -48,6 +49,9 @@ _REGISTERED_MODELS = (
     UserInvitation,
     Channel,
     ChannelOAuthSession,
+    OAuthAuthorizationCode,
+    OAuthCredential,
+    OAuthGrant,
     ConversationRecord,
     MCPControlKey,
     RequestAttempt,
@@ -61,6 +65,8 @@ _REGISTERED_MODELS = (
 )
 
 _PRE_USER_REVISION = "e1f2a3b4c5d6"
+_PRE_CLIENT_OAUTH_REVISION = "f2a3b4c5d6e7"
+_CLIENT_OAUTH_TABLES = frozenset({"client_oauth_codes", "client_oauth_grants", "client_oauth_credentials"})
 _USER_COLUMNS = {
     "admin_users": {"role", "display_name", "quota", "used_quota", "allowed_channels", "allowed_models", "default_token_id"},
     "tokens": {"owner_id", "is_base", "allowed_models"},
@@ -247,10 +253,16 @@ def _legacy_revision(connection: Connection) -> str:
     oauth_table_additions = 0
     callback_columns = []
     user_additions = False
+    client_oauth_additions = set()
+    client_oauth_index_tables = set()
     for difference in diff_tuples:
         signature = _schema_parity_signature(difference)
         if signature is not None:
             parity_signatures.append(signature)
+        elif difference[0] == "add_table" and getattr(difference[1], "name", None) in _CLIENT_OAUTH_TABLES:
+            client_oauth_additions.add(difference[1].name)
+        elif difference[0] == "add_index" and getattr(getattr(difference[1], "table", None), "name", None) in _CLIENT_OAUTH_TABLES:
+            client_oauth_index_tables.add(difference[1].table.name)
         elif _is_user_addition(difference):
             if "user_invitations" in inspect(connection).get_table_names():
                 raise LegacyDatabaseError("cannot safely adopt unversioned SQLite database: partial user ownership constraints")
@@ -276,6 +288,10 @@ def _legacy_revision(connection: Connection) -> str:
                 "cannot safely adopt unversioned SQLite database: "
                 "its schema does not match a known Rotor release"
             )
+
+    if ((client_oauth_additions and client_oauth_additions != _CLIENT_OAUTH_TABLES)
+            or not client_oauth_index_tables <= client_oauth_additions):
+        raise LegacyDatabaseError("cannot safely adopt unversioned SQLite database: partial client OAuth schema")
 
     if oauth_columns or oauth_table_additions:
         if set(oauth_columns) != _OAUTH_CHANNEL_COLUMNS or len(oauth_columns) != len(_OAUTH_CHANNEL_COLUMNS) or oauth_table_additions != 1:
@@ -335,6 +351,8 @@ def _legacy_revision(connection: Connection) -> str:
 
     if user_additions:
         return _PRE_USER_REVISION
+    if client_oauth_additions:
+        return _PRE_CLIENT_OAUTH_REVISION
     raise LegacyDatabaseError(
         "cannot safely adopt unversioned SQLite database: "
         "its schema does not match a known Rotor release"

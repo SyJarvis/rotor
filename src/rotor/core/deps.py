@@ -25,6 +25,12 @@ async def get_current_token(
     if not token_key:
         raise AuthenticationException("Missing Authorization or x-api-key header")
 
+    from rotor.services.client_oauth import ACCESS_PREFIX, resolve_access_token
+    if credentials and token_key.startswith(ACCESS_PREFIX):
+        return await resolve_access_token(db, token_key)
+    if token_key.startswith((ACCESS_PREFIX, "rotor-refresh-", "rotor-code-")):
+        raise AuthenticationException("Use an OAuth access token in the Authorization Bearer header")
+
     if not validate_api_key_format(token_key):
         raise AuthenticationException("Invalid token format")
 
@@ -67,6 +73,12 @@ async def get_optional_token(
     token_key = credentials.credentials if credentials else x_api_key
     if not token_key:
         return None
+
+    from rotor.services.client_oauth import ACCESS_PREFIX, resolve_access_token
+    if credentials and token_key.startswith(ACCESS_PREFIX):
+        return await resolve_access_token(db, token_key)
+    if token_key.startswith((ACCESS_PREFIX, "rotor-refresh-", "rotor-code-")):
+        raise AuthenticationException("Use an OAuth access token in the Authorization Bearer header")
 
     if not validate_api_key_format(token_key):
         return None

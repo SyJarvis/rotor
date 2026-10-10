@@ -39,7 +39,7 @@ from rotor.api.admin import (
     monitoring,
     settings as admin_settings,
 )
-from rotor.api import users, chat as user_chat
+from rotor.api import users, chat as user_chat, client_oauth
 from rotor.api.control import channels as control_channels
 from rotor.api.control import requests as control_requests
 from rotor.core.control_auth import (
@@ -141,6 +141,7 @@ app.add_exception_handler(
     control_api_exception_handler,
 )
 app.add_exception_handler(Exception, general_exception_handler)
+app.add_exception_handler(client_oauth.OAuthError, client_oauth.oauth_error_handler)
 
 
 @app.get("/anthropic/api/hello")
@@ -198,6 +199,7 @@ async def frontend_index():
 
 
 # Include routers
+app.include_router(client_oauth.router)
 app.include_router(chat.router, prefix=settings.API_V1_STR, tags=["chat"])
 app.include_router(responses.router, prefix=settings.API_V1_STR, tags=["responses"])
 app.include_router(embeddings.router, prefix=settings.API_V1_STR, tags=["embeddings"])

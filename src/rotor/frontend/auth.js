@@ -5,6 +5,7 @@ const LOGIN_ENDPOINT = "/api/auth/login";
 const CHANGE_PASSWORD_ENDPOINT = "/api/auth/change-password";
 const LOGOUT_ENDPOINT = "/api/auth/logout";
 const registrationRequested = new URL(window.location.href).searchParams.get("register") === "1";
+const clientAuthorizationPage = ["/oauth/authorize", "/oauth/apps"].includes(window.location.pathname);
 
 let appLoaded = false;
 
@@ -116,6 +117,7 @@ function authScreen() {
     </main>
   `;
   document.body.appendChild(screen);
+  if (clientAuthorizationPage) screen.querySelector("#openRegistration").href = authPageUrl(true);
   screen.querySelector("#adminLoginForm")
     ?.addEventListener("submit", submitLogin);
   screen.querySelector("#adminPasswordForm")
@@ -146,8 +148,16 @@ function showLogin(message = "") {
   showPanel("adminLoginPanel", message);
 }
 
+function authPageUrl(register) {
+  if (!clientAuthorizationPage) return `${window.location.pathname}${register ? "?register=1" : ""}`;
+  const url = new URL(window.location.href);
+  if (register) url.searchParams.set("register", "1");
+  else url.searchParams.delete("register");
+  return `${url.pathname}${url.search}`;
+}
+
 function switchAuthPage(register) {
-  window.history.replaceState(null, "", `${window.location.pathname}${register ? "?register=1" : ""}`);
+  window.history.replaceState(null, "", authPageUrl(register));
   showPanel(register ? "registerPanel" : "adminLoginPanel");
 }
 
@@ -164,7 +174,8 @@ async function startApp(actor) {
   }
   if (!appLoaded) {
     try {
-      await import("./app.js?v=63");
+      if (clientAuthorizationPage) await import("./client-authorization.js?v=1");
+      else await import("./app.js?v=63");
       appLoaded = true;
       authScreen().classList.add("hidden");
       document.body.classList.remove("auth-pending");
@@ -259,7 +270,7 @@ async function submitRegister(event) {
     const result = await response.json();
     if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : labels().registrationFailed);
     form.reset();
-    window.history.replaceState(null, "", window.location.pathname);
+    window.history.replaceState(null, "", authPageUrl(false));
     await startApp(result);
   } catch (error) { showPanel("registerPanel", error.message || labels().registrationFailed); }
   finally { button.disabled = false; }

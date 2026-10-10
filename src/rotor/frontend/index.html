@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap">
-    <link rel="stylesheet" href="/styles.css?v=45">
+    <link rel="stylesheet" href="/styles.css?v=46">
     <script>
       // FOUC guard — must run before body paints.
       (function () {
@@ -51,6 +51,9 @@
           <button class="nav-item" data-tab="tokens">
             <i data-lucide="key-round"></i><span data-i18n="apiKeys">API Key</span>
           </button>
+          <a class="nav-item" href="/oauth/apps">
+            <i data-lucide="user-round-check"></i><span data-i18n="clientAppsTitle">已授权客户端</span>
+          </a>
           <button class="nav-item" data-tab="usage">
             <i data-lucide="trending-up"></i><span data-i18n="usage">用量统计</span>
           </button>
@@ -406,7 +409,7 @@
       </div>
     </div>
 
-    <script src="/config.js?v=53"></script>
-    <script type="module" src="/auth.js?v=43"></script>
+    <script src="/config.js?v=54"></script>
+    <script type="module" src="/auth.js?v=44"></script>
   </body>
 </html>
