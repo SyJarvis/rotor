@@ -27,7 +27,7 @@ from rotor.adapters.protocol.responses import (
     validate_responses_response,
 )
 from rotor.core.deps import get_available_channels, get_current_token
-from rotor.core.user_access import effective_permissions
+from rotor.core.user_access import AccountPrincipal, principal_scope_key, reload_principal, effective_permissions
 from rotor.core.client_session import resolve_client_session
 from rotor.core.header_forwarding import snapshot_inbound_headers
 from rotor.application_settings import application_settings
@@ -405,7 +405,8 @@ async def create_response(
     previous_route = None
     if request.previous_response_id:
         previous_route = await get_response_route(
-            db, request.previous_response_id, token.id
+            db, request.previous_response_id, token.id,
+            owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
         )
         if previous_route is None:
             raise HTTPException(status_code=404, detail="Response not found")
@@ -464,6 +465,7 @@ async def create_response(
         lease_preference = await get_session_lease_preference(
             db,
             token_id=token.id,
+            owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
             session_id=lease_session_id,
             logical_model=chat_request.model,
             request_protocol="openai_responses",
@@ -477,7 +479,7 @@ async def create_response(
             ),
         )
         affinity_key = (
-            client_session.affinity_key(token.id)
+            client_session.affinity_key(principal_scope_key(token))
             if routing_settings.affinity_enabled
             else None
         )
@@ -601,6 +603,7 @@ async def create_response(
                                 route_db,
                                 response_id=native_response["id"],
                                 token_id=token.id,
+                                owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
                                 channel_id=channel.id,
                                 conversation_id=conversation_id,
                                 model=native_response.get("model") or chat_request.model,
@@ -684,6 +687,7 @@ async def create_response(
                             db,
                             response_id=response_id,
                             token_id=token.id,
+                            owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
                             channel_id=channel.id,
                             conversation_id=conversation_id,
                             model=response_data.get("model") or chat_request.model,
@@ -826,7 +830,8 @@ async def _resolve_response_channel(
     response_id: str,
     token,
 ) -> tuple[ResponseRoute, Channel]:
-    route = await get_response_route(db, response_id, token.id)
+    route = await get_response_route(db, response_id, token.id,
+                                     owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None)
     if route is None:
         raise HTTPException(status_code=404, detail="Response not found")
     channel = await db.get(Channel, route.channel_id)
@@ -1097,10 +1102,11 @@ async def retrieve_response(
                     try:
                         async with async_session_maker() as stream_db:
                             stream_route = await get_response_route(
-                                stream_db, response_id, token.id
+                                stream_db, response_id, token.id,
+                                owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
                             )
                             stream_channel = await stream_db.get(Channel, channel.id)
-                            stream_token = await stream_db.get(type(token), token.id)
+                            stream_token = await reload_principal(stream_db, token)
                             if stream_route and stream_channel and stream_token:
                                 stream_route.status = (
                                     terminal_response.get("status") or stream_route.status

@@ -34,7 +34,8 @@ class SessionLeasePreference:
 async def get_session_lease_preference(
     db: AsyncSession,
     *,
-    token_id: int,
+    token_id: int | None = None,
+    owner_id: int | None = None,
     session_id: str | None,
     logical_model: str,
     request_protocol: str,
@@ -50,6 +51,7 @@ async def get_session_lease_preference(
     lease = await _get_lease(
         db,
         token_id=token_id,
+        owner_id=owner_id,
         session_id=session_id,
         logical_model=logical_model,
     )
@@ -134,7 +136,8 @@ async def get_session_lease_preference(
 async def get_preferred_channel_id(
     db: AsyncSession,
     *,
-    token_id: int,
+    token_id: int | None = None,
+    owner_id: int | None = None,
     session_id: str | None,
     logical_model: str,
     now: datetime | None = None,
@@ -145,6 +148,7 @@ async def get_preferred_channel_id(
     lease = await _get_lease(
         db,
         token_id=token_id,
+        owner_id=owner_id,
         session_id=session_id,
         logical_model=logical_model,
     )
@@ -157,7 +161,8 @@ async def record_session_lease_success(
     db: AsyncSession,
     *,
     request_id: str,
-    token_id: int,
+    token_id: int | None = None,
+    owner_id: int | None = None,
     session_id: str,
     logical_model: str,
     channel_id: int,
@@ -180,6 +185,7 @@ async def record_session_lease_success(
     lease = await _get_lease(
         db,
         token_id=token_id,
+        owner_id=owner_id,
         session_id=session_id,
         logical_model=logical_model,
         for_update=True,
@@ -198,6 +204,7 @@ async def record_session_lease_success(
     if lease is None:
         lease = SessionLease(
             token_id=token_id,
+            owner_id=owner_id,
             session_id=session_id,
             logical_model=logical_model,
             channel_id=channel_id,
@@ -214,6 +221,7 @@ async def record_session_lease_success(
             lease = await _get_lease(
                 db,
                 token_id=token_id,
+                owner_id=owner_id,
                 session_id=session_id,
                 logical_model=logical_model,
                 for_update=True,
@@ -329,13 +337,17 @@ def resolve_idle_ttl_seconds(
 async def _get_lease(
     db: AsyncSession,
     *,
-    token_id: int,
+    token_id: int | None = None,
+    owner_id: int | None = None,
     session_id: str,
     logical_model: str,
     for_update: bool = False,
 ) -> SessionLease | None:
+    if (token_id is None) == (owner_id is None):
+        raise ValueError("Session ownership requires exactly one account or API Key")
     statement = select(SessionLease).where(
         SessionLease.token_id == token_id,
+        SessionLease.owner_id == owner_id,
         SessionLease.session_id == session_id,
         SessionLease.logical_model == logical_model,
     )
@@ -359,6 +371,7 @@ def _add_event(
         lease_id=lease.id,
         request_id=request_id,
         token_id=lease.token_id,
+        owner_id=lease.owner_id,
         session_id=lease.session_id,
         logical_model=lease.logical_model,
         event_type=event_type,

@@ -17,7 +17,7 @@ import rotor.main  # noqa: F401  # Register every model in Base.metadata.
 
 ROOT = Path(__file__).resolve().parents[1]
 PREVIOUS_REVISION = "b8c9d0e1f2a3"
-HEAD_REVISION = "a3b4c5d6e7f8"
+HEAD_REVISION = "b4c5d6e7f8a9"
 ADMIN_TABLES = {
     "admin_auth_events",
     "admin_login_throttles",

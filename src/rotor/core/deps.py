@@ -10,7 +10,7 @@ from rotor.models.channel import Channel
 from rotor.core.exceptions import AuthenticationException, ModelNotFoundException
 from rotor.core.security import validate_api_key_format
 from rotor.config import settings
-from rotor.core.user_access import validate_token_access, effective_permissions
+from rotor.core.user_access import AccountPrincipal, validate_token_access, effective_permissions
 
 security = HTTPBearer(auto_error=False)
 
@@ -96,7 +96,7 @@ async def get_optional_token(
 
 async def get_available_channels(
     model: str,
-    token: Optional[Token] = None,
+    token: Token | AccountPrincipal | None = None,
     db: AsyncSession = Depends(get_db)
 ) -> list[Channel]:
     """Get available channels for a given model."""

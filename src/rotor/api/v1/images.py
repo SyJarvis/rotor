@@ -41,6 +41,7 @@ from rotor.gateway.fallback import (
 )
 from rotor.gateway.routing import routing_engine, session_lease_success_reason
 from rotor.services.session_leases import get_session_lease_preference
+from rotor.core.user_access import AccountPrincipal, principal_scope_key, reload_principal
 from rotor.gateway.streaming import AdmissionStreamingResponse
 from rotor.schemas.error import ErrorPhase
 
@@ -271,8 +272,10 @@ async def _stream_image_response(
         # counters, so one commit covers the attempt plus usage rows.
         # record_attempt=False because the attempt was already staged above.
         async with async_session_maker() as stream_db:
-            stream_token = await stream_db.get(type(token), token.id)
+            stream_token = await reload_principal(stream_db, token)
             if stream_token is None:
+                if isinstance(token, AccountPrincipal):
+                    raise RuntimeError(f"Account {token.owner_id} no longer exists")
                 raise RuntimeError(f"Token {token.id} no longer exists")
             if attempt_context is not None:
                 await attempt_recorder.record(
@@ -315,7 +318,7 @@ async def _stream_image_response(
         )
         try:
             async with async_session_maker() as stream_db:
-                stream_token = await stream_db.get(type(token), token.id)
+                stream_token = await reload_principal(stream_db, token)
                 await _record_failure(
                     stream_db,
                     token=stream_token or token,
@@ -376,6 +379,7 @@ async def generate_image(
     lease_preference = await get_session_lease_preference(
         db,
         token_id=token.id,
+        owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
         session_id=lease_session_id,
         logical_model=image_request.model,
         request_protocol="openai_images",
@@ -389,7 +393,7 @@ async def generate_image(
         ),
     )
     affinity_key = (
-        client_session.affinity_key(token.id)
+        client_session.affinity_key(principal_scope_key(token))
         if routing_settings.affinity_enabled
         else None
     )

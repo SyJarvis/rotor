@@ -44,6 +44,7 @@ from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.capabilities import anthropic_required_capabilities
 from rotor.gateway.routing import routing_engine, session_lease_success_reason
 from rotor.services.session_leases import get_session_lease_preference
+from rotor.core.user_access import AccountPrincipal, principal_scope_key, reload_principal
 from rotor.gateway.streaming import AdmissionStreamingResponse
 from rotor.gateway.fallback import (
     retry_after_seconds,
@@ -733,7 +734,7 @@ async def messages(
         metadata=request.metadata,
     )
     internal_request.responses_prompt_cache_key = build_responses_prompt_cache_key(
-        token_id=token.id,
+        token_id=principal_scope_key(token),
         model=request.model,
         session_id=client_session.session_id,
     )
@@ -752,6 +753,7 @@ async def messages(
     lease_preference = await get_session_lease_preference(
         db,
         token_id=token.id,
+        owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
         session_id=lease_session_id,
         logical_model=request.model,
         request_protocol="anthropic_messages",
@@ -765,7 +767,7 @@ async def messages(
         ),
     )
     affinity_key = (
-        client_session.affinity_key(token.id)
+        client_session.affinity_key(principal_scope_key(token))
         if routing_settings.affinity_enabled
         else None
     )
@@ -1269,8 +1271,10 @@ async def _handle_streaming_request(
                         outcome="success",
                         db=stream_db,
                     )
-                stream_token = await stream_db.get(type(token), token.id)
+                stream_token = await reload_principal(stream_db, token)
                 if stream_token is None:
+                    if isinstance(token, AccountPrincipal):
+                        raise RuntimeError(f"Account {token.owner_id} no longer exists")
                     raise RuntimeError(f"Token {token.id} no longer exists")
                 await accounting_service.record_success(
                     stream_db,

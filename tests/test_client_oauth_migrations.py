@@ -11,7 +11,7 @@ from rotor.migrations.runner import LegacyDatabaseError, run_startup_migrations
 
 ROOT = Path(__file__).resolve().parents[1]
 PREVIOUS = "f2a3b4c5d6e7"
-HEAD = "a3b4c5d6e7f8"
+HEAD = "b4c5d6e7f8a9"
 TABLES = {"client_oauth_codes", "client_oauth_grants", "client_oauth_credentials"}
 
 

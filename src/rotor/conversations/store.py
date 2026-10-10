@@ -19,6 +19,7 @@ from rotor.database import async_session_maker
 from rotor.models.conversation import ConversationRecord
 from rotor.models.channel import Channel
 from rotor.models.token import Token
+from rotor.core.user_access import AccountPrincipal
 from rotor.schemas.request import ChatCompletionRequest
 
 logger = logging.getLogger(__name__)
@@ -182,7 +183,7 @@ class ConversationStore:
         *,
         conversation_id: str,
         request_id: str,
-        token: Token,
+        token: Token | AccountPrincipal,
         request: ChatCompletionRequest,
         protocol: str,
     ) -> ConversationHandle:

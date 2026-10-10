@@ -89,7 +89,7 @@ class ClientSessionContext:
     cache_key: str | None = None
     client_source: str | None = None
 
-    def affinity_key(self, token_id: int) -> str | None:
+    def affinity_key(self, token_id: int | str) -> str | None:
         """Namespace affinity by Rotor token so tenants cannot collide."""
         if self.session_id is None:
             return None
@@ -106,7 +106,7 @@ class ClientSessionContext:
 
 def build_responses_prompt_cache_key(
     *,
-    token_id: int,
+    token_id: int | str,
     model: str,
     session_id: str | None,
 ) -> str | None:

@@ -25,13 +25,19 @@ class SessionLease(Base):
             "logical_model",
             name="uq_session_leases_token_session_model",
         ),
+        UniqueConstraint("owner_id", "session_id", "logical_model", name="uq_session_leases_owner_session_model"),
+        CheckConstraint("(token_id IS NOT NULL AND owner_id IS NULL) OR (token_id IS NULL AND owner_id IS NOT NULL)",
+                        name="ck_session_leases_identity"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    token_id: Mapped[int] = mapped_column(
+    token_id: Mapped[int | None] = mapped_column(
         ForeignKey("tokens.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
+    )
+    owner_id: Mapped[int | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="CASCADE"), nullable=True, index=True
     )
     session_id: Mapped[str] = mapped_column(String(100), nullable=False)
     logical_model: Mapped[str] = mapped_column(
@@ -68,6 +74,8 @@ class SessionLeaseEvent(Base):
             "event_type IN ('assigned', 'renewed', 'migrated', 'expired')",
             name="ck_session_lease_events_type",
         ),
+        CheckConstraint("(token_id IS NOT NULL AND owner_id IS NULL) OR (token_id IS NULL AND owner_id IS NOT NULL)",
+                        name="ck_session_lease_events_identity"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
@@ -75,7 +83,8 @@ class SessionLeaseEvent(Base):
     request_id: Mapped[str] = mapped_column(
         String(64), nullable=False, index=True
     )
-    token_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    token_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    owner_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     session_id: Mapped[str] = mapped_column(String(100), nullable=False)
     logical_model: Mapped[str] = mapped_column(
         String(100), nullable=False, index=True

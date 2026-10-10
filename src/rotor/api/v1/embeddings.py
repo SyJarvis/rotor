@@ -39,6 +39,7 @@ from rotor.gateway.fallback import (
 )
 from rotor.gateway.routing import routing_engine, session_lease_success_reason
 from rotor.services.session_leases import get_session_lease_preference
+from rotor.core.user_access import AccountPrincipal, principal_scope_key
 from rotor.schemas.error import ErrorPhase
 
 
@@ -285,6 +286,7 @@ async def create_embeddings(
     lease_preference = await get_session_lease_preference(
         db,
         token_id=token.id,
+        owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
         session_id=lease_session_id,
         logical_model=embedding_request.model,
         request_protocol="openai_embeddings",
@@ -298,7 +300,7 @@ async def create_embeddings(
         ),
     )
     affinity_key = (
-        client_session.affinity_key(token.id)
+        client_session.affinity_key(principal_scope_key(token))
         if routing_settings.affinity_enabled
         else None
     )

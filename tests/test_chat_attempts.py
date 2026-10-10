@@ -503,6 +503,7 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
         async def preferred_channel(db, **kwargs):
             assert kwargs == {
                 "token_id": 9,
+                "owner_id": None,
                 "session_id": "session-a",
                 "logical_model": "model-a",
                 "request_protocol": "openai_chat",

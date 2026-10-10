@@ -12,7 +12,7 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import TEXT, String, Text, create_engine, inspect
+from sqlalchemy import TEXT, Integer, String, Text, create_engine, inspect
 from sqlalchemy.engine import Connection, make_url
 
 from rotor.database import Base
@@ -67,6 +67,13 @@ _REGISTERED_MODELS = (
 _PRE_USER_REVISION = "e1f2a3b4c5d6"
 _PRE_CLIENT_OAUTH_REVISION = "f2a3b4c5d6e7"
 _CLIENT_OAUTH_TABLES = frozenset({"client_oauth_codes", "client_oauth_grants", "client_oauth_credentials"})
+_PRE_ACCOUNT_REVISION = "a3b4c5d6e7f8"
+_ACCOUNT_SCOPE_TABLES = frozenset({"response_routes", "session_leases", "session_lease_events"})
+_ACCOUNT_SCOPE_UNIQUES = {
+    "response_routes": ("uq_response_routes_owner_response", ["owner_id", "response_id"]),
+    "session_leases": ("uq_session_leases_owner_session_model", ["owner_id", "session_id", "logical_model"]),
+}
+_ACCOUNT_SCOPE_CHECK = "(token_id IS NOT NULL AND owner_id IS NULL) OR (token_id IS NULL AND owner_id IS NOT NULL)"
 _USER_COLUMNS = {
     "admin_users": {"role", "display_name", "quota", "used_quota", "allowed_channels", "allowed_models", "default_token_id"},
     "tokens": {"owner_id", "is_base", "allowed_models"},
@@ -98,6 +105,67 @@ def _validate_user_schema_generation(connection):
     expected = [(table, column) for table, columns in _USER_COLUMNS.items() for column in columns]
     if (observed or "user_invitations" in tables) and (set(observed) != set(expected) or "user_invitations" not in tables):
         raise LegacyDatabaseError("cannot safely adopt unversioned SQLite database: partial user ownership schema")
+
+
+def _validate_account_scope_generation(connection):
+    schema = inspect(connection)
+    tables = set(schema.get_table_names())
+    columns = {table: {column["name"]: column for column in schema.get_columns(table)}
+               for table in _ACCOUNT_SCOPE_TABLES if table in tables}
+    observed = {table for table, fields in columns.items() if "owner_id" in fields}
+    if not observed:
+        if any(fields.get("token_id", {}).get("nullable") for fields in columns.values()):
+            raise LegacyDatabaseError("cannot safely adopt SQLite database: partial account identity schema")
+        return False
+    expected_check = "".join(_ACCOUNT_SCOPE_CHECK.split()).lower()
+    for table in _ACCOUNT_SCOPE_TABLES:
+        if (table not in observed or not columns[table]["owner_id"]["nullable"]
+                or not columns[table].get("token_id", {}).get("nullable")
+                or not isinstance(columns[table]["owner_id"]["type"], Integer)
+                or not isinstance(columns[table]["token_id"]["type"], Integer)):
+            raise LegacyDatabaseError("cannot safely adopt SQLite database: partial account identity schema")
+        owner_fks = [fk for fk in schema.get_foreign_keys(table) if "owner_id" in fk["constrained_columns"]]
+        if table == "session_lease_events":
+            valid_fk = not owner_fks
+        else:
+            valid_fk = len(owner_fks) == 1 and (
+                owner_fks[0]["constrained_columns"] == ["owner_id"]
+                and owner_fks[0]["referred_table"] == "admin_users"
+                and owner_fks[0]["referred_columns"] == ["id"]
+                and owner_fks[0].get("options", {}).get("ondelete", "").upper() == "CASCADE")
+        if not valid_fk:
+            raise LegacyDatabaseError("cannot safely adopt SQLite database: partial account identity foreign keys")
+        checks = {check["name"]: "".join(check["sqltext"].split()).lower() for check in schema.get_check_constraints(table)}
+        indexes = {index["name"]: index["column_names"] for index in schema.get_indexes(table)}
+        if (checks.get(f"ck_{table}_identity") != expected_check
+                or indexes.get(f"ix_{table}_owner_id") != ["owner_id"]):
+            raise LegacyDatabaseError("cannot safely adopt SQLite database: partial account identity constraints")
+        if table in _ACCOUNT_SCOPE_UNIQUES:
+            name, fields = _ACCOUNT_SCOPE_UNIQUES[table]
+            uniques = {constraint["name"]: constraint["column_names"] for constraint in schema.get_unique_constraints(table)}
+            if uniques.get(name) != fields:
+                raise LegacyDatabaseError("cannot safely adopt SQLite database: partial account identity constraints")
+    return True
+
+
+def _is_account_scope_addition(difference):
+    operation = difference[0]
+    if operation == "add_column" and len(difference) == 4:
+        return difference[2] in _ACCOUNT_SCOPE_TABLES and difference[3].name == "owner_id"
+    if operation == "modify_nullable" and len(difference) == 7:
+        return difference[2] in _ACCOUNT_SCOPE_TABLES and difference[3] == "token_id" and difference[5:] == (False, True)
+    if operation == "add_index":
+        index = difference[1]
+        return index.table.name in _ACCOUNT_SCOPE_TABLES and index.name == f"ix_{index.table.name}_owner_id"
+    if operation == "add_constraint":
+        constraint = difference[1]
+        expected = _ACCOUNT_SCOPE_UNIQUES.get(constraint.table.name)
+        return expected is not None and constraint.name == expected[0] and list(constraint.columns.keys()) == expected[1]
+    if operation == "add_fk":
+        constraint = difference[1]
+        return (constraint.table.name in {"response_routes", "session_leases"} and list(constraint.column_keys) == ["owner_id"]
+                and [element.target_fullname for element in constraint.elements] == ["admin_users.id"])
+    return False
 
 
 _PRE_ADMIN_REVISION = "f6a7b8c9d0e1"
@@ -227,6 +295,7 @@ def _schema_parity_signature(
 
 def _legacy_revision(connection: Connection) -> str:
     _validate_user_schema_generation(connection)
+    _validate_account_scope_generation(connection)
     context = MigrationContext.configure(
         connection,
         opts={"compare_type": True},
@@ -255,10 +324,13 @@ def _legacy_revision(connection: Connection) -> str:
     user_additions = False
     client_oauth_additions = set()
     client_oauth_index_tables = set()
+    account_scope_additions = False
     for difference in diff_tuples:
         signature = _schema_parity_signature(difference)
         if signature is not None:
             parity_signatures.append(signature)
+        elif _is_account_scope_addition(difference):
+            account_scope_additions = True
         elif difference[0] == "add_table" and getattr(difference[1], "name", None) in _CLIENT_OAUTH_TABLES:
             client_oauth_additions.add(difference[1].name)
         elif difference[0] == "add_index" and getattr(getattr(difference[1], "table", None), "name", None) in _CLIENT_OAUTH_TABLES:
@@ -353,6 +425,8 @@ def _legacy_revision(connection: Connection) -> str:
         return _PRE_USER_REVISION
     if client_oauth_additions:
         return _PRE_CLIENT_OAUTH_REVISION
+    if account_scope_additions:
+        return _PRE_ACCOUNT_REVISION
     raise LegacyDatabaseError(
         "cannot safely adopt unversioned SQLite database: "
         "its schema does not match a known Rotor release"
@@ -399,6 +473,7 @@ def run_startup_migrations(database_url: str) -> Path | None:
     engine = create_engine(sync_url)
     try:
         with engine.connect() as connection:
+            _validate_account_scope_generation(connection)
             table_names = set(inspect(connection).get_table_names())
             current_heads = MigrationContext.configure(
                 connection
