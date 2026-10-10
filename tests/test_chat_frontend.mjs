@@ -249,6 +249,42 @@ for (const [id, values] of [['chatTemperature', ['-1', '2.1', 'NaN']], ['chatMax
   });
 }
 
+for (const api_format of ['chat', 'responses']) {
+  for (const missing of [['temperature'], ['max_tokens'], ['temperature', 'max_tokens']]) {
+    test(`legacy ${api_format} chat with missing ${missing.join(' and ')} sends and tests untouched defaults after reload`, async () => {
+      const settings = { model: 'model-a', api_format, system_prompt: '', temperature: 0.4, max_tokens: 128 };
+      for (const name of missing) delete settings[name];
+      const env = await environment({ serverRecords: historyStorage([{ id: 'legacy', settings }]) });
+      env.page.unload(); await env.page.load();
+      const expected = { ...settings };
+      for (const name of missing) expected[name] = null;
+      await env.testConnection();
+      assert.equal(env.requests.length, 1);
+      assert.equal(env.requests[0].url, '/api/chat/test');
+      assert.deepEqual(env.requests[0].payload, expected);
+      assert.equal(env.nodes.get('chatSettingsError').classList.contains('hidden'), true);
+      await env.send('Use the model defaults');
+      assert.equal(env.requests.length, 2);
+      assert.equal(env.requests[1].url, '/api/chat/completions');
+      assert.deepEqual(env.requests[1].payload.settings, expected);
+      assert.equal(env.nodes.get('chatSettingsError').classList.contains('hidden'), true);
+      assert.ok(env.notices.every(({ severity }) => severity !== 'warning'));
+    });
+  }
+}
+
+test('zero temperature remains explicit while blank maximum tokens use the model default', async () => {
+  const env = await environment();
+  env.change('chatTemperature', '0'); env.change('chatMaxTokens', '');
+  await env.testConnection(); await env.send('Keep zero temperature');
+  assert.equal(env.requests.length, 2);
+  for (const request of env.requests) {
+    const settings = request.payload.settings || request.payload;
+    assert.equal(settings.temperature, 0); assert.equal(settings.max_tokens, null);
+  }
+  assert.equal(env.nodes.get('chatSettingsError').classList.contains('hidden'), true);
+});
+
 test('connection test only sends settings, reports latency and becomes stale on any change', async () => {
   const gate = deferred();
   const env = await environment({ probes: [{ success: true, latency_ms: 24.2 }, gate.promise] });

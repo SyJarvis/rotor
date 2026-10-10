@@ -84,6 +84,36 @@ def completion(document, content="hello", **kwargs):
             "settings": document["settings"], "message": {"content": content}, **kwargs}
 
 
+@pytest.mark.parametrize("api_format", ["chat", "responses"])
+def test_settings_patch_preserves_cleared_numeric_defaults_and_ignores_null_outer_fields(tmp_path, monkeypatch, api_format):
+    async def exercise():
+        async with fixture(tmp_path, monkeypatch) as (client, _, _):
+            created = await client.post("/api/chat/conversations", json={
+                "title": "Keep this title", "settings": {"model": "model-a", "api_format": api_format,
+                    "temperature": 0.4, "max_tokens": 128}, "draft": {"text": "Keep this draft"},
+            })
+            assert created.status_code == 201
+            document = created.json()
+            path = f"/api/chat/conversations/{document['id']}"
+            settings = {**document["settings"], "temperature": None, "max_tokens": None}
+            patched = await client.patch(path, json={"expected_revision": document["revision"], "settings": settings})
+            assert patched.status_code == 200
+            saved = patched.json()
+            assert saved["settings"] == settings
+            assert saved["settings"]["temperature"] is None and saved["settings"]["max_tokens"] is None
+            assert (await client.get(path)).json()["settings"] == settings
+            listed = (await client.get("/api/chat/conversations")).json()
+            assert next(item for item in listed if item["id"] == document["id"])["settings"] == settings
+            unchanged = await client.patch(path, json={"expected_revision": saved["revision"],
+                "title": None, "settings": None, "draft": None})
+            assert unchanged.status_code == 200
+            assert unchanged.json()["title"] == saved["title"]
+            assert unchanged.json()["settings"] == settings
+            assert unchanged.json()["draft"] == saved["draft"]
+
+    asyncio.run(exercise())
+
+
 def test_crud_and_attachment_api_are_isolated_and_reject_history_overrides(tmp_path, monkeypatch):
     async def exercise():
         async with fixture(tmp_path, monkeypatch) as (client, store, _):

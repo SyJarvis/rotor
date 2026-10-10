@@ -192,7 +192,7 @@ test('authorization and grant pages load their standalone module while the conso
     assert.equal(h.document.body.classList.contains('auth-pending'), false);
   }
   const console = await environment();
-  assert.deepEqual(console.importPaths, ['./app.js?v=64']);
+  assert.deepEqual(console.importPaths, ['./app.js?v=65']);
 });
 
 test('authorization parameters survive registration switching, registration completion and page refresh', async () => {

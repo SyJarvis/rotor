@@ -495,8 +495,8 @@ function renderDetails() {
 function validateSettings(showToast = true) {
   const source = ensureConversation()?.settings;
   if (!source) return null;
-  const temperature = source.temperature === null || source.temperature === "" ? null : Number(source.temperature);
-  const maxTokens = source.max_tokens === null || source.max_tokens === "" ? null : Number(source.max_tokens);
+  const temperature = source.temperature == null || source.temperature === "" ? null : Number(source.temperature);
+  const maxTokens = source.max_tokens == null || source.max_tokens === "" ? null : Number(source.max_tokens);
   let error = "";
   if (!source.model || !models.includes(source.model)) error = t("selectModelFirst");
   else if (temperature !== null && (!Number.isFinite(temperature) || temperature < 0 || temperature > 2)) error = t("chatTemperatureInvalid");

@@ -107,6 +107,8 @@ async def get_conversation(conversation_id: str, actor: AdminActor = Depends(req
 @router.patch("/conversations/{conversation_id}")
 async def patch_conversation(conversation_id: str, payload: ConversationPatch, actor: AdminActor = Depends(require_user_access)):
     changes = payload.model_dump(exclude={"expected_revision", "expected_draft_revision"}, exclude_none=True)
+    if payload.settings is not None:
+        changes["settings"] = payload.settings.model_dump()
     return await _call(_store().patch, actor.user_id, conversation_id, payload.expected_revision, changes,
                        expected_draft=payload.expected_draft_revision)
 
