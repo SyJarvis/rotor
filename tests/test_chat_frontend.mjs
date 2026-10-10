@@ -12,7 +12,7 @@ const deferred = () => { let resolve, reject; const promise = new Promise((yes, 
 
 async function environment({ availableModels = ['model-a', 'model-b'], language = 'zh-CN', viewportWidth = 1200,
   storage = new Map(), serverRecords = new Map(), actorId = '1', attachments = new Map(), storageFailure = false, storageReadFailure = false, attachmentFailure = false,
-  streams = [], modelResponses = [], probes = [], tokenAvailable = true, reducedMotion = false, attachmentReads = null } = {}) {
+  streams = [], modelResponses = [], probes = [], accountAvailable = true, reducedMotion = false, attachmentReads = null } = {}) {
   const nodes = new Map(), actions = new Map(), listeners = {}, requests = [], downloads = [], notices = [];
   let nextId = 0, focused, unauthorized = 0;
   const apiRequests = [];
@@ -122,7 +122,7 @@ async function environment({ availableModels = ['model-a', 'model-b'], language 
   });
   const bindings = {
     t, api: async (url, options = {}) => {
-      if (url.endsWith('/models')) return modelResponses.length ? await modelResponses.shift() : { models: availableModels, token_available: tokenAvailable };
+      if (url.endsWith('/models')) return modelResponses.length ? await modelResponses.shift() : { models: availableModels, account_available: accountAvailable };
       const payload = options.body ? JSON.parse(options.body) : null;
       if (url.startsWith('/api/chat/conversations')) {
         apiRequests.push({ url, options, payload });
@@ -348,10 +348,10 @@ for (const action of ['new', 'delete', 'unload']) {
 
 test('stale model loads and connection tests do not redraw after unload', async () => {
   const slow = deferred();
-  const env = await environment({ modelResponses: [{ models: ['model-a'], token_available: true }, { models: ['model-a'], token_available: true }, slow.promise, { models: ['model-b'], token_available: true }] });
+  const env = await environment({ modelResponses: [{ models: ['model-a'], account_available: true }, { models: ['model-a'], account_available: true }, slow.promise, { models: ['model-b'], account_available: true }] });
   const first = env.page.load();
   await env.page.load();
-  slow.resolve({ models: ['old-model'], token_available: true }); await first;
+  slow.resolve({ models: ['old-model'], account_available: true }); await first;
   assert.match(env.nodes.get('agentModel').innerHTML, /model-b/); assert.doesNotMatch(env.nodes.get('agentModel').innerHTML, /old-model/);
 });
 
@@ -395,12 +395,25 @@ for (const language of ['zh-CN', 'en']) {
   });
 }
 
-test('no-model, missing token and full localStorage failures are handled without throwing', async () => {
+test('no-model, unavailable account and full localStorage failures are handled without throwing', async () => {
   const empty = await environment({ availableModels: [] }); await empty.send(); assert.equal(empty.requests.length, 0);
-  const noToken = await environment({ tokenAvailable: false }); await noToken.send(); assert.equal(noToken.requests.length, 0);
+  const unavailable = await environment({ accountAvailable: false }); await unavailable.send(); assert.equal(unavailable.requests.length, 0);
   const quota = await environment({ storageFailure: true }); await quota.send();
   assert.equal(quota.requests.length, 1); assert.equal(quota.storage.has('rotor.chat.conversations.v1'), false);
 });
+
+for (const language of ['zh-CN', 'en']) {
+  test(`an unavailable account blocks both generation and connection tests with an account message (${language})`, async () => {
+    const env = await environment({ accountAvailable: false, availableModels: [], language });
+    assert.equal(env.nodes.get('chatTestConnection').disabled, true);
+    assert.match(env.nodes.get('agentRuntimeStatus').textContent, language === 'en' ? /account.*permissions and quota/ : /账号状态、模型权限和额度/);
+    assert.doesNotMatch(env.nodes.get('agentRuntimeStatus').textContent, /Key|keys/);
+    await env.send(); await env.testConnection();
+    assert.equal(env.requests.length, 0);
+    assert.equal(env.notices.length, 2);
+    assert.ok(env.notices.every(({ message }) => !/Key|keys/.test(message)));
+  });
+}
 
 test('all navigation routes use Chat and settings has no page navigation handler', async () => {
   const pages = ['overview', 'channels', 'tokens', 'usage', 'logs', 'monitoring', 'chat'];

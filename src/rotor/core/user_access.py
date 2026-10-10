@@ -8,7 +8,6 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects.sqlite import insert
 
 from rotor.config import settings
-from rotor.database import async_session_maker
 from rotor.models.admin_auth import AdminUser
 from rotor.models.channel import Channel
 from rotor.models.token import Token
@@ -131,17 +130,3 @@ async def accessible_models(token, db) -> list[str]:
     channels = (await db.scalars(query)).all()
     return sorted({model for channel in channels for model in [*(channel.models or []), *(channel.model_mapping or {})]
                    if model_ids is None or model in model_ids})
-
-
-async def resolve_default_chat_token(actor, model: str | None = None) -> Token:
-    async with async_session_maker() as db:
-        owner = await db.get(AdminUser, actor.user_id)
-        if owner is None or not owner.enabled:
-            raise HTTPException(403, "Account is disabled")
-        token = await db.get(Token, owner.default_token_id) if owner.default_token_id else None
-        if token is None or token.owner_id != owner.id:
-            raise HTTPException(400, "Default API Key is unavailable; select another default Key")
-        await validate_token_access(token, db)
-        if model is not None and model not in await accessible_models(token, db):
-            raise HTTPException(403, "Model is not available to the default API Key")
-        return token

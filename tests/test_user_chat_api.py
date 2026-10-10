@@ -2,12 +2,13 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from fastapi import FastAPI, HTTPException, Request
 from httpx import ASGITransport, AsyncClient, Response as HTTPResponse
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from rotor.api import chat
@@ -17,9 +18,11 @@ from rotor.database import Base, get_db
 from rotor.models.admin_auth import AdminUser
 from rotor.models.channel import Channel
 from rotor.models.log import RequestLog
+from rotor.models.request_attempt import RequestAttempt
 from rotor.models.token import Token
+from rotor.models.usage import UsageLedger
 from rotor.services.user_chat_store import ChatStore
-from tests.test_admin_chat import attachment, docx_bytes
+from tests.test_admin_chat import attachment, chat_sse, docx_bytes, responses_sse
 
 
 @asynccontextmanager
@@ -44,7 +47,6 @@ async def fixture(tmp_path, monkeypatch):
         await db.commit()
     store = ChatStore(tmp_path / "chats")
     monkeypatch.setattr(chat, "_store", lambda: store)
-    monkeypatch.setattr(user_access, "async_session_maker", sessions)
     monkeypatch.setattr(engine, "async_session_maker", sessions)
     app = FastAPI()
 
@@ -131,8 +133,8 @@ def test_attachment_validation_and_preview_reuse_existing_formats(tmp_path, monk
 def test_sse_persists_canonical_multiturn_history_and_usage(tmp_path, monkeypatch):
     observed = []
 
-    async def generate(payload, request, token):
-        observed.append((payload, token.id))
+    async def generate(payload, request, principal):
+        observed.append((payload, principal))
         yield {"type": "delta", "content": "answer"}
         yield {"type": "done", "answer": "answer", "usage": {"total_tokens": 5}}
 
@@ -152,25 +154,60 @@ def test_sse_persists_canonical_multiturn_history_and_usage(tmp_path, monkeypatc
             response = await client.post("/api/chat/completions", json=completion(final, "follow up"))
             assert events(response)[-1]["type"] == "done"
             assert [message.content for message in observed[1][0].messages] == ["hello", "answer", "follow up"]
-            assert [token for _, token in observed] == [11, 11]
+            assert [principal.owner_id for _, principal in observed] == [1, 1]
+            assert all(isinstance(principal, user_access.AccountPrincipal) and principal.id is None for _, principal in observed)
 
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("failure,status", [("disabled_key", 403), ("key_quota", 429), ("account_quota", 429), ("wrong_owner", 400), ("missing_default", 400), ("disabled_account", 403), ("restricted_model", 403)])
-def test_default_key_unavailable_never_falls_back_to_other_or_global_keys(tmp_path, monkeypatch, failure, status):
+@pytest.mark.parametrize("key_state", ["disabled", "quota", "expired", "restricted", "wrong_owner", "missing_default", "no_tokens"])
+def test_web_chat_uses_the_account_independently_of_api_keys(tmp_path, monkeypatch, key_state):
+    observed = []
+
+    async def generate(payload, request, principal):
+        observed.append(principal)
+        yield {"type": "done", "answer": "OK", "usage": {"total_tokens": 0}}
+
+    monkeypatch.setattr(engine, "_completion_events", generate)
+
     async def exercise():
         async with fixture(tmp_path, monkeypatch) as (client, store, sessions):
             document = await create(client)
             async with sessions() as db:
-                if failure == "disabled_key":
-                    await db.execute(update(Token).where(Token.id == 11).values(enabled=False))
-                elif failure == "key_quota":
-                    await db.execute(update(Token).where(Token.id == 11).values(quota=1, used_quota=1))
+                if key_state == "no_tokens":
+                    await db.execute(delete(Token))
+                elif key_state in {"wrong_owner", "missing_default"}:
+                    await db.execute(update(AdminUser).where(AdminUser.id == 1).values(default_token_id=21 if key_state == "wrong_owner" else None))
                 else:
-                    values = {"account_quota": {"quota": 0}, "wrong_owner": {"default_token_id": 21},
-                              "missing_default": {"default_token_id": None}, "disabled_account": {"enabled": False},
-                              "restricted_model": {"allowed_models": ["model-b"]}}[failure]
+                    values = {"disabled": {"enabled": False}, "quota": {"quota": 0},
+                              "expired": {"expire_time": datetime.now(timezone.utc) - timedelta(days=1)},
+                              "restricted": {"allowed_channels": [2], "allowed_models": ["model-b"]}}[key_state]
+                    await db.execute(update(Token).where(Token.id == 11).values(**values))
+                await db.commit()
+            assert (await client.get("/api/chat/models")).json() == {"models": ["model-a"], "account_available": True}
+            assert (await client.post("/api/chat/test", json={"model": "model-a"})).status_code == 200
+            response = await client.post("/api/chat/completions", json=completion(document))
+            assert response.status_code == 200 and events(response)[-1]["type"] == "done"
+            assert store.get(1, document["id"])["messages"][-1]["status"] == "done"
+            assert (await client.post("/api/admin/chat/completions", json={"model": "model-a", "conversation_id": "legacy", "messages": [{"role": "user", "content": "hi"}]})).status_code == 200
+            assert all(isinstance(principal, user_access.AccountPrincipal) and principal.owner_id == 1 and principal.id is None for principal in observed)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure,status", [("account_quota", 429), ("disabled_account", 403), ("password_change", 403), ("restricted_model", 403), ("restricted_channel", 403), ("no_models", 403), ("no_channels", 403), ("missing_account", 403)])
+def test_account_access_is_required_before_a_generation_is_persisted(tmp_path, monkeypatch, failure, status):
+    async def exercise():
+        async with fixture(tmp_path, monkeypatch) as (client, store, sessions):
+            document = await create(client)
+            async with sessions() as db:
+                if failure == "missing_account":
+                    await db.execute(delete(AdminUser).where(AdminUser.id == 1))
+                else:
+                    values = {"account_quota": {"quota": 0}, "disabled_account": {"enabled": False},
+                              "password_change": {"must_change_password": True}, "restricted_model": {"allowed_models": ["model-b"]},
+                              "restricted_channel": {"allowed_channels": [2]}, "no_models": {"allowed_models": []},
+                              "no_channels": {"allowed_channels": []}}[failure]
                     await db.execute(update(AdminUser).where(AdminUser.id == 1).values(**values))
                 await db.commit()
             response = await client.post("/api/chat/completions", json=completion(document))
@@ -178,19 +215,18 @@ def test_default_key_unavailable_never_falls_back_to_other_or_global_keys(tmp_pa
             assert store.get(1, document["id"])["messages"] == []
             assert (await client.post("/api/chat/test", json={"model": "model-a"})).status_code == status
             models = (await client.get("/api/chat/models")).json()
-            assert models["models"] == []
-            if failure != "restricted_model":
-                assert models["token_available"] is False
+            assert models["models"] == (["model-b"] if failure == "restricted_channel" else [])
+            assert models["account_available"] is (failure in {"restricted_model", "restricted_channel", "no_models", "no_channels"})
             assert (await client.post("/api/admin/chat/completions", json={"model": "model-a", "conversation_id": "legacy", "messages": [{"role": "user", "content": "hi"}]})).status_code == status
 
     asyncio.run(exercise())
 
 
-def test_models_are_limited_to_current_account_and_default_key(tmp_path, monkeypatch):
+def test_models_are_limited_to_current_account(tmp_path, monkeypatch):
     async def exercise():
         async with fixture(tmp_path, monkeypatch) as (client, _, _):
-            assert (await client.get("/api/chat/models")).json() == {"models": ["model-a"], "token_available": True}
-            assert (await client.get("/api/chat/models", headers={"x-test-user": "2"})).json() == {"models": ["model-b"], "token_available": True}
+            assert (await client.get("/api/chat/models")).json() == {"models": ["model-a"], "account_available": True}
+            assert (await client.get("/api/chat/models", headers={"x-test-user": "2"})).json() == {"models": ["model-b"], "account_available": True}
     asyncio.run(exercise())
 
 
@@ -297,17 +333,23 @@ def test_cancel_before_stream_creation_releases_the_lease(tmp_path, monkeypatch,
     asyncio.run(exercise())
 
 
-def test_key_revocation_before_sdk_request_is_rechecked(tmp_path, monkeypatch):
+@pytest.mark.parametrize("change,fragment", [("disabled", "disabled"), ("quota", "quota"), ("password", "password"), ("model", "not available"), ("channels", "not available"), ("deleted", "disabled")])
+def test_account_changes_before_sdk_request_are_rechecked(tmp_path, monkeypatch, change, fragment):
     async def exercise():
         async with fixture(tmp_path, monkeypatch) as (client, store, sessions):
             document = await create(client)
             request = Request({"type": "http", "method": "POST", "path": "/api/chat/completions", "headers": []})
             response = await chat.completions(chat.CompletionRequest(**completion(document)), request, SimpleNamespace(user_id=1))
             async with sessions() as db:
-                await db.execute(update(Token).where(Token.id == 11).values(enabled=False))
+                if change == "deleted":
+                    await db.execute(delete(AdminUser).where(AdminUser.id == 1))
+                else:
+                    values = {"disabled": {"enabled": False}, "quota": {"quota": 0}, "password": {"must_change_password": True},
+                              "model": {"allowed_models": ["model-b"]}, "channels": {"allowed_channels": [2]}}[change]
+                    await db.execute(update(AdminUser).where(AdminUser.id == 1).values(**values))
                 await db.commit()
             streamed = [json.loads(item[6:]) async for item in response.body_iterator]
-            assert streamed[-1]["type"] == "error" and "disabled" in streamed[-1]["message"]
+            assert streamed[-1]["type"] == "error" and fragment in streamed[-1]["message"]
             assert store.get(1, document["id"])["messages"][-1]["status"] == "error"
             async with sessions() as db:
                 assert (await db.get(Token, 12)).used_quota == 0
@@ -315,8 +357,45 @@ def test_key_revocation_before_sdk_request_is_rechecked(tmp_path, monkeypatch):
     asyncio.run(exercise())
 
 
-def test_sdk_gateway_stream_charges_the_selected_user_and_key(tmp_path, monkeypatch):
+@pytest.mark.parametrize("api_format", ["chat", "responses"])
+def test_key_changes_after_browser_admission_do_not_affect_the_account(tmp_path, monkeypatch, api_format):
+    admitted = []
+
+    async def gateway(data, request, response, db, principal):
+        admitted.append(principal)
+
+        async def body():
+            for chunk in (chat_sse("OK") if api_format == "chat" else responses_sse("OK")):
+                yield chunk
+
+        return engine.StreamingResponse(body())
+
+    monkeypatch.setattr(engine, "chat_completions", gateway)
+    monkeypatch.setattr(engine, "create_response", gateway)
+
+    async def exercise():
+        async with fixture(tmp_path, monkeypatch) as (client, store, sessions):
+            document = await create(client)
+            document["settings"]["api_format"] = api_format
+            request = Request({"type": "http", "method": "POST", "path": "/api/chat/completions", "headers": []})
+            response = await chat.completions(chat.CompletionRequest(**completion(document)), request, SimpleNamespace(user_id=1))
+            async with sessions() as db:
+                await db.execute(update(Token).where(Token.owner_id == 1).values(enabled=False, quota=0))
+                await db.execute(update(AdminUser).where(AdminUser.id == 1).values(default_token_id=21))
+                await db.commit()
+            streamed = [json.loads(item[6:]) async for item in response.body_iterator]
+            assert streamed[-1]["type"] == "done"
+            assert store.get(1, document["id"])["messages"][-1]["content"] == "OK"
+            assert len(admitted) == 1 and isinstance(admitted[0], user_access.AccountPrincipal) and admitted[0].owner_id == 1
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("api_format", ["chat", "responses"])
+@pytest.mark.parametrize("with_keys", [False, True])
+def test_sdk_gateway_stream_charges_only_the_account(tmp_path, monkeypatch, api_format, with_keys):
     import rotor.api.v1.chat as gateway
+    import rotor.api.v1.responses as responses_gateway
     from rotor.gateway.routing import RoutingEngine
     from tests.test_chat_attempts import FakeConversationStore
 
@@ -336,21 +415,38 @@ def test_sdk_gateway_stream_charges_the_selected_user_and_key(tmp_path, monkeypa
 
     async def exercise():
         async with fixture(tmp_path, monkeypatch) as (client, store, sessions):
-            monkeypatch.setattr(gateway, "async_session_maker", sessions)
-            monkeypatch.setattr(gateway, "conversation_store", FakeConversationStore())
-            monkeypatch.setattr(gateway, "routing_engine", RoutingEngine("fallback_order"))
+            async with sessions() as db:
+                await db.execute(update(AdminUser).where(AdminUser.id == 1).values(quota=3))
+                await db.commit()
+            if not with_keys:
+                async with sessions() as db:
+                    await db.execute(delete(Token))
+                    await db.commit()
+            routing, archive = RoutingEngine("fallback_order"), FakeConversationStore()
+            for module in (gateway, responses_gateway):
+                monkeypatch.setattr(module, "async_session_maker", sessions)
+                monkeypatch.setattr(module, "conversation_store", archive)
+                monkeypatch.setattr(module, "routing_engine", routing)
             monkeypatch.setattr(gateway.AdapterFactory, "create_adapter", lambda *args: Adapter())
             document = await create(client)
+            document["settings"]["api_format"] = api_format
             response = await client.post("/api/chat/completions", json=completion(document))
             streamed = events(response)
             assert streamed[-1]["type"] == "done", streamed
             assert streamed[-1]["conversation"]["messages"][-1]["content"] == "charged answer"
             async with sessions() as db:
                 assert (await db.get(AdminUser, 1)).used_quota == 5
-                assert (await db.get(Token, 11)).used_quota == 5
-                assert (await db.get(Token, 12)).used_quota == (await db.get(Token, 21)).used_quota == 0
+                assert all(token.used_quota == 0 for token in (await db.scalars(select(Token))).all())
                 record = (await db.scalars(select(RequestLog))).one()
-                assert record.owner_id == 1 and record.token_id == 11 and record.total_tokens == 5
+                assert record.owner_id == 1 and record.token_id is None and record.total_tokens == 5
+                assert (await db.scalars(select(RequestAttempt))).one().request_origin == "user_chat"
             assert store.get(1, document["id"])["messages"][-1]["usage"]["total_tokens"] == 5
+            follow_up = await client.post("/api/chat/completions", json=completion(streamed[-1]["conversation"], "another request"))
+            assert follow_up.status_code == 429 and follow_up.json()["detail"] == "Account token quota exceeded"
+            assert len(store.get(1, document["id"])["messages"]) == 2
+            async with sessions() as db:
+                ledger = (await db.scalars(select(UsageLedger))).one()
+                assert ledger.total_tokens == 5 and ledger.owner_id == 1 and ledger.token_id is None
+                assert len((await db.scalars(select(RequestLog))).all()) == 1
 
     asyncio.run(exercise())

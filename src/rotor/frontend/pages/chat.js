@@ -516,7 +516,7 @@ function invalidateProbe() {
 
 function renderProbe() {
   const button = document.getElementById("chatTestConnection");
-  if (button) button.disabled = Boolean(probe) || !models.length || status?.token_available === false;
+  if (button) button.disabled = Boolean(probe) || !models.length || status?.account_available === false;
   const result = document.getElementById("chatProbeResult");
   if (!result) return;
   result.textContent = probe ? t("chatTesting") : probeResult?.text || "";
@@ -525,6 +525,7 @@ function renderProbe() {
 }
 
 async function testConnection() {
+  if (status?.account_available === false) { toast(t("chatAccountUnavailable"), "warning"); return; }
   const settings = validateSettings();
   if (!settings || probe) return;
   const operation = { controller: new AbortController(), conversationId: activeId };
@@ -940,7 +941,7 @@ function setRuntimeStatus(text, active = false) {
 function setGenerating(generating) {
   document.getElementById("agentSend")?.classList.toggle("hidden", generating);
   document.getElementById("agentStop")?.classList.toggle("hidden", !generating);
-  const ready = status?.token_available === false ? status.message || t("chatTokenUnavailable") : t("agentReady");
+  const ready = status?.account_available === false ? status.message || t("chatAccountUnavailable") : t("agentReady");
   setRuntimeStatus(generating ? t("agentThinking") : ready, generating);
 }
 
@@ -980,8 +981,8 @@ async function sendMessage() {
   const textarea = document.getElementById("agentPrompt"), submittedText = textarea?.value || "";
   const content = submittedText.trim();
   if (!content && !pendingAttachments.length) return;
+  if (status?.account_available === false) { toast(t("chatAccountUnavailable"), "warning"); return; }
   const settings = validateSettings(); if (!settings) return;
-  if (status?.token_available === false) { toast(t("chatTokenUnavailable"), "warning"); return; }
   const conversation = ensureConversation(), outbound = [...pendingAttachments];
   const operation = { controller: new AbortController(), conversation, assistantMessage: null, inserted: false, session: owner };
   generation = operation; setGenerating(true);
