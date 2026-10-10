@@ -12,6 +12,7 @@
 - [管理 API Key 与配额](guides/api-keys.md)
 - [选择路由策略](guides/routing.md)
 - [接入 Codex、Claude Code 与 OpenCode](guides/client-integrations.md)
+- [客户端网页登录授权](guides/client-oauth.md)
 
 ## 核心概念
 
