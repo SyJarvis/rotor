@@ -236,7 +236,7 @@ async def chat_completions(
             except (HTTPStatusError, RequestError) as e:
                 last_error = e
                 if should_fallback(e):
-                    routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(e))
+                    routing_engine.mark_failure(request.model, channel, e)
                 logger.warning(f"Channel {channel.name} failed: {format_error_message(e)}")
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
@@ -287,7 +287,7 @@ async def chat_completions(
             except Exception as e:
                 last_error = e
                 if should_fallback(e):
-                    routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(e))
+                    routing_engine.mark_failure(request.model, channel, e)
                 logger.error(f"Unexpected error with channel {channel.name}: {format_error_message(e)}")
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
@@ -979,7 +979,7 @@ async def _handle_streaming_request(
                 stream_usage.observe(error_usage)
             logger.error(f"Streaming error: {format_error_message(e)}")
             if isinstance(e, EmptyUpstreamResponse) or should_fallback(e):
-                routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(e))
+                routing_engine.mark_failure(request.model, channel, e)
             latency_ms = int((time.time() - start_time) * 1000)
             attempt_latency_ms = (
                 attempt_context.elapsed_ms() if attempt_context is not None else None

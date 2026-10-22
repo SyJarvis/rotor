@@ -41,6 +41,9 @@ class UpstreamErrorFact(BaseModel):
     retry_same_channel: bool
     fallback_allowed: bool
     retry_after_seconds: float | None = None
+    # Plan-level usage limits block every model on the channel until the billing
+    # window resets, unlike per-endpoint rate limits that only cool one model.
+    channel_wide_cooldown: bool = False
     message: str
     sanitized_body: Any | None = None
     provider_request_ids: dict[str, str] = Field(default_factory=dict)

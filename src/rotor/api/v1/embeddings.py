@@ -397,7 +397,7 @@ async def create_embeddings(
             except (HTTPStatusError, RequestError, UpstreamProtocolError) as exc:
                 last_error = exc
                 if should_fallback(exc):
-                    routing_engine.mark_unavailable(embedding_request.model, channel, retry_after_seconds(exc))
+                    routing_engine.mark_failure(embedding_request.model, channel, exc)
                 await _record_failure(
                     db,
                     token=token,

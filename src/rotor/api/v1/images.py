@@ -311,7 +311,7 @@ async def _stream_image_response(
             yield block
     except Exception as exc:
         if should_fallback(exc):
-            routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(exc))
+            routing_engine.mark_failure(request.model, channel, exc)
         logger.exception("Image generation stream failed for request_id=%s", request_id)
         attempt_latency_ms = (
             attempt_context.elapsed_ms() if attempt_context is not None else None
@@ -533,7 +533,7 @@ async def generate_image(
             except (HTTPStatusError, RequestError) as exc:
                 last_error = exc
                 if should_fallback(exc):
-                    routing_engine.mark_unavailable(image_request.model, channel, retry_after_seconds(exc))
+                    routing_engine.mark_failure(image_request.model, channel, exc)
                 await _record_failure(
                     db,
                     token=token,

@@ -705,7 +705,7 @@ async def create_response(
             except (HTTPStatusError, RequestError) as exc:
                 last_error = exc
                 if should_fallback(exc):
-                    routing_engine.mark_unavailable(chat_request.model, channel, retry_after_seconds(exc))
+                    routing_engine.mark_failure(chat_request.model, channel, exc)
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
                 error_fact = normalize_upstream_error(exc)
@@ -755,7 +755,7 @@ async def create_response(
             except Exception as exc:
                 last_error = exc
                 if should_fallback(exc):
-                    routing_engine.mark_unavailable(chat_request.model, channel, retry_after_seconds(exc))
+                    routing_engine.mark_failure(chat_request.model, channel, exc)
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
                 if isinstance(exc, (UpstreamProtocolError, UpstreamOverloaded)) and not attempt_context.recorded:
@@ -988,7 +988,7 @@ async def _native_collection_request(
             except (HTTPStatusError, RequestError) as exc:
                 last_error = exc
                 if should_fallback(exc):
-                    routing_engine.mark_unavailable(model, channel, retry_after_seconds(exc))
+                    routing_engine.mark_failure(model, channel, exc)
                     continue
                 if isinstance(exc, HTTPStatusError):
                     return _upstream_error(exc)

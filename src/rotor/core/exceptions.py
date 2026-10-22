@@ -157,6 +157,38 @@ def _parse_retry_after(value: str | None) -> float | None:
     return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
+_PLAN_LIMIT_ERROR_TYPES = {"usage_limit_reached", "insufficient_quota"}
+# ChatGPT plan windows roll over at most every few hours; anything larger is
+# treated as corrupt upstream data rather than a cooldown to honor.
+_PLAN_RESET_MAX_SECONDS = 6 * 3600.0
+
+
+def _plan_reset_seconds(body: Any) -> float | None:
+    """Extract the reset delay of a plan-level usage limit from an error body.
+
+    ChatGPT reports exhausted plan windows (for example the Codex 5-hour Plus
+    limit) as ``error.type=usage_limit_reached`` with ``resets_at``/``resets_in_seconds``.
+    The absolute deadline is preferred over the relative field because the two
+    have been observed to disagree.
+    """
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if not isinstance(error, dict) or error.get("type") not in _PLAN_LIMIT_ERROR_TYPES:
+        return None
+    seconds: float | None = None
+    resets_at = error.get("resets_at")
+    if isinstance(resets_at, (int, float)) and math.isfinite(resets_at):
+        seconds = float(resets_at) - time()
+    if seconds is None or seconds < 0:
+        resets_in = error.get("resets_in_seconds")
+        if isinstance(resets_in, (int, float)) and math.isfinite(resets_in):
+            seconds = float(resets_in)
+    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+        return None
+    return min(seconds, _PLAN_RESET_MAX_SECONDS)
+
+
 def normalize_upstream_error(
     exc: Exception,
     *,
@@ -176,6 +208,7 @@ def normalize_upstream_error(
         provider_request_ids = provider_error["request_ids"]
 
     retry_after = None
+    channel_wide = False
     if isinstance(exc, httpx.TimeoutException):
         code = "upstream_timeout"
         category = ErrorCategory.TIMEOUT
@@ -218,6 +251,13 @@ def normalize_upstream_error(
         )
         if fallback_allowed:
             retry_after = _parse_retry_after(exc.response.headers.get("retry-after"))
+        plan_reset = _plan_reset_seconds(sanitized_body)
+        if plan_reset is not None:
+            # The plan window blocks the whole account, so immediate same-channel
+            # retries are pointless; cool every model until the window resets.
+            retry_after = max(retry_after or 0.0, plan_reset)
+            retry_same_channel = False
+            channel_wide = True
         message = f"Upstream returned HTTP {status_code}"
     elif isinstance(exc, httpx.RequestError):
         code = "upstream_connection_failed"
@@ -255,6 +295,7 @@ def normalize_upstream_error(
         retry_same_channel=retry_same_channel,
         fallback_allowed=fallback_allowed,
         retry_after_seconds=retry_after,
+        channel_wide_cooldown=channel_wide,
         message=message,
         sanitized_body=sanitized_body,
         provider_request_ids=provider_request_ids,

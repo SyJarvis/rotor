@@ -8,6 +8,7 @@ from threading import RLock
 from typing import Callable, Iterable, Optional
 
 from rotor.application_settings import application_settings
+from rotor.core.exceptions import normalize_upstream_error
 from rotor.models.channel import Channel
 from rotor.models.token import Token
 from rotor.services.loadbalancer import LoadBalancer
@@ -316,6 +317,8 @@ class RoutingEngine:
         model: str,
         channel: Channel,
         cooldown_seconds: float | None = None,
+        *,
+        channel_wide: bool = False,
     ) -> None:
         """Temporarily suppress a channel after a retryable provider failure."""
         if cooldown_seconds is None:
@@ -326,20 +329,37 @@ class RoutingEngine:
                 cooldown_seconds = 30
         if not math.isfinite(cooldown_seconds) or cooldown_seconds < 0:
             cooldown_seconds = 30
+        targets = [model]
+        if channel_wide:
+            # Plan-level limits (e.g. ChatGPT Codex usage_limit_reached) block the
+            # whole account, so every model the channel serves must cool down,
+            # not just the one that happened to hit the error first.
+            targets += [entry for entry in (channel.models or []) if entry != model]
         with self._lock:
-            key = (model, channel.id)
-            state = self._cooldowns.get(key)
-            if state is None:
-                self._cooldowns[key] = _Cooldown(
-                    self._now() + cooldown_seconds,
-                    cooldown_seconds=cooldown_seconds,
-                )
-            else:
-                deadline = self._now() + cooldown_seconds
-                if deadline > state.deadline:
-                    state.cooldown_seconds = cooldown_seconds
-                state.deadline = max(state.deadline, deadline)
-                state.generation += 1
+            for target in targets:
+                key = (target, channel.id)
+                state = self._cooldowns.get(key)
+                if state is None:
+                    self._cooldowns[key] = _Cooldown(
+                        self._now() + cooldown_seconds,
+                        cooldown_seconds=cooldown_seconds,
+                    )
+                else:
+                    deadline = self._now() + cooldown_seconds
+                    if deadline > state.deadline:
+                        state.cooldown_seconds = cooldown_seconds
+                    state.deadline = max(state.deadline, deadline)
+                    state.generation += 1
+
+    def mark_failure(self, model: str, channel: Channel, exc: Exception) -> None:
+        """Cool a channel based on a provider failure's normalized error fact."""
+        fact = normalize_upstream_error(exc)
+        self.mark_unavailable(
+            model,
+            channel,
+            fact.retry_after_seconds,
+            channel_wide=fact.channel_wide_cooldown,
+        )
 
     def clear_cooldown(self, model: str | None, channel_id: int) -> list[str]:
         """Clear process-local cooldowns for one model or an entire channel."""

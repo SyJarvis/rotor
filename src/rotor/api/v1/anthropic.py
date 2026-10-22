@@ -559,7 +559,7 @@ async def count_message_tokens(
                 except Exception as exc:
                     last_error = exc
                     if should_fallback(exc):
-                        routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(exc))
+                        routing_engine.mark_failure(request.model, channel, exc)
                         continue
                     raise
                 finally:
@@ -880,7 +880,7 @@ async def messages(
             except (HTTPStatusError, RequestError) as e:
                 last_error = e
                 if should_fallback(e):
-                    routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(e))
+                    routing_engine.mark_failure(request.model, channel, e)
                 logger.warning(f"Channel {channel.name} failed: {format_error_message(e)}")
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
@@ -1377,7 +1377,7 @@ async def _handle_streaming_request(
                 e.upstream_status = response.status_code
             logger.error(f"Streaming error: {format_error_message(e)}")
             if should_fallback(e):
-                routing_engine.mark_unavailable(anthropic_request.model, channel, retry_after_seconds(e))
+                routing_engine.mark_failure(anthropic_request.model, channel, e)
             latency_ms = int((time.time() - start_time) * 1000)
             attempt_latency_ms = (
                 attempt_context.elapsed_ms() if attempt_context is not None else None
