@@ -8,7 +8,7 @@ import {
   skeletonCards, showInline, hideInline, refreshIcons, toast,
 } from "../ui.js";
 
-let state = { channels: [], filter: { q: "", provider: "", status: "" }, testResult: {}, authSyncError: {}, openMenu: null, routingState: {}, routingError: null };
+let state = { channels: [], filter: { q: "", provider: "", status: "" }, testResult: {}, authSyncError: {}, openMenu: null, routingState: {}, routingError: null, quota: {} };
 
 export const editState = { id: null, authType: "api_key", authStatus: null, authExpiresAt: null, authError: null, authSyncError: false };
 let editRequest = 0;
@@ -667,6 +667,7 @@ export async function load() {
     state.routingState = indexRoutingState(routingState);
     state.routingError = routingError;
     render();
+    void loadQuota();
   } catch (e) {
     if (!active || generation !== loadGeneration) return;
     container.innerHTML = `<div class="empty-state"><i data-lucide="alert-circle"></i><h3>${escapeHtml(e.message)}</h3></div>`;
@@ -674,6 +675,97 @@ export async function load() {
   } finally {
     if (active && generation === loadGeneration) scheduleRoutingPoll();
   }
+}
+
+const QUOTA_FRESH_MS = 90_000;
+
+async function loadQuota(forceId = null) {
+  const targets = state.channels.filter(
+    (c) => c.auth_type === "oauth" && (!forceId || String(c.id) === String(forceId)),
+  );
+  let changed = false;
+  await Promise.all(targets.map(async (c) => {
+    const cached = state.quota[c.id];
+    if (!forceId && cached?.fetchedAt && Date.now() - cached.fetchedAt < QUOTA_FRESH_MS) return;
+    if (cached?.loading) return;
+    state.quota[c.id] = { ...cached, loading: true };
+    changed = true;
+    try {
+      const data = await api(`/api/admin/channels/${c.id}/oauth/usage${forceId ? "?refresh=1" : ""}`);
+      state.quota[c.id] = { loading: false, data, fetchedAt: Date.now() };
+    } catch (error) {
+      // 404 = this server build predates quota reporting; hide the block instead of nagging.
+      state.quota[c.id] = { loading: false, error, unsupported: error?.status === 404 };
+    }
+  }));
+  if (changed) render();
+}
+
+function quotaTone(percent) {
+  if (percent == null) return "";
+  if (percent >= 90) return "danger";
+  if (percent >= 60) return "warn";
+  return "ok";
+}
+
+function fmtDuration(ms) {
+  const minutes = Math.max(0, Math.round(ms / 60000));
+  if (minutes < 60) return `${minutes}${t("oauthUnitM")}`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) {
+    return minutes % 60 ? `${hours}${t("oauthUnitH")} ${minutes % 60}${t("oauthUnitM")}` : `${hours}${t("oauthUnitH")}`;
+  }
+  return `${Math.round(hours / 24)}${t("oauthUnitD")}`;
+}
+
+function renderOAuthBlock(c) {
+  const expiry = Number(c.auth_expires_at);
+  let head = "";
+  if (expiry > 0 && Number.isFinite(expiry)) {
+    const leftMs = expiry * 1000 - Date.now();
+    const full = new Date(expiry * 1000).toLocaleString();
+    const label = leftMs <= 0 ? t("oauthTokenExpired") : `${fmtDuration(leftMs)} ${t("oauthExpiresSuffix")}`;
+    head = `<span class="oauth-expiry${leftMs < 3600000 ? " danger" : ""}" title="${t("oauthExpiry")}: ${full}">${escapeHtml(label)}</span>`;
+  }
+  const errorText = c.auth_error ? `<span class="oauth-quota-error">${escapeHtml(c.auth_error)}</span>` : "";
+  const q = state.quota[c.id];
+  let quotaHtml = "";
+  if (q?.loading) {
+    quotaHtml = `<span class="muted text-sm">${t("oauthQuotaLoading")}</span>`;
+  } else if (q?.unsupported) {
+    quotaHtml = "";
+  } else if (q?.error) {
+    quotaHtml = `<span class="oauth-quota-error">${t("oauthQuotaFailed")}</span>
+      <button class="oauth-quota-retry" data-channel-quota-refresh="${c.id}">${t("oauthRetry")}</button>`;
+  } else if (q?.data) {
+    const d = q.data;
+    const row = (label, win) => {
+      const pct = win?.used_percent ?? 0;
+      const resetTitle = win?.reset_after_seconds != null
+        ? `${t("oauthResetsIn")} ${fmtDuration(win.reset_after_seconds * 1000)}` : "";
+      return `<div class="quota-row" title="${escapeHtml(resetTitle)}">
+        <span class="quota-label">${escapeHtml(label)}</span>
+        <div class="quota-bar"><div class="quota-fill ${quotaTone(win?.used_percent)}" style="width:${Math.min(100, pct)}%"></div></div>
+        <span class="quota-val">${pct}%</span>
+      </div>`;
+    };
+    const limited = d.limit_reached
+      ? `<span class="quota-limited">${t("oauthLimitReached")}${d.primary?.reset_after_seconds != null ? ` · ${t("oauthResetsIn")} ${fmtDuration(d.primary.reset_after_seconds * 1000)}` : ""}</span>`
+      : "";
+    quotaHtml = `<div class="quota-rows">
+      ${row(t("oauthQuota5h"), d.primary)}
+      ${row(t("oauthQuotaWeek"), d.secondary)}
+      <div class="quota-foot">
+        ${limited}
+        <span class="muted text-sm">${escapeHtml(d.plan || "")}</span>
+        <button class="icon-btn" data-channel-quota-refresh="${c.id}" title="${t("oauthQuotaRefresh")}" aria-label="${t("oauthQuotaRefresh")}">
+          <i data-lucide="refresh-cw"></i>
+        </button>
+      </div>
+    </div>`;
+  }
+  if (!head && !errorText && !quotaHtml) return "";
+  return `<div class="oauth-block">${head}${errorText}${quotaHtml}</div>`;
 }
 
 export function render() {
@@ -789,7 +881,7 @@ function renderCard(c) {
         ${statusBadge(c.enabled)}
       </div>
       <div class="ch-base" title="${escapeHtml(c.base_url || "")}">${escapeHtml(c.base_url || "")}</div>
-      ${c.auth_type === "oauth" ? `<p class="muted text-sm">${escapeHtml(savedOAuthDetails(c, state.authSyncError[c.id]))}</p>` : ""}
+      ${c.auth_type === "oauth" ? renderOAuthBlock(c) : ""}
       ${cooling ? `<div class="ch-meta cooldown-row">${routingBadges(c.id)}</div>` : ""}
       <div class="chips">
         ${models.map((m) => `<span class="chip">${escapeHtml(m)}</span>`).join("")}
@@ -850,6 +942,12 @@ export async function onClick(target) {
   const resetCooldown = target.closest("[data-channel-cooldown-reset]")?.dataset.channelCooldownReset;
   if (resetCooldown) {
     await resetChannelCooldown(resetCooldown);
+    return true;
+  }
+
+  const quotaRefresh = target.closest("[data-channel-quota-refresh]")?.dataset.channelQuotaRefresh;
+  if (quotaRefresh) {
+    await loadQuota(quotaRefresh);
     return true;
   }
 

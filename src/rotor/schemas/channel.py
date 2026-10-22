@@ -157,6 +157,26 @@ class ChannelListItem(BaseModel):
     failed_requests: int
 
 
+class ChannelUsageWindow(BaseModel):
+    """One ChatGPT plan usage window (5-hour primary or weekly secondary)."""
+
+    used_percent: Optional[float] = None
+    window_seconds: Optional[int] = None
+    reset_after_seconds: Optional[int] = None
+    reset_at: Optional[float] = None
+
+
+class ChannelUsageResponse(BaseModel):
+    """ChatGPT plan usage snapshot for an OAuth channel."""
+
+    plan: Optional[str] = None
+    allowed: Optional[bool] = None
+    limit_reached: Optional[bool] = None
+    primary: Optional[ChannelUsageWindow] = None
+    secondary: Optional[ChannelUsageWindow] = None
+    fetched_at: float
+
+
 class ChannelCooldownState(BaseModel):
     """Process-local routing cooldown for one `(model, channel)` pair."""
 

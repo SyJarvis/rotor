@@ -29,6 +29,9 @@ AUTHORIZE_URL = f"{AUTH_BASE_URL}/oauth/authorize"
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 SCOPE = "openid profile email offline_access"
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+# chatgpt.com's edge rejects non-browser/non-CLI agents on some backend GET routes
+# with a 403 HTML block page; presenting the Codex CLI user agent keeps them reachable.
+CODEX_CLI_UA = "codex_cli_rs/0.44.0 (Linux 6.12; arm64) unknown (unknown)"
 # The model catalog uses Codex protocol compatibility, independently of Rotor's version.
 CATALOG_CLIENT_VERSION = "0.161.0"
 HTTP_TIMEOUT = 15.0
@@ -192,6 +195,39 @@ async def fetch_model_catalog(client: httpx.AsyncClient, credential: OAuthCreden
         return models, len(entries)
     except (ValueError, TypeError, UnicodeDecodeError):
         raise OAuthError("ChatGPT returned an invalid model catalog; try again", 502) from None
+
+
+async def fetch_codex_usage(client: httpx.AsyncClient, credential: OAuthCredentials) -> dict:
+    """Fetch the account's plan usage (rate-limit windows, credits) from Codex."""
+    try:
+        async with asyncio.timeout(HTTP_TIMEOUT):
+            response = await client.get(
+                CODEX_BASE_URL + "/usage",
+                headers={
+                    "Authorization": "Bearer " + credential.access_token,
+                    "chatgpt-account-id": credential.account_id,
+                    "originator": "rotor",
+                    "Accept": "application/json",
+                    "User-Agent": CODEX_CLI_UA,
+                },
+                timeout=HTTP_TIMEOUT,
+                follow_redirects=False,
+            )
+    except (httpx.HTTPError, TimeoutError):
+        raise OAuthError("ChatGPT usage is temporarily unavailable; try again", 503) from None
+    if response.status_code == 401:
+        raise OAuthError("ChatGPT usage authorization failed; sign in again", auth_status="reauth_required")
+    if response.status_code == 403:
+        raise OAuthError("ChatGPT usage access was denied; try again", 503)
+    if not response.is_success:
+        raise OAuthError("ChatGPT usage is temporarily unavailable; try again", 503)
+    try:
+        payload = _json(response)
+    except OAuthError:
+        raise OAuthError("ChatGPT returned an invalid usage payload; try again", 502) from None
+    if not isinstance(payload, dict) or not isinstance(payload.get("rate_limit"), dict):
+        raise OAuthError("ChatGPT returned an invalid usage payload; try again", 502) from None
+    return payload
 
 
 async def probe_saved_models(db: AsyncSession, client: httpx.AsyncClient, channel: Channel) -> tuple[list[str], int]:

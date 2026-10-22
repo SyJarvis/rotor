@@ -19,6 +19,7 @@ from rotor.services.chatgpt_oauth import (
     clear_credential_values,
     consume_session,
     credential_values,
+    fetch_codex_usage,
     probe_saved_models,
     resolve_oauth_credentials,
     validate_configuration,
@@ -32,6 +33,8 @@ from rotor.schemas.channel import (
     ChannelResponse,
     ChannelRoutingStateResponse,
     ChannelUpdate,
+    ChannelUsageResponse,
+    ChannelUsageWindow,
     ProbeModelsResponse,
 )
 from rotor.schemas.request import (
@@ -390,6 +393,87 @@ async def probe_models(
         ) from exc
     latency_ms = int((time.perf_counter() - start) * 1000)
     return ProbeModelsResponse(models=models, latency_ms=latency_ms, raw_count=len(models))
+
+
+# Admin UI cards poll this while the page is open; cache briefly so several
+# viewers (or rapid re-renders) do not multiply upstream usage calls.
+_usage_cache: dict[int, tuple[float, ChannelUsageResponse]] = {}
+_USAGE_CACHE_TTL_SECONDS = 90.0
+_USAGE_RESET_MAX_SECONDS = 6 * 3600.0
+
+
+def _window(payload: dict | None) -> ChannelUsageWindow:
+    data = payload if isinstance(payload, dict) else {}
+    return ChannelUsageWindow(
+        used_percent=data.get("used_percent"),
+        window_seconds=data.get("limit_window_seconds"),
+        reset_after_seconds=data.get("reset_after_seconds"),
+        reset_at=data.get("reset_at"),
+    )
+
+
+@router.get("/{channel_id}/oauth/usage", response_model=ChannelUsageResponse)
+async def get_channel_oauth_usage(
+    channel_id: int,
+    refresh: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """Current ChatGPT plan usage for an OAuth channel.
+
+    When the plan reports an exhausted window, every model on the channel is
+    cooled down until the window resets so routing stops selecting it instead of
+    collecting a 429 per model.
+    """
+    cached = _usage_cache.get(channel_id)
+    now = time.time()
+    if cached and not refresh and now - cached[0] < _USAGE_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    result = await db.execute(select(Channel).where(Channel.id == channel_id))
+    channel = result.scalar_one_or_none()
+    if not channel:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Channel {channel_id} not found",
+        )
+    if channel.auth_type != "oauth":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Channel is not an OAuth channel",
+        )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            credential = await resolve_oauth_credentials(channel, client)
+            payload = await fetch_codex_usage(client, credential)
+    except OAuthError as exc:
+        raise HTTPException(
+            status_code=exc.status_code if exc.status_code >= 500 else status.HTTP_502_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    rate_limit = payload.get("rate_limit") or {}
+    usage = ChannelUsageResponse(
+        plan=payload.get("plan_type"),
+        allowed=rate_limit.get("allowed"),
+        limit_reached=rate_limit.get("limit_reached"),
+        primary=_window(rate_limit.get("primary_window")),
+        secondary=_window(rate_limit.get("secondary_window")),
+        fetched_at=now,
+    )
+    _usage_cache[channel_id] = (now, usage)
+
+    if usage.limit_reached:
+        primary = usage.primary or ChannelUsageWindow()
+        reset_seconds = primary.reset_after_seconds
+        if primary.reset_at:
+            reset_seconds = min(
+                max(primary.reset_at - now, 0.0), _USAGE_RESET_MAX_SECONDS
+            )
+        elif reset_seconds is None:
+            reset_seconds = 30.0
+        for model in {*(channel.models or [])}:
+            routing_engine.mark_unavailable(model, channel, reset_seconds)
+    return usage
 
 
 @router.post("/{channel_id}/test", response_model=ChannelTestResponse)
