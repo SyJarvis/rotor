@@ -33,6 +33,8 @@ from rotor.services.session_leases import get_session_lease_preference
 from rotor.core.user_access import AccountPrincipal, principal_scope_key, reload_principal
 from rotor.gateway.streaming import AdmissionStreamingResponse
 from rotor.gateway.fallback import (
+    ConnectRetry,
+    is_connect_failure,
     retry_after_seconds,
     set_routing_headers,
     should_fallback,
@@ -186,7 +188,17 @@ async def chat_completions(
         protocol="openai_chat",
     )
     try:
-        for attempt, channel in enumerate(candidates):
+        # The plan starts as the routed candidates; a connect failure inserts a
+        # same-channel retry right behind itself so a blip never scatters the
+        # session to another account (and its cold KV cache).
+        plan = list(candidates)
+        connect_retry = ConnectRetry()
+        attempt = -1
+        while True:
+            attempt += 1
+            if attempt >= len(plan):
+                break
+            channel = plan[attempt]
             admission = routing_engine.admit_attempt(request.model, channel)
             if admission is None:
                 continue
@@ -235,9 +247,17 @@ async def chat_completions(
 
             except (HTTPStatusError, RequestError) as e:
                 last_error = e
-                if should_fallback(e):
+                retry_delay = None
+                if should_fallback(e) and is_connect_failure(e):
+                    retry_delay = connect_retry.plan_retry(channel.id)
+                if retry_delay is not None:
+                    plan.insert(attempt + 1, channel)
+                elif should_fallback(e):
                     routing_engine.mark_failure(request.model, channel, e)
-                logger.warning(f"Channel {channel.name} failed: {format_error_message(e)}")
+                logger.warning(
+                    f"Channel {channel.name} failed: {format_error_message(e)}"
+                    + (f"; same-channel retry in {retry_delay}s" if retry_delay is not None else "")
+                )
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
                 error_fact = normalize_upstream_error(e)
@@ -279,6 +299,8 @@ async def chat_completions(
                     )
                 await db.commit()
                 if should_fallback(e):
+                    if retry_delay is not None:
+                        await asyncio.sleep(retry_delay)
                     continue
                 if conversation_handle:
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)

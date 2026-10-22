@@ -1,3 +1,4 @@
+import asyncio
 import time
 import uuid
 import json
@@ -50,6 +51,8 @@ from rotor.gateway.routing import routing_engine, session_lease_success_reason
 from rotor.services.session_leases import get_session_lease_preference
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.fallback import (
+    ConnectRetry,
+    is_connect_failure,
     retry_after_seconds,
     set_routing_headers,
     should_fallback,
@@ -555,7 +558,17 @@ async def create_response(
         protocol="openai_responses",
     )
     try:
-        for attempt, channel in enumerate(routing_candidates):
+        # The plan starts as the routed candidates; a connect failure inserts a
+        # same-channel retry right behind itself so a blip never scatters the
+        # session to another account (and its cold KV cache).
+        plan = list(routing_candidates)
+        connect_retry = ConnectRetry()
+        attempt = -1
+        while True:
+            attempt += 1
+            if attempt >= len(plan):
+                break
+            channel = plan[attempt]
             admission = routing_engine.admit_attempt(chat_request.model, channel)
             if admission is None:
                 continue
@@ -704,7 +717,12 @@ async def create_response(
 
             except (HTTPStatusError, RequestError) as exc:
                 last_error = exc
-                if should_fallback(exc):
+                retry_delay = None
+                if should_fallback(exc) and is_connect_failure(exc):
+                    retry_delay = connect_retry.plan_retry(channel.id)
+                if retry_delay is not None:
+                    plan.insert(attempt + 1, channel)
+                elif should_fallback(exc):
                     routing_engine.mark_failure(chat_request.model, channel, exc)
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
@@ -747,6 +765,8 @@ async def create_response(
                     )
                 await db.commit()
                 if should_fallback(exc):
+                    if retry_delay is not None:
+                        await asyncio.sleep(retry_delay)
                     continue
                 if conversation_handle:
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)

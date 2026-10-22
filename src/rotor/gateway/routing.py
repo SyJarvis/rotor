@@ -9,6 +9,7 @@ from typing import Callable, Iterable, Optional
 
 from rotor.application_settings import application_settings
 from rotor.core.exceptions import normalize_upstream_error
+from rotor.gateway.fallback import CONNECT_COOLDOWN_SECONDS, is_connect_failure
 from rotor.models.channel import Channel
 from rotor.models.token import Token
 from rotor.services.loadbalancer import LoadBalancer
@@ -354,10 +355,15 @@ class RoutingEngine:
     def mark_failure(self, model: str, channel: Channel, exc: Exception) -> None:
         """Cool a channel based on a provider failure's normalized error fact."""
         fact = normalize_upstream_error(exc)
+        cooldown = fact.retry_after_seconds
+        if cooldown is None and is_connect_failure(exc):
+            # Connect blips are short-lived; a long exile would scatter the
+            # session's cache across accounts while the channel recovers.
+            cooldown = CONNECT_COOLDOWN_SECONDS
         self.mark_unavailable(
             model,
             channel,
-            fact.retry_after_seconds,
+            cooldown,
             channel_wide=fact.channel_wide_cooldown,
         )
 
