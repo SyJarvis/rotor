@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 import rotor.api.admin.channels as channels_api
 from rotor.api.admin.channels import router
 from rotor.database import Base, get_db
+import rotor.models.admin_auth  # noqa: F401 - registers admin_users for Base.metadata.create_all
 from rotor.models.channel import Channel
 from rotor.core.exceptions import UpstreamProtocolError
 
