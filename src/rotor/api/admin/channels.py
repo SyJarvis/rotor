@@ -14,6 +14,11 @@ from rotor.core.exceptions import format_error_message
 from rotor.gateway.routing import routing_engine
 from rotor.models.channel import Channel
 from rotor.models.log import RequestLog
+from rotor.services.zhipu_quota import (
+    ZhipuQuotaError,
+    fetch_zhipu_usage,
+    is_zhipu_quota_channel,
+)
 from rotor.services.chatgpt_oauth import (
     OAuthError,
     clear_credential_values,
@@ -418,8 +423,10 @@ async def get_channel_oauth_usage(
     refresh: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
-    """Current ChatGPT plan usage for an OAuth channel.
+    """Current subscription usage for a channel with a quota provider.
 
+    Covers ChatGPT OAuth channels (Codex plan windows) and API-key Zhipu
+    channels (GLM Coding Plan rolling windows, matched by base-URL host).
     When the plan reports an exhausted window, every model on the channel is
     cooled down until the window resets so routing stops selecting it instead of
     collecting a 429 per model.
@@ -436,30 +443,36 @@ async def get_channel_oauth_usage(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Channel {channel_id} not found",
         )
-    if channel.auth_type != "oauth":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Channel is not an OAuth channel",
-        )
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            credential = await resolve_oauth_credentials(channel, client)
-            payload = await fetch_codex_usage(client, credential)
+        if channel.auth_type == "oauth":
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                credential = await resolve_oauth_credentials(channel, client)
+                payload = await fetch_codex_usage(client, credential)
+            rate_limit = payload.get("rate_limit") or {}
+            usage = ChannelUsageResponse(
+                plan=payload.get("plan_type"),
+                allowed=rate_limit.get("allowed"),
+                limit_reached=rate_limit.get("limit_reached"),
+                primary=_window(rate_limit.get("primary_window")),
+                secondary=_window(rate_limit.get("secondary_window")),
+                fetched_at=now,
+            )
+        elif is_zhipu_quota_channel(channel):
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                usage = await fetch_zhipu_usage(client, channel)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Channel has no quota provider (OAuth or Zhipu required)",
+            )
     except OAuthError as exc:
         raise HTTPException(
             status_code=exc.status_code if exc.status_code >= 500 else status.HTTP_502_BAD_REQUEST,
             detail=str(exc),
         ) from exc
+    except ZhipuQuotaError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
-    rate_limit = payload.get("rate_limit") or {}
-    usage = ChannelUsageResponse(
-        plan=payload.get("plan_type"),
-        allowed=rate_limit.get("allowed"),
-        limit_reached=rate_limit.get("limit_reached"),
-        primary=_window(rate_limit.get("primary_window")),
-        secondary=_window(rate_limit.get("secondary_window")),
-        fetched_at=now,
-    )
     _usage_cache[channel_id] = (now, usage)
 
     if usage.limit_reached:

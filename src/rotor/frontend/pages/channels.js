@@ -679,9 +679,16 @@ export async function load() {
 
 const QUOTA_FRESH_MS = 90_000;
 
+function hasUsagePanel(c) {
+  if (c.auth_type === "oauth") return true;
+  // Zhipu GLM Coding Plan channels are generic openai/anthropic types; their
+  // base URL is the discriminator the backend uses too.
+  return /bigmodel\.cn|z\.ai/.test(c.base_url || "");
+}
+
 async function loadQuota(forceId = null) {
   const targets = state.channels.filter(
-    (c) => c.auth_type === "oauth" && (!forceId || String(c.id) === String(forceId)),
+    (c) => hasUsagePanel(c) && (!forceId || String(c.id) === String(forceId)),
   );
   let changed = false;
   await Promise.all(targets.map(async (c) => {
@@ -721,7 +728,7 @@ function fmtDuration(ms) {
 function renderOAuthBlock(c) {
   const expiry = Number(c.auth_expires_at);
   let head = "";
-  if (expiry > 0 && Number.isFinite(expiry)) {
+  if (c.auth_type === "oauth" && expiry > 0 && Number.isFinite(expiry)) {
     const leftMs = expiry * 1000 - Date.now();
     const full = new Date(expiry * 1000).toLocaleString();
     const label = leftMs <= 0 ? t("oauthTokenExpired") : `${fmtDuration(leftMs)} ${t("oauthExpiresSuffix")}`;
@@ -881,7 +888,7 @@ function renderCard(c) {
         ${statusBadge(c.enabled)}
       </div>
       <div class="ch-base" title="${escapeHtml(c.base_url || "")}">${escapeHtml(c.base_url || "")}</div>
-      ${c.auth_type === "oauth" ? renderOAuthBlock(c) : ""}
+      ${hasUsagePanel(c) ? renderOAuthBlock(c) : ""}
       ${cooling ? `<div class="ch-meta cooldown-row">${routingBadges(c.id)}</div>` : ""}
       <div class="chips">
         ${models.map((m) => `<span class="chip">${escapeHtml(m)}</span>`).join("")}
