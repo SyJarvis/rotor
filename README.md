@@ -183,12 +183,15 @@ Codex、Claude Code 和 OpenCode 的配置方式见
 | OpenAI Embeddings | `POST /v1/embeddings` |
 | OpenAI Images | `POST /v1/images/generations` |
 | Anthropic | `POST /anthropic/v1/messages`、`POST /anthropic/v1/messages/count_tokens`、`GET /anthropic/v1/models` |
-| 模型 | `GET /v1/models` |
+| 模型 | `GET /v1/models`、`GET /v1/models/{id}` |
+| 用量 | `GET /v1/usage`(令牌配额 + 上游计划窗口快照) |
 | 管理 API | `/api/admin/channels`、`/api/admin/tokens`、`/api/admin/logs`、`/api/admin/settings` |
 | 监控 | `/api/admin/monitoring/sources`、`/api/admin/monitoring/performance` |
 | Control API | `/api/control/v1/channels`、请求 trace、近期失败、模型用量和 Session Lease 评估 |
 
 Responses API 支持创建、查询、取消、删除、输入项查询、输入 Token 计数和 compact。
+
+coding agent(pi agent、opencode、Claude Code、Codex CLI 等)的接入方式见 [docs/agent-integration.md](docs/agent-integration.md)。
 当上游是原生 Responses Channel 时，Rotor 会把后续资源操作路由回原 Channel 和账号。
 
 ## 路由策略
