@@ -26,6 +26,7 @@ from rotor.models.admin_auth import (
     AdminUser,
 )
 from rotor.models.channel import Channel
+from rotor.models.token import Token
 from rotor.services.admin_security import (
     login_retry_after_seconds,
     record_login_failure,
@@ -389,24 +390,28 @@ def test_main_admin_routes_are_protected_but_probe_remains_public() -> None:
     assert asyncio.run(exercise()) == (401, 200)
 
 
-def test_model_list_remains_public_without_rotor_token() -> None:
-    async def exercise() -> tuple[int, list[str]]:
+def test_model_list_requires_rotor_token() -> None:
+    async def exercise() -> tuple[int, int, list[str]]:
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+        key = settings.API_KEY_PREFIX + "model-list-credential"
         async with sessions() as db:
-            db.add(Channel(
-                name="public-models",
-                type="openai",
-                key="provider-key",
-                base_url="https://example.test/v1",
-                models=["model-a"],
-                model_mapping={},
-                enabled=True,
-                protocol="openai",
-                extra={},
-            ))
+            db.add_all([
+                Channel(
+                    name="public-models",
+                    type="openai",
+                    key="provider-key",
+                    base_url="https://example.test/v1",
+                    models=["model-a"],
+                    model_mapping={},
+                    enabled=True,
+                    protocol="openai",
+                    extra={},
+                ),
+                Token(key=key, name="model-list", enabled=True),
+            ])
             await db.commit()
 
         app = FastAPI()
@@ -421,10 +426,13 @@ def test_model_list_remains_public_without_rotor_token() -> None:
             transport=ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/v1/models")
+            anonymous = await client.get("/v1/models")
+            authorized = await client.get("/v1/models", headers={"Authorization": f"Bearer {key}"})
         await engine.dispose()
-        return response.status_code, [
-            model["id"] for model in response.json()["data"]
-        ]
+        return (
+            anonymous.status_code,
+            authorized.status_code,
+            [model["id"] for model in authorized.json()["data"]],
+        )
 
-    assert asyncio.run(exercise()) == (200, ["model-a"])
+    assert asyncio.run(exercise()) == (401, 200, ["model-a"])

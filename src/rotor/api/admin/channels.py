@@ -29,6 +29,7 @@ from rotor.services.chatgpt_oauth import (
     resolve_oauth_credentials,
     validate_configuration,
 )
+from rotor.services import usage_cache
 from rotor.schemas.channel import (
     ChannelCooldownResetRequest,
     ChannelCooldownResetResponse,
@@ -402,8 +403,6 @@ async def probe_models(
 
 # Admin UI cards poll this while the page is open; cache briefly so several
 # viewers (or rapid re-renders) do not multiply upstream usage calls.
-_usage_cache: dict[int, tuple[float, ChannelUsageResponse]] = {}
-_USAGE_CACHE_TTL_SECONDS = 90.0
 _USAGE_RESET_MAX_SECONDS = 6 * 3600.0
 
 
@@ -431,10 +430,10 @@ async def get_channel_oauth_usage(
     cooled down until the window resets so routing stops selecting it instead of
     collecting a 429 per model.
     """
-    cached = _usage_cache.get(channel_id)
     now = time.time()
-    if cached and not refresh and now - cached[0] < _USAGE_CACHE_TTL_SECONDS:
-        return cached[1]
+    cached = usage_cache.fresh(channel_id, now=now)
+    if cached and not refresh:
+        return cached
 
     result = await db.execute(select(Channel).where(Channel.id == channel_id))
     channel = result.scalar_one_or_none()
@@ -473,7 +472,7 @@ async def get_channel_oauth_usage(
     except ZhipuQuotaError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
-    _usage_cache[channel_id] = (now, usage)
+    usage_cache.store(channel_id, usage, now=now)
 
     if usage.limit_reached:
         primary = usage.primary or ChannelUsageWindow()

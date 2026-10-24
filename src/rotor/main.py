@@ -26,7 +26,7 @@ from rotor.core.anthropic_errors import (
 )
 from rotor.core.middleware import LoggingMiddleware
 from rotor.core.logging_config import LOG_FORMAT, configure_file_logging
-from rotor.api.v1 import chat, embeddings, images, models, anthropic, responses
+from rotor.api.v1 import chat, embeddings, images, models, anthropic, responses, usage
 from rotor.api.v1 import anthropic_models
 from rotor.api.admin import (
     auth as admin_auth,
@@ -205,6 +205,7 @@ app.include_router(responses.router, prefix=settings.API_V1_STR, tags=["response
 app.include_router(embeddings.router, prefix=settings.API_V1_STR, tags=["embeddings"])
 app.include_router(images.router, prefix=settings.API_V1_STR, tags=["images"])
 app.include_router(models.router, prefix=settings.API_V1_STR, tags=["models"])
+app.include_router(usage.router, prefix=settings.API_V1_STR, tags=["usage"])
 # Anthropic-compatible endpoint
 app.include_router(anthropic.router, prefix="/anthropic/v1", tags=["anthropic"])
 app.include_router(anthropic_models.router, prefix="/anthropic/v1", tags=["anthropic"])
