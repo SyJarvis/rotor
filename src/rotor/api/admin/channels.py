@@ -14,11 +14,7 @@ from rotor.core.exceptions import format_error_message
 from rotor.gateway.routing import routing_engine
 from rotor.models.channel import Channel
 from rotor.models.log import RequestLog
-from rotor.services.zhipu_quota import (
-    ZhipuQuotaError,
-    fetch_zhipu_usage,
-    is_zhipu_quota_channel,
-)
+from rotor.services import usage_cache
 from rotor.services.chatgpt_oauth import (
     OAuthError,
     clear_credential_values,
@@ -29,7 +25,11 @@ from rotor.services.chatgpt_oauth import (
     resolve_oauth_credentials,
     validate_configuration,
 )
-from rotor.services import usage_cache
+from rotor.services.zhipu_quota import (
+    ZhipuQuotaError,
+    fetch_zhipu_usage,
+    is_zhipu_quota_channel,
+)
 from rotor.schemas.channel import (
     ChannelCooldownResetRequest,
     ChannelCooldownResetResponse,

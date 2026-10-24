@@ -1,8 +1,7 @@
 from rotor.adapters.base import OpenAICompatibleAdapter
 from rotor.adapters.protocol.anthropic import AnthropicAdapter
 from rotor.channels.presets import join_api_url
-from rotor.models.channel import Channel
-from httpx import AsyncClient, Response
+from httpx import Response
 from typing import AsyncIterator
 from copy import deepcopy
 from rotor.schemas.request import ChatCompletionRequest

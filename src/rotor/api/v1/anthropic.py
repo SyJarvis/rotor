@@ -3,8 +3,8 @@ import time
 import uuid
 import logging
 import json
-from typing import AsyncIterator, Optional
-from fastapi import APIRouter, Depends, Request, Response, status, Header
+from typing import Optional
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,10 +19,6 @@ from rotor.application_settings import application_settings
 from rotor.schemas.request import (
     AnthropicMessageRequest,
     AnthropicCountTokensRequest,
-    AnthropicMessageResponse,
-    AnthropicUsage,
-    AnthropicTextBlock,
-    ErrorResponse,
     ChatCompletionRequest,
     ChatMessage,
     Function,
@@ -47,7 +43,6 @@ from rotor.services.session_leases import get_session_lease_preference
 from rotor.core.user_access import AccountPrincipal, principal_scope_key, reload_principal
 from rotor.gateway.streaming import AdmissionStreamingResponse
 from rotor.gateway.fallback import (
-    retry_after_seconds,
     set_routing_headers,
     should_fallback,
 )

@@ -1,6 +1,5 @@
 from rotor.adapters.base import OpenAICompatibleAdapter
-from rotor.models.channel import Channel
-from httpx import AsyncClient, Response
+from httpx import Response
 from typing import AsyncIterator
 from rotor.schemas.request import ChatCompletionRequest
 

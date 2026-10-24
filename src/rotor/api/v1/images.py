@@ -9,7 +9,6 @@ import uuid
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, Request, Response
-from fastapi.responses import StreamingResponse
 from httpx import AsyncClient, HTTPStatusError, RequestError, Timeout
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,7 +34,6 @@ from rotor.gateway.provider_facts import (
 )
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.fallback import (
-    retry_after_seconds,
     set_routing_headers,
     should_fallback,
 )

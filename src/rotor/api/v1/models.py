@@ -1,5 +1,4 @@
 import time
-from typing import Any
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import select

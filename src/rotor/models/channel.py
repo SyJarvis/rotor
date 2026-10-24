@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Float, Integer, String, Text, JSON, Boolean, DateTime, func
+from sqlalchemy import Float, Integer, String, Text, JSON, Boolean, DateTime, func
 from sqlalchemy.orm import Mapped, mapped_column
 from rotor.database import Base
 from typing import Optional

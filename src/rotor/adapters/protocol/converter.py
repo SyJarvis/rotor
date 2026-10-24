@@ -1,23 +1,14 @@
-from typing import Any, List, Union, Dict, Mapping, Optional
+from typing import Any, List, Dict, Mapping, Optional
 from rotor.core.exceptions import UpstreamProtocolError
 from rotor.schemas.request import (
     ChatCompletionRequest,
-    ChatCompletionResponse,
-    ChatCompletionChunk,
     ChatMessage,
     Role,
     ToolCall,
     Tool,
     Usage,
-    ChatCompletionChoice,
-    ChatMessageResponse,
-    AnthropicMessageRequest,
-    AnthropicMessage,
     AnthropicMessageResponse,
     AnthropicUsage,
-    AnthropicTextBlock,
-    AnthropicToolUseBlock,
-    AnthropicToolResultBlock,
 )
 
 
@@ -413,7 +404,6 @@ class ProtocolConverter:
             if block.get("type") == "redacted_thinking":
                 raise UpstreamProtocolError("Redacted Anthropic thinking cannot be represented faithfully as Chat content")
             if block.get("type") == "tool_use":
-                import json
                 return {
                     "id": chunk_id,
                     "object": "chat.completion.chunk",

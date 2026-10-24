@@ -33,7 +33,6 @@ from rotor.gateway.provider_facts import (
 )
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.fallback import (
-    retry_after_seconds,
     set_routing_headers,
     should_fallback,
 )

@@ -35,7 +35,6 @@ from rotor.gateway.streaming import AdmissionStreamingResponse
 from rotor.gateway.fallback import (
     ConnectRetry,
     is_connect_failure,
-    retry_after_seconds,
     set_routing_headers,
     should_fallback,
 )

@@ -4,7 +4,6 @@ import time
 
 from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.engine import make_url
 from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool

@@ -9,7 +9,6 @@ from rotor.models.token import Token
 from rotor.models.channel import Channel
 from rotor.core.exceptions import AuthenticationException, ModelNotFoundException
 from rotor.core.security import validate_api_key_format
-from rotor.config import settings
 from rotor.core.user_access import AccountPrincipal, validate_token_access, effective_permissions
 
 security = HTTPBearer(auto_error=False)

@@ -319,7 +319,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         # Check rate limit
         if len(self.request_counts[client_id]) >= self.requests_per_minute:
-            from fastapi import status
             from rotor.core.exceptions import RateLimitException
             raise RateLimitException(
                 f"Rate limit exceeded: {self.requests_per_minute} requests per minute"
