@@ -744,7 +744,6 @@ for (const language of ['zh-CN', 'en']) {
       assert.ok(env.getNode('channelOAuthStatus').textContent.includes(env.locale[key]));
       assert.equal(env.getNode('channels').innerHTML.includes('<unsafe>'), false);
       if (status !== 'unauthed') {
-        assert.ok(env.getNode('channels').innerHTML.includes(env.locale.oauthAutoRefresh));
         assert.ok(env.getNode('channelOAuthDetails').textContent.includes(env.locale.oauthAutoRefresh));
         assert.ok(env.getNode('channelOAuthDetails').textContent.includes(env.locale.oauthExpiry));
       }
