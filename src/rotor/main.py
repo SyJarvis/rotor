@@ -89,10 +89,17 @@ async def lifespan(app: FastAPI):
 
     conversation_store.attach()
 
+    # Keep channel plan-usage snapshots current so quota state, not guessed
+    # deadlines, drives channel-wide cooldowns.
+    from rotor.services.quota_refresher import refresher
+
+    refresher.start()
+
     yield
 
     # Shutdown
     logger.info("Shutting down Rotor...")
+    await refresher.stop()
     await conversation_store.shutdown()
 
 

@@ -118,7 +118,7 @@ class FakeRoutingEngine(RoutingEngine):
             scores=None,
         )
 
-    def mark_unavailable(self, model, channel, cooldown_seconds=None, *, channel_wide=False) -> None:
+    def mark_unavailable(self, model, channel, cooldown_seconds=None, *, channel_wide=False, reason="transient") -> None:
         self.unavailable.append(channel.id)
 
 

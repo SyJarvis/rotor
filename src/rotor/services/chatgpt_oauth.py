@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rotor.database import async_session_maker
 from rotor.models.channel import Channel
 from rotor.models.channel_oauth import ChannelOAuthSession
+from rotor.schemas.channel import ChannelUsageResponse, ChannelUsageWindow
 from rotor.schemas.channel_oauth import OAuthCallbackResponse, OAuthSessionResponse
 
 
@@ -228,6 +229,29 @@ async def fetch_codex_usage(client: httpx.AsyncClient, credential: OAuthCredenti
     if not isinstance(payload, dict) or not isinstance(payload.get("rate_limit"), dict):
         raise OAuthError("ChatGPT returned an invalid usage payload; try again", 502) from None
     return payload
+
+
+def codex_usage_snapshot(payload: dict, *, fetched_at: float) -> ChannelUsageResponse:
+    """Map a Codex /usage payload onto the shared channel usage schema."""
+    rate_limit = payload.get("rate_limit") or {}
+
+    def _window(payload_window) -> ChannelUsageWindow:
+        data = payload_window if isinstance(payload_window, dict) else {}
+        return ChannelUsageWindow(
+            used_percent=data.get("used_percent"),
+            window_seconds=data.get("limit_window_seconds"),
+            reset_after_seconds=data.get("reset_after_seconds"),
+            reset_at=data.get("reset_at"),
+        )
+
+    return ChannelUsageResponse(
+        plan=payload.get("plan_type"),
+        allowed=rate_limit.get("allowed"),
+        limit_reached=rate_limit.get("limit_reached"),
+        primary=_window(rate_limit.get("primary_window")),
+        secondary=_window(rate_limit.get("secondary_window")),
+        fetched_at=fetched_at,
+    )
 
 
 async def probe_saved_models(db: AsyncSession, client: httpx.AsyncClient, channel: Channel) -> tuple[list[str], int]:

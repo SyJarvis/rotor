@@ -12,6 +12,7 @@ from rotor.core.exceptions import normalize_upstream_error
 from rotor.gateway.fallback import CONNECT_COOLDOWN_SECONDS, is_connect_failure
 from rotor.models.channel import Channel
 from rotor.models.token import Token
+from rotor.services import quota_refresher
 from rotor.services.loadbalancer import LoadBalancer
 from rotor.gateway.adaptive import AdaptiveScorer, AdaptiveWeights
 
@@ -46,6 +47,9 @@ class _Cooldown:
     generation: int = 0
     probe: AttemptAdmission | None = None
     cooldown_seconds: float = 30.0
+    # "plan_limit" cooldowns are quota-driven and lifted by a healthy usage
+    # snapshot; everything else is a transient provider failure.
+    reason: str = "transient"
 
 
 _RESPONSES_PROTOCOLS = {"responses", "openai_responses"}
@@ -320,6 +324,7 @@ class RoutingEngine:
         cooldown_seconds: float | None = None,
         *,
         channel_wide: bool = False,
+        reason: str = "transient",
     ) -> None:
         """Temporarily suppress a channel after a retryable provider failure."""
         if cooldown_seconds is None:
@@ -344,6 +349,7 @@ class RoutingEngine:
                     self._cooldowns[key] = _Cooldown(
                         self._now() + cooldown_seconds,
                         cooldown_seconds=cooldown_seconds,
+                        reason=reason,
                     )
                 else:
                     deadline = self._now() + cooldown_seconds
@@ -351,6 +357,10 @@ class RoutingEngine:
                         state.cooldown_seconds = cooldown_seconds
                     state.deadline = max(state.deadline, deadline)
                     state.generation += 1
+                    if reason == "plan_limit":
+                        # A quota-driven mark upgrades a transient entry so a
+                        # healthy snapshot can later lift the whole plan cooldown.
+                        state.reason = reason
 
     def mark_failure(self, model: str, channel: Channel, exc: Exception) -> None:
         """Cool a channel based on a provider failure's normalized error fact."""
@@ -365,15 +375,28 @@ class RoutingEngine:
             channel,
             cooldown,
             channel_wide=fact.channel_wide_cooldown,
+            reason="plan_limit" if fact.plan_limit else "transient",
         )
+        if fact.plan_limit:
+            # Let the quota refresher replace the guessed horizon with the
+            # provider's actual window state.
+            quota_refresher.refresher.schedule(channel.id)
 
-    def clear_cooldown(self, model: str | None, channel_id: int) -> list[str]:
-        """Clear process-local cooldowns for one model or an entire channel."""
+    def clear_cooldown(
+        self, model: str | None, channel_id: int, *, reason: str | None = None
+    ) -> list[str]:
+        """Clear process-local cooldowns for one model or an entire channel.
+
+        ``reason`` restricts the clear to cooldowns with that origin (a healthy
+        quota snapshot lifts plan-limit entries only); None clears everything.
+        """
         with self._lock:
             keys = [
                 key
-                for key in self._cooldowns
-                if key[1] == channel_id and (model is None or key[0] == model)
+                for key, state in self._cooldowns.items()
+                if key[1] == channel_id
+                and (model is None or key[0] == model)
+                and (reason is None or state.reason == reason)
             ]
             for key in keys:
                 self._cooldowns.pop(key)

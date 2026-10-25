@@ -14,13 +14,12 @@ from rotor.core.exceptions import format_error_message
 from rotor.gateway.routing import routing_engine
 from rotor.models.channel import Channel
 from rotor.models.log import RequestLog
-from rotor.services import usage_cache
+from rotor.services import quota_refresher, usage_cache
 from rotor.services.chatgpt_oauth import (
     OAuthError,
     clear_credential_values,
     consume_session,
     credential_values,
-    fetch_codex_usage,
     probe_saved_models,
     resolve_oauth_credentials,
     validate_configuration,
@@ -40,7 +39,6 @@ from rotor.schemas.channel import (
     ChannelRoutingStateResponse,
     ChannelUpdate,
     ChannelUsageResponse,
-    ChannelUsageWindow,
     ProbeModelsResponse,
 )
 from rotor.schemas.request import (
@@ -403,17 +401,6 @@ async def probe_models(
 
 # Admin UI cards poll this while the page is open; cache briefly so several
 # viewers (or rapid re-renders) do not multiply upstream usage calls.
-_USAGE_RESET_MAX_SECONDS = 6 * 3600.0
-
-
-def _window(payload: dict | None) -> ChannelUsageWindow:
-    data = payload if isinstance(payload, dict) else {}
-    return ChannelUsageWindow(
-        used_percent=data.get("used_percent"),
-        window_seconds=data.get("limit_window_seconds"),
-        reset_after_seconds=data.get("reset_after_seconds"),
-        reset_at=data.get("reset_at"),
-    )
 
 
 @router.get("/{channel_id}/oauth/usage", response_model=ChannelUsageResponse)
@@ -426,9 +413,9 @@ async def get_channel_oauth_usage(
 
     Covers ChatGPT OAuth channels (Codex plan windows) and API-key Zhipu
     channels (GLM Coding Plan rolling windows, matched by base-URL host).
-    When the plan reports an exhausted window, every model on the channel is
-    cooled down until the window resets so routing stops selecting it instead of
-    collecting a 429 per model.
+    The snapshot reconciles channel-wide cooldowns: an exhausted window cools
+    every model until it resets, and a healthy one immediately lifts the
+    channel's plan-limit cooldowns (rolling windows can recover early).
     """
     now = time.time()
     cached = usage_cache.fresh(channel_id, now=now)
@@ -443,23 +430,9 @@ async def get_channel_oauth_usage(
             detail=f"Channel {channel_id} not found",
         )
     try:
-        if channel.auth_type == "oauth":
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                credential = await resolve_oauth_credentials(channel, client)
-                payload = await fetch_codex_usage(client, credential)
-            rate_limit = payload.get("rate_limit") or {}
-            usage = ChannelUsageResponse(
-                plan=payload.get("plan_type"),
-                allowed=rate_limit.get("allowed"),
-                limit_reached=rate_limit.get("limit_reached"),
-                primary=_window(rate_limit.get("primary_window")),
-                secondary=_window(rate_limit.get("secondary_window")),
-                fetched_at=now,
-            )
-        elif is_zhipu_quota_channel(channel):
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                usage = await fetch_zhipu_usage(client, channel)
-        else:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            usage = await quota_refresher.fetch_usage(channel, client)
+        if usage is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Channel has no quota provider (OAuth or Zhipu required)",
@@ -472,19 +445,7 @@ async def get_channel_oauth_usage(
     except ZhipuQuotaError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
-    usage_cache.store(channel_id, usage, now=now)
-
-    if usage.limit_reached:
-        primary = usage.primary or ChannelUsageWindow()
-        reset_seconds = primary.reset_after_seconds
-        if primary.reset_at:
-            reset_seconds = min(
-                max(primary.reset_at - now, 0.0), _USAGE_RESET_MAX_SECONDS
-            )
-        elif reset_seconds is None:
-            reset_seconds = 30.0
-        for model in {*(channel.models or [])}:
-            routing_engine.mark_unavailable(model, channel, reset_seconds)
+    quota_refresher.apply_usage(channel, usage, now=now)
     return usage
 
 

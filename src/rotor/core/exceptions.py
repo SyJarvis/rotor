@@ -161,20 +161,31 @@ _PLAN_LIMIT_ERROR_TYPES = {"usage_limit_reached", "insufficient_quota"}
 # ChatGPT plan windows roll over at most every few hours; anything larger is
 # treated as corrupt upstream data rather than a cooldown to honor.
 _PLAN_RESET_MAX_SECONDS = 6 * 3600.0
+# Zhipu reports the Coding-Plan 5-hour cap as error.code 1308. Its reset
+# message is a timezone-less wall-clock string, and the rolling window can
+# recover as soon as old usage ages out, so a short recheck horizon is used
+# instead of parsing it; the quota refresher then holds the real state.
+_ZHIPU_PLAN_LIMIT_CODES = {"1308"}
+_PLAN_RECHECK_SECONDS = 120.0
 
 
 def _plan_reset_seconds(body: Any) -> float | None:
-    """Extract the reset delay of a plan-level usage limit from an error body.
+    """Extract the cooldown horizon of a plan-level usage limit from an error body.
 
     ChatGPT reports exhausted plan windows (for example the Codex 5-hour Plus
     limit) as ``error.type=usage_limit_reached`` with ``resets_at``/``resets_in_seconds``.
     The absolute deadline is preferred over the relative field because the two
-    have been observed to disagree.
+    have been observed to disagree. Zhipu is detected by error code instead;
+    it gets the recheck horizon because its reset message carries no timezone.
     """
     if not isinstance(body, dict):
         return None
     error = body.get("error")
-    if not isinstance(error, dict) or error.get("type") not in _PLAN_LIMIT_ERROR_TYPES:
+    if not isinstance(error, dict):
+        return None
+    if error.get("code") in _ZHIPU_PLAN_LIMIT_CODES:
+        return _PLAN_RECHECK_SECONDS
+    if error.get("type") not in _PLAN_LIMIT_ERROR_TYPES:
         return None
     seconds: float | None = None
     resets_at = error.get("resets_at")
@@ -209,6 +220,7 @@ def normalize_upstream_error(
 
     retry_after = None
     channel_wide = False
+    plan_limit = False
     if isinstance(exc, httpx.TimeoutException):
         code = "upstream_timeout"
         category = ErrorCategory.TIMEOUT
@@ -258,6 +270,7 @@ def normalize_upstream_error(
             retry_after = max(retry_after or 0.0, plan_reset)
             retry_same_channel = False
             channel_wide = True
+            plan_limit = True
         message = f"Upstream returned HTTP {status_code}"
     elif isinstance(exc, httpx.RequestError):
         code = "upstream_connection_failed"
@@ -296,6 +309,7 @@ def normalize_upstream_error(
         fallback_allowed=fallback_allowed,
         retry_after_seconds=retry_after,
         channel_wide_cooldown=channel_wide,
+        plan_limit=plan_limit,
         message=message,
         sanitized_body=sanitized_body,
         provider_request_ids=provider_request_ids,

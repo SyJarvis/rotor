@@ -44,6 +44,9 @@ class UpstreamErrorFact(BaseModel):
     # Plan-level usage limits block every model on the channel until the billing
     # window resets, unlike per-endpoint rate limits that only cool one model.
     channel_wide_cooldown: bool = False
+    # True only for plan-level limits; such cooldowns are tagged so a healthy
+    # quota snapshot can lift them without touching transient-failure ones.
+    plan_limit: bool = False
     message: str
     sanitized_body: Any | None = None
     provider_request_ids: dict[str, str] = Field(default_factory=dict)
