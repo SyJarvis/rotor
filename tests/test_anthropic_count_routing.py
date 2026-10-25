@@ -168,7 +168,7 @@ def test_native_cooldown_cannot_be_bypassed_by_estimation(state):
     state.channels.append(channel(3, "openai"))
     with pytest.raises(ChannelsTemporarilyUnavailable) as captured:
         asyncio.run(state.call())
-    assert captured.value.status_code == 503
+    assert captured.value.status_code == 429
     assert captured.value.headers["Retry-After"] == "17"
     assert state.seen == []
 

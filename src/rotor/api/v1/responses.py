@@ -520,7 +520,9 @@ async def create_response(
 
     if not routing_candidates:
         if routing_decision is not None and routing_decision.temporarily_unavailable:
-            raise ChannelsTemporarilyUnavailable(chat_request.model, routing_decision.retry_after_seconds)
+            raise ChannelsTemporarilyUnavailable(
+                chat_request.model, routing_decision.retry_after_seconds,
+                plan_limited=routing_decision.plan_limited)
         required_capabilities = responses_required_capabilities(request)
         if "responses_persistence" in required_capabilities and any(
             str(channel.type or "").lower() == "openai_codex" for channel in channels
@@ -563,6 +565,7 @@ async def create_response(
         plan = list(routing_candidates)
         connect_retry = ConnectRetry()
         attempt = -1
+        fallback_reason = None
         while True:
             attempt += 1
             if attempt >= len(plan):
@@ -658,7 +661,8 @@ async def create_response(
                         ),
                     )
                     set_routing_headers(
-                        result, channel, chat_request.model, attempt > 0
+                        result, channel, chat_request.model, attempt > 0,
+                        fallback_reason=fallback_reason,
                     )
                     # Ownership of http_client transfers to the streaming
                     # generator, which closes it in its own finally block.
@@ -690,7 +694,8 @@ async def create_response(
                     ),
                 )
                 set_routing_headers(
-                    api_response, channel, chat_request.model, attempt > 0
+                    api_response, channel, chat_request.model, attempt > 0,
+                    fallback_reason=fallback_reason,
                 )
                 if response_data.get("object") == "response":
                     response_id = response_data.get("id")
@@ -726,6 +731,10 @@ async def create_response(
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
                 error_fact = normalize_upstream_error(exc)
+                if fallback_reason is None:
+                    fallback_reason = (
+                        f"{channel.name if (channel.name or '').isascii() else f'channel-{channel.id}'}: {error_fact.code}"
+                    )
                 await attempt_recorder.record(
                     context=attempt_context,
                     request_id=request_id,
@@ -836,7 +845,8 @@ async def create_response(
         conversation_handle, "failed", int((time.time() - start_time) * 1000)
     )
     if last_error is None:
-        raise ChannelsTemporarilyUnavailable(chat_request.model, routing_engine.retry_after_seconds(chat_request.model, routing_candidates))
+        wait, plan_limited = routing_engine.cooldown_outlook(chat_request.model, routing_candidates)
+        raise ChannelsTemporarilyUnavailable(chat_request.model, wait, plan_limited=plan_limited)
     raise ChannelException(
         f"All channels failed for model '{chat_request.model}'",
         status_code=classify_error_status(last_error),
@@ -979,7 +989,8 @@ async def _native_collection_request(
     candidates = decision.candidates
     if not candidates:
         if decision.temporarily_unavailable:
-            raise ChannelsTemporarilyUnavailable(model, decision.retry_after_seconds)
+            raise ChannelsTemporarilyUnavailable(
+                model, decision.retry_after_seconds, plan_limited=decision.plan_limited)
         if any(str(channel.type or "").lower() == "openai_codex" for channel in channels):
             raise HTTPException(status_code=400, detail="ChatGPT OAuth does not support Responses resources")
         raise ChannelException(
@@ -1015,7 +1026,8 @@ async def _native_collection_request(
             finally:
                 admission.engine.release_attempt(admission)
     if last_error is None:
-        raise ChannelsTemporarilyUnavailable(model, routing_engine.retry_after_seconds(model, candidates))
+        wait, plan_limited = routing_engine.cooldown_outlook(model, candidates)
+        raise ChannelsTemporarilyUnavailable(model, wait, plan_limited=plan_limited)
     if isinstance(last_error, HTTPStatusError):
         return _upstream_error(last_error)
     raise ChannelException(

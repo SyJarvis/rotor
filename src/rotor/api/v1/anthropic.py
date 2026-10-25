@@ -516,8 +516,10 @@ async def count_message_tokens(
                 request_protocol="anthropic_messages",
             )
             if not decision.candidates:
-                raise ChannelsTemporarilyUnavailable(request.model, decision.retry_after_seconds)
+                raise ChannelsTemporarilyUnavailable(
+                request.model, decision.retry_after_seconds, plan_limited=decision.plan_limited)
             last_error = None
+            fallback_reason = None
             for attempt, channel in enumerate(decision.candidates):
                 admission = routing_engine.admit_attempt(request.model, channel)
                 if admission is None:
@@ -549,10 +551,15 @@ async def count_message_tokens(
                         media_type="application/json",
                         headers={"X-Rotor-Token-Count-Source": "provider"},
                     )
-                    set_routing_headers(result, channel, request.model, attempt > 0)
+                    set_routing_headers(result, channel, request.model, attempt > 0, fallback_reason=fallback_reason)
                     return result
                 except Exception as exc:
                     last_error = exc
+                    if fallback_reason is None:
+                        fallback_reason = (
+                            f"{channel.name if (channel.name or '').isascii() else f'channel-{channel.id}'}: "
+                            f"{normalize_upstream_error(exc).code}"
+                        )
                     if should_fallback(exc):
                         routing_engine.mark_failure(request.model, channel, exc)
                         continue
@@ -563,8 +570,9 @@ async def count_message_tokens(
                     admission.engine.release_attempt(admission)
             if last_error is not None:
                 raise last_error
+            wait, plan_limited = routing_engine.cooldown_outlook(request.model, native_channels)
             raise ChannelsTemporarilyUnavailable(
-                request.model, routing_engine.retry_after_seconds(request.model, native_channels)
+                request.model, wait, plan_limited=plan_limited
             )
         if selection_failed:
             raise UpstreamProtocolError("No usable native token-count adapter could be selected")
@@ -779,7 +787,9 @@ async def messages(
     )
     if not routing_decision.candidates:
         if routing_decision.temporarily_unavailable:
-            raise ChannelsTemporarilyUnavailable(request.model, routing_decision.retry_after_seconds)
+            raise ChannelsTemporarilyUnavailable(
+                request.model, routing_decision.retry_after_seconds,
+                plan_limited=routing_decision.plan_limited)
         raise ChannelException(
             f"No compatible channel available for Anthropic model '{request.model}'. "
             f"Required capabilities: {sorted(required_capabilities)}",
@@ -820,6 +830,7 @@ async def messages(
         protocol="anthropic_messages",
     )
     try:
+        fallback_reason = None
         for attempt, channel in enumerate(routing_decision.candidates):
             admission = routing_engine.admit_attempt(request.model, channel)
             if admission is None:
@@ -853,14 +864,15 @@ async def messages(
                             routing_decision, attempt, channel=channel, request_protocol="anthropic_messages"
                         ),
                     )
-                    set_routing_headers(result, channel, request.model, attempt > 0)
+                    set_routing_headers(result, channel, request.model, attempt > 0, fallback_reason=fallback_reason)
                     # Ownership of http_client transfers to the streaming
                     # generator, which closes it in its own finally block.
                     streaming_response_returned = True
                     return result
                 else:
                     set_routing_headers(
-                        api_response, channel, request.model, attempt > 0
+                        api_response, channel, request.model, attempt > 0,
+                        fallback_reason=fallback_reason,
                     )
                     return await _handle_non_streaming_request(
                         request, internal_request, adapter, channel, token, db, start_time,
@@ -880,6 +892,10 @@ async def messages(
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
                 error_fact = normalize_upstream_error(e)
+                if fallback_reason is None:
+                    fallback_reason = (
+                        f"{channel.name if (channel.name or '').isascii() else f'channel-{channel.id}'}: {error_fact.code}"
+                    )
                 await attempt_recorder.record(
                     context=attempt_context,
                     request_id=request_id,
@@ -974,7 +990,8 @@ async def messages(
         conversation_handle, "failed", int((time.time() - start_time) * 1000)
     )
     if last_error is None:
-        raise ChannelsTemporarilyUnavailable(request.model, routing_engine.retry_after_seconds(request.model, routing_decision.candidates))
+        wait, plan_limited = routing_engine.cooldown_outlook(request.model, routing_decision.candidates)
+        raise ChannelsTemporarilyUnavailable(request.model, wait, plan_limited=plan_limited)
     error = ChannelException(
         f"All channels failed for model '{request.model}'",
         status_code=classify_error_status(last_error),

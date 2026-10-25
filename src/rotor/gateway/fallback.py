@@ -41,10 +41,19 @@ def retry_after_seconds(exc: Exception) -> float | None:
     return normalize_upstream_error(exc).retry_after_seconds
 
 
-def set_routing_headers(response, channel, requested_model: str, fallback: bool) -> None:
-    response.headers["X-Rotor-Channel"] = channel.name
+def set_routing_headers(
+    response, channel, requested_model: str, fallback: bool, fallback_reason: str | None = None
+) -> None:
+    # HTTP headers are latin-1 at best; non-ASCII channel names degrade to an
+    # ASCII label instead of crashing header encoding.
+    name = channel.name or ""
+    if not name.isascii():
+        name = f"channel-{channel.id}"
+    response.headers["X-Rotor-Channel"] = name
     response.headers["X-Rotor-Provider-Model"] = (
         (channel.model_mapping or {}).get(requested_model, requested_model)
     )
     if fallback:
         response.headers["X-Rotor-Fallback"] = "true"
+        if fallback_reason:
+            response.headers["X-Rotor-Fallback-Reason"] = fallback_reason

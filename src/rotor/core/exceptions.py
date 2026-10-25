@@ -139,6 +139,24 @@ def _indicates_missing_model(body: Any) -> bool:
     )
 
 
+def _indicates_account_model_unsupported(body: Any) -> bool:
+    """Detect account-level model gating (e.g. "not supported with a ChatGPT account").
+
+    Such 400s describe the account, not the request: another channel serving
+    the same model must be tried instead of failing the request outright.
+    """
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error", body)
+    if not isinstance(error, dict):
+        return False
+    evidence = " ".join(
+        str(error.get(name, ""))
+        for name in ("code", "type", "message")
+    ).lower()
+    return "not supported" in evidence and "account" in evidence
+
+
 def _parse_retry_after(value: str | None) -> float | None:
     """Parse an upstream delay or HTTP date without accepting invalid cooldowns."""
     if value is None:
@@ -244,6 +262,11 @@ def normalize_upstream_error(
         elif status_code == 404:
             code = "upstream_resource_not_found"
             category = ErrorCategory.PROTOCOL_OR_PARAMETER_ERROR
+        elif status_code == 400 and _indicates_account_model_unsupported(sanitized_body):
+            # Account-level gating ("not supported with a ChatGPT account"):
+            # the request may still be served by a different channel.
+            code = "upstream_model_not_available_on_account"
+            category = ErrorCategory.MODEL_NOT_FOUND
         elif status_code in {408, 425}:
             code = "upstream_temporarily_unavailable"
             category = ErrorCategory.UPSTREAM_AVAILABILITY
@@ -256,6 +279,7 @@ def normalize_upstream_error(
         fallback_allowed = (
             status_code in {401, 402, 403, 404, 408, 409, 425, 429}
             or status_code >= 500
+            or code == "upstream_model_not_available_on_account"
         )
         retry_same_channel = (
             status_code in {408, 409, 425, 429}
@@ -486,17 +510,34 @@ class RateLimitException(APIRouterException):
 
 
 class ChannelsTemporarilyUnavailable(APIRouterException):
-    """Compatible channels are cooling down or running a recovery probe."""
+    """Compatible channels are cooling down or running a recovery probe.
 
-    def __init__(self, model: str, retry_after_seconds: int) -> None:
+    Reported as 429 with a structured body so coding agents can back off to
+    the local cooldown deadline instead of treating a retryable quota state
+    as a server error. ``resets_at`` is derived from the local deadline; it
+    deliberately does not echo upstream reset fields, which have shown
+    timezone drift.
+    """
+
+    def __init__(self, model: str, retry_after_seconds: int, *, plan_limited: bool = False) -> None:
+        wait = max(1, int(retry_after_seconds))
+        if plan_limited:
+            message = (f"Channels for model '{model}' are cooling down until the "
+                       f"usage window resets; retry in {wait}s")
+            error_type = "usage_limit_reached"
+        else:
+            message = f"Channels for model '{model}' are temporarily unavailable; retry in {wait}s"
+            error_type = "rate_limit_error"
         super().__init__(
-            status_code=503,
+            status_code=429,
             detail={"error": {
-                "message": f"Channels for model '{model}' are temporarily unavailable",
-                "type": "channel_error",
+                "message": message,
+                "type": error_type,
                 "code": "channels_temporarily_unavailable",
+                "retry_after_seconds": wait,
+                "resets_at": time() + wait,
             }},
-            headers={"Retry-After": str(max(1, retry_after_seconds))},
+            headers={"Retry-After": str(wait)},
         )
 
 

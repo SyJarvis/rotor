@@ -428,7 +428,9 @@ async def generate_image(
     )
     if not candidates:
         if routing_decision.temporarily_unavailable:
-            raise ChannelsTemporarilyUnavailable(image_request.model, routing_decision.retry_after_seconds)
+            raise ChannelsTemporarilyUnavailable(
+                image_request.model, routing_decision.retry_after_seconds,
+                plan_limited=routing_decision.plan_limited)
         raise ChannelException(
             f"No compatible image generation channel for model "
             f"'{image_request.model}'",
@@ -439,6 +441,7 @@ async def generate_image(
     http_client = AsyncClient(timeout=_timeout())
     streaming_response_returned = False
     last_error: Exception | None = None
+    fallback_reason: str | None = None
     try:
         for attempt, channel in enumerate(candidates):
             admission = routing_engine.admit_attempt(image_request.model, channel)
@@ -500,7 +503,7 @@ async def generate_image(
                         close_callbacks=(upstream.aclose, http_client.aclose),
                         media_type="text/event-stream",
                     )
-                    set_routing_headers(response, channel, image_request.model, attempt > 0)
+                    set_routing_headers(response, channel, image_request.model, attempt > 0, fallback_reason=fallback_reason)
                     # Ownership of http_client transfers to the streaming
                     # generator, which closes it in its own finally block.
                     streaming_response_returned = True
@@ -526,10 +529,15 @@ async def generate_image(
                         routing_decision, attempt, channel=channel, request_protocol="openai_images"
                     ),
                 )
-                set_routing_headers(api_response, channel, image_request.model, attempt > 0)
+                set_routing_headers(api_response, channel, image_request.model, attempt > 0, fallback_reason=fallback_reason)
                 return response_data
             except (HTTPStatusError, RequestError) as exc:
                 last_error = exc
+                if fallback_reason is None:
+                    fallback_reason = (
+                        f"{channel.name if (channel.name or '').isascii() else f'channel-{channel.id}'}: "
+                        f"{normalize_upstream_error(exc).code}"
+                    )
                 if should_fallback(exc):
                     routing_engine.mark_failure(image_request.model, channel, exc)
                 await _record_failure(
@@ -556,7 +564,8 @@ async def generate_image(
                     admission.engine.release_attempt(admission)
 
         if last_error is None:
-            raise ChannelsTemporarilyUnavailable(image_request.model, routing_engine.retry_after_seconds(image_request.model, candidates))
+            wait, plan_limited = routing_engine.cooldown_outlook(image_request.model, candidates)
+            raise ChannelsTemporarilyUnavailable(image_request.model, wait, plan_limited=plan_limited)
         raise ChannelException(
             f"All image generation channels failed for model '{image_request.model}'",
             status_code=classify_error_status(last_error),

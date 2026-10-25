@@ -138,8 +138,18 @@ POST /oauth/token
 |---|---|---|
 | 401 `authentication_failed` | 凭据失效 | refresh 换新后重试一次;再失败则重新授权 |
 | 404 `model_not_found` | 模型不存在或无权限 | 不要重试;从模型列表重新选取 |
-| 429 | 配额/限速 | 退避重试;结合 `/v1/usage` 的窗口重置时间 |
+| 429 | 该模型的所有渠道都在冷却 | 按 `Retry-After` 头 / `error.retry_after_seconds` 退避;`error.type=usage_limit_reached` 表示是额度窗口耗尽,`error.resets_at` 是本地计算的重置时刻 |
 | 5xx | 上游不可用 | 指数退避重试 |
+
+冷却导致的 429 响应体(agent 可直接读取退避时间):
+
+```json
+{"error": {"message": "Channels for model 'glm-5.3' are cooling down until the usage window resets; retry in 1742s",
+           "type": "usage_limit_reached", "code": "channels_temporarily_unavailable",
+           "retry_after_seconds": 1742, "resets_at": 1792923902}}
+```
+
+另外,当请求发生渠道切换(fallback)时,成功响应会带 `X-Rotor-Fallback: true` 和 `X-Rotor-Fallback-Reason: <渠道>: <错误码>` 头,便于排查为何没有由首选渠道服务。
 
 ## 各 agent 配置样例
 

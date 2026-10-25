@@ -24,11 +24,7 @@ from rotor.services.chatgpt_oauth import (
     resolve_oauth_credentials,
     validate_configuration,
 )
-from rotor.services.zhipu_quota import (
-    ZhipuQuotaError,
-    fetch_zhipu_usage,
-    is_zhipu_quota_channel,
-)
+from rotor.services.zhipu_quota import ZhipuQuotaError
 from rotor.schemas.channel import (
     ChannelCooldownResetRequest,
     ChannelCooldownResetResponse,

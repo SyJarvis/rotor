@@ -296,7 +296,7 @@ def test_partial_failure_never_switches_channel_or_recovers_probe(api):
 
 @pytest.mark.parametrize("kind,status,expected_type", [
     ("authentication", 401, "authentication_error"), ("validation", 422, "invalid_request_error"),
-    ("http", 403, "permission_error"), ("temporary", 503, "overloaded_error"),
+    ("http", 403, "permission_error"), ("temporary", 429, "rate_limit_error"),
     ("generic", 500, "api_error"), ("upstream", 429, "rate_limit_error"),
     ("http-billing", 402, "billing_error"), ("http-conflict", 409, "conflict_error"),
     ("http-timeout", 504, "timeout_error"),

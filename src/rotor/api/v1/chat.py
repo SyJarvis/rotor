@@ -142,7 +142,9 @@ async def chat_completions(
     candidates = routing_decision.candidates
     if not candidates:
         if routing_decision.temporarily_unavailable:
-            raise ChannelsTemporarilyUnavailable(request.model, routing_decision.retry_after_seconds)
+            raise ChannelsTemporarilyUnavailable(
+                request.model, routing_decision.retry_after_seconds,
+                plan_limited=routing_decision.plan_limited)
         raise ChannelException(
             f"No compatible channel available for Chat model '{request.model}'. "
             f"Required capabilities: {sorted(required_capabilities)}",
@@ -193,6 +195,7 @@ async def chat_completions(
         plan = list(candidates)
         connect_retry = ConnectRetry()
         attempt = -1
+        fallback_reason = None
         while True:
             attempt += 1
             if attempt >= len(plan):
@@ -225,14 +228,15 @@ async def chat_completions(
                             routing_decision, attempt, channel=channel, request_protocol="openai_chat"
                         ),
                     )
-                    set_routing_headers(result, channel, request.model, attempt > 0)
+                    set_routing_headers(result, channel, request.model, attempt > 0, fallback_reason=fallback_reason)
                     # Ownership of http_client transfers to the streaming
                     # generator, which closes it in its own finally block.
                     streaming_response_returned = True
                     return result
                 else:
                     set_routing_headers(
-                        api_response, channel, request.model, attempt > 0
+                        api_response, channel, request.model, attempt > 0,
+                        fallback_reason=fallback_reason,
                     )
                     return await _handle_non_streaming_request(
                         request, adapter, channel, token, db, start_time, http_request,
@@ -260,6 +264,10 @@ async def chat_completions(
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
                 error_fact = normalize_upstream_error(e)
+                if fallback_reason is None:
+                    fallback_reason = (
+                        f"{channel.name if (channel.name or '').isascii() else f'channel-{channel.id}'}: {error_fact.code}"
+                    )
                 await attempt_recorder.record(
                     context=attempt_context,
                     request_id=request_id,
@@ -375,7 +383,8 @@ async def chat_completions(
         conversation_handle, "failed", int((time.time() - start_time) * 1000)
     )
     if last_error is None:
-        raise ChannelsTemporarilyUnavailable(request.model, routing_engine.retry_after_seconds(request.model, candidates))
+        wait, plan_limited = routing_engine.cooldown_outlook(request.model, candidates)
+        raise ChannelsTemporarilyUnavailable(request.model, wait, plan_limited=plan_limited)
     raise ChannelException(
         f"All channels failed for model '{request.model}'",
         status_code=classify_error_status(last_error),

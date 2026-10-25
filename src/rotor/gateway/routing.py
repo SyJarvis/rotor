@@ -26,6 +26,9 @@ class RoutingDecision:
     lease_used: bool = False
     temporarily_unavailable: bool = False
     retry_after_seconds: int | None = None
+    # True when a plan-limit (quota) cooldown is among the blockers; lets the
+    # client-facing error say usage_limit_reached instead of a generic retry.
+    plan_limited: bool = False
     lease_reassessment_attempted: bool = False
 
 
@@ -172,6 +175,10 @@ class RoutingEngine:
                 ]
                 lease_used = True
 
+        if compatible and not active:
+            wait, plan_limited = self.cooldown_outlook(model, compatible)
+        else:
+            wait, plan_limited = None, False
         return RoutingDecision(
             candidates=ordered,
             strategy=self.strategy,
@@ -179,9 +186,8 @@ class RoutingEngine:
             lease_channel_id=preferred_channel_id,
             lease_used=lease_used,
             temporarily_unavailable=bool(compatible and not active),
-            retry_after_seconds=(
-                self.retry_after_seconds(model, compatible) if compatible and not active else None
-            ),
+            retry_after_seconds=wait,
+            plan_limited=plan_limited,
             lease_reassessment_attempted=lease_reassessment_attempted,
         )
 
@@ -278,6 +284,22 @@ class RoutingEngine:
                 if state is not None:
                     delays.append(max(1.0 if state.probe is not None else 0.0, state.deadline - now))
             return max(1, math.ceil(min(delays))) if delays else 1
+
+    def cooldown_outlook(self, model: str, channels: Iterable[Channel]) -> tuple[int, bool]:
+        """Advisory wait plus whether a plan-limit cooldown is among the blockers."""
+        with self._lock:
+            now = self._now()
+            delays = []
+            plan_limited = False
+            for channel in channels:
+                state = self._cooldowns.get((model, channel.id))
+                if state is None:
+                    continue
+                delays.append(max(1.0 if state.probe is not None else 0.0, state.deadline - now))
+                if state.reason == "plan_limit":
+                    plan_limited = True
+            wait = max(1, math.ceil(min(delays))) if delays else 1
+            return wait, plan_limited
 
     def available_native_channel_ids(
         self,
