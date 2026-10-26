@@ -133,13 +133,16 @@ def _carries_stream_content(delta):
     """A role-only echo carries no response content.
 
     OpenRouter's usage tail repeats {"content":"","role":"assistant"} with the
-    finish reason after the terminal chunk; only a real payload makes a delta
-    meaningful once a choice has finished.
+    finish reason after the terminal chunk, and Mercury appends a delta of
+    encrypted reasoning_details after it for cross-turn continuation; such
+    provider bookkeeping is not response output, so only a real payload makes
+    a delta meaningful once a choice has finished.
     """
     return any(
         value not in (None, "", [], {})
         for key, value in delta.items()
-        if not (key == "role" and value == "assistant")
+        if key != "reasoning_details"
+        and not (key == "role" and value == "assistant")
     )
 
 
