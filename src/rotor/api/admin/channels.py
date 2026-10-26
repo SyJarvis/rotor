@@ -14,6 +14,7 @@ from rotor.core.exceptions import format_error_message
 from rotor.gateway.routing import routing_engine
 from rotor.models.channel import Channel
 from rotor.models.log import RequestLog
+from rotor.services import quota_refresher, usage_cache
 from rotor.services.chatgpt_oauth import (
     OAuthError,
     clear_credential_values,
@@ -23,6 +24,7 @@ from rotor.services.chatgpt_oauth import (
     resolve_oauth_credentials,
     validate_configuration,
 )
+from rotor.services.zhipu_quota import ZhipuQuotaError
 from rotor.schemas.channel import (
     ChannelCooldownResetRequest,
     ChannelCooldownResetResponse,
@@ -32,6 +34,7 @@ from rotor.schemas.channel import (
     ChannelResponse,
     ChannelRoutingStateResponse,
     ChannelUpdate,
+    ChannelUsageResponse,
     ProbeModelsResponse,
 )
 from rotor.schemas.request import (
@@ -390,6 +393,56 @@ async def probe_models(
         ) from exc
     latency_ms = int((time.perf_counter() - start) * 1000)
     return ProbeModelsResponse(models=models, latency_ms=latency_ms, raw_count=len(models))
+
+
+# Admin UI cards poll this while the page is open; cache briefly so several
+# viewers (or rapid re-renders) do not multiply upstream usage calls.
+
+
+@router.get("/{channel_id}/oauth/usage", response_model=ChannelUsageResponse)
+async def get_channel_oauth_usage(
+    channel_id: int,
+    refresh: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """Current subscription usage for a channel with a quota provider.
+
+    Covers ChatGPT OAuth channels (Codex plan windows) and API-key Zhipu
+    channels (GLM Coding Plan rolling windows, matched by base-URL host).
+    The snapshot reconciles channel-wide cooldowns: an exhausted window cools
+    every model until it resets, and a healthy one immediately lifts the
+    channel's plan-limit cooldowns (rolling windows can recover early).
+    """
+    now = time.time()
+    cached = usage_cache.fresh(channel_id, now=now)
+    if cached and not refresh:
+        return cached
+
+    result = await db.execute(select(Channel).where(Channel.id == channel_id))
+    channel = result.scalar_one_or_none()
+    if not channel:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Channel {channel_id} not found",
+        )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            usage = await quota_refresher.fetch_usage(channel, client)
+        if usage is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Channel has no quota provider (OAuth or Zhipu required)",
+            )
+    except OAuthError as exc:
+        raise HTTPException(
+            status_code=exc.status_code if exc.status_code >= 500 else status.HTTP_502_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except ZhipuQuotaError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    quota_refresher.apply_usage(channel, usage, now=now)
+    return usage
 
 
 @router.post("/{channel_id}/test", response_model=ChannelTestResponse)

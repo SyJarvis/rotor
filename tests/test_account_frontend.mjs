@@ -13,12 +13,12 @@ async function setup() {
     if (!nodes.has(id)) nodes.set(id, { value: '', textContent: '', disabled: false, classList: { toggle() {} }, listeners: {}, addEventListener(name, callback) { this.listeners[name] = callback; } });
     return nodes.get(id);
   };
-  const context = vm.createContext({ document: { getElementById: get, addEventListener(name, callback) { events[name] = callback; } } });
-  const bindings = { t: (key) => key, actor: () => actor, setActor: (value) => { actor = value; }, requestLogout() {}, api: async (path, options = {}) => { calls.push({ path, options }); return response ? await response : { ...profile, ...(options.body ? JSON.parse(options.body) : {}) }; } };
+  const context = vm.createContext({ AbortController, document: { getElementById: get, addEventListener(name, callback) { events[name] = callback; } } });
+  const bindings = { t: (key) => key, actor: () => actor, accountId: () => String(actor?.id ?? ''), setActor: (value) => { actor = value; events.sessionchange?.(); }, requestLogout() {}, api: async (path, options = {}) => { calls.push({ path, options }); return response ? await response : { ...profile, ...(options.body ? JSON.parse(options.body) : {}) }; } };
   const module = new vm.SourceTextModule(accountSource, { context });
-  await module.link((specifier) => { const names = specifier.includes('api.js') ? ['api'] : specifier.includes('i18n') ? ['t'] : ['actor', 'setActor', 'requestLogout']; return new vm.SyntheticModule(names, function () { names.forEach((name) => this.setExport(name, bindings[name])); }, { context }); });
+  await module.link((specifier) => { const names = specifier.includes('api.js') ? ['api'] : specifier.includes('i18n') ? ['t'] : ['actor', 'accountId', 'setActor']; return new vm.SyntheticModule(names, function () { names.forEach((name) => this.setExport(name, bindings[name])); }, { context }); });
   await module.evaluate(); const account = module.namespace.initAccount();
-  return { get, calls, account, get actor() { return actor; }, respond(value) { response = value; }, end() { actor = null; events.sessionended(); }, async input(id, value) { get(id).value = value; return get(id).listeners.input?.(); }, async click(id) { return get(id).listeners.click(); } };
+  return { get, calls, account, get actor() { return actor; }, respond(value) { response = value; }, switchActor(value) { bindings.setActor(value); }, end() { actor = null; events.sessionended(); }, async input(id, value) { get(id).value = value; return get(id).listeners.input?.(); }, async click(id) { return get(id).listeners.click(); } };
 }
 
 test('account fills immutable username and saves only display_name while retaining role and default key', async () => {
@@ -30,10 +30,8 @@ test('account fills immutable username and saves only display_name while retaini
   assert.equal(h.get('accountSave').disabled, true);
 });
 
-test('account password checks prevent invalid requests and a late profile save cannot restore an ended session', async () => {
+test('a late profile save cannot restore an ended session', async () => {
   const h = await setup(); await h.account.load();
-  h.get('accountNewPassword').value = 'short'; await h.click('accountPasswordSave'); assert.equal(h.calls.length, 1);
-  h.get('accountNewPassword').value = 'long-password'; h.get('accountConfirmPassword').value = 'different'; await h.click('accountPasswordSave'); assert.equal(h.calls.length, 1);
   const pending = deferred(); h.respond(pending.promise); await h.input('accountDisplayName', 'Pending'); const saving = h.click('accountSave');
   h.end(); pending.resolve({ id: 7, username: 'ordinary', display_name: 'Pending', role: 'user' }); await saving;
   assert.equal(h.actor, null); assert.equal(h.get('accountUsername').textContent, ''); assert.equal(h.get('accountDisplayName').value, '');
@@ -46,4 +44,29 @@ test('authenticated API aborts old session requests and rejects late JSON instea
   const loading = module.namespace.api('/api/me', { method: 'PATCH', body: '{}' }); await Promise.resolve();
   assert.equal(request.headers['X-CSRF-Token'], 'test'); events.sessionended(); assert.equal(request.signal.aborted, true);
   pending.resolve({ username: 'previous-account' }); await assert.rejects(loading, (error) => error.name === 'AbortError');
+});
+
+test('profile draft survives closing without retaining an inflight request', async () => {
+  const h = await setup(); await h.account.load(); await h.input('accountDisplayName', 'Draft');
+  h.account.close(); await h.account.load();
+  assert.equal(h.get('accountDisplayName').value, 'Draft'); assert.equal(h.get('accountSave').disabled, false);
+  assert.equal(h.calls.length, 1);
+});
+
+test('same-owner actor updates keep a profile draft, owner changes clear it and ignore a late profile response', async () => {
+  const h = await setup(); await h.account.load(); await h.input('accountDisplayName', 'Draft');
+  h.switchActor({ ...h.actor, display_name: 'Updated elsewhere' });
+  assert.equal(h.get('accountDisplayName').value, 'Draft'); assert.equal(h.get('accountSave').disabled, false);
+  const pending = deferred(); h.respond(pending.promise); const saving = h.click('accountSave');
+  h.switchActor({ id: 8, username: 'another', display_name: 'Another', role: 'user' });
+  assert.equal(h.calls.at(-1).options.signal.aborted, true); assert.equal(h.get('accountDisplayName').value, '');
+  pending.resolve({ id: 7, username: 'ordinary', display_name: 'Old result', role: 'user' }); await saving;
+  assert.equal(h.actor.id, 8); assert.equal(h.get('accountUsername').textContent, 'another'); assert.equal(h.get('accountDisplayName').value, '');
+});
+
+test('closing during a profile lookup aborts it and a late response cannot refill the profile', async () => {
+  const h = await setup(); const pending = deferred(); h.respond(pending.promise); const loading = h.account.load();
+  h.account.close(); assert.equal(h.calls[0].options.signal.aborted, true);
+  pending.resolve({ id: 7, username: 'ordinary', display_name: 'Late private profile', role: 'user' }); await loading;
+  assert.equal(h.get('accountDisplayName').value, '');
 });

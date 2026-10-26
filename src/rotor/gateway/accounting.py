@@ -6,6 +6,7 @@ from sqlalchemy import case, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.core.resource_scopes import ResourceScopes, resolve_resource_scopes
+from rotor.core.user_access import AccountPrincipal
 from rotor.models.channel import Channel
 from rotor.models.log import RequestLog
 from rotor.models.token import Token
@@ -96,7 +97,7 @@ class AccountingService:
         db: AsyncSession,
         *,
         request_id: str,
-        token: Token | None,
+        token: Token | AccountPrincipal | None,
         model: str,
         request_protocol: str,
         decision,
@@ -123,6 +124,7 @@ class AccountingService:
             ),
             feature_snapshot={
                 **(features or {}),
+                **({"owner_id": token.owner_id} if isinstance(token, AccountPrincipal) else {}),
                 "session_lease": {
                     "preferred_channel_id": getattr(
                         decision, "lease_channel_id", None
@@ -144,7 +146,7 @@ class AccountingService:
         request_id: str,
         conversation_id: str | None,
         request_protocol: str,
-        token: Token,
+        token: Token | AccountPrincipal,
         channel: Channel,
         model: str,
         provider_model: str | None,
@@ -252,7 +254,7 @@ class AccountingService:
         db: AsyncSession,
         *,
         request_id: str,
-        token: Token,
+        token: Token | AccountPrincipal,
         channel: Channel,
         model: str,
         lease_session_id: str | None,
@@ -272,6 +274,7 @@ class AccountingService:
             db,
             request_id=request_id,
             token_id=token.id,
+            owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
             session_id=lease_session_id,
             logical_model=model,
             channel_id=channel.id,
@@ -535,7 +538,7 @@ class AccountingService:
     async def _update_token_counters(
         self,
         db: AsyncSession,
-        token: Token,
+        token: Token | AccountPrincipal,
         usage: UsageData,
     ) -> None:
         # Requests can hold stale Token objects while waiting for upstream.
@@ -545,6 +548,8 @@ class AccountingService:
             await db.execute(update(AdminUser).where(AdminUser.id == token.owner_id).values(
                 used_quota=AdminUser.used_quota + usage.total_tokens
             ).execution_options(synchronize_session=False))
+        if isinstance(token, AccountPrincipal):
+            return
         await db.execute(
             update(Token)
             .where(Token.id == token.id)

@@ -1,7 +1,6 @@
 from rotor.adapters.base import AnthropicCompatibleAdapter
 from rotor.adapters.protocol.converter import ProtocolConverter
-from rotor.models.channel import Channel
-from httpx import AsyncClient, Response
+from httpx import Response
 from typing import AsyncIterator, Any
 from copy import deepcopy
 from rotor.schemas.request import ChatCompletionRequest

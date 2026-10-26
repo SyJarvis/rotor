@@ -1,8 +1,9 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, unquote
 
-from pydantic import Field, model_validator
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import SettingsConfigDict
 from pydantic_settings import BaseSettings
 
@@ -10,6 +11,37 @@ from rotor import __version__ as ROTOR_VERSION
 
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "rotor"
+
+
+def oauth_redirect_parts(uri: str):
+    """Validate a registered redirect without trusting URL normalization."""
+    if not isinstance(uri, str) or len(uri) > 2048 or any(
+        ord(character) <= 32 or ord(character) == 127
+        for character in unquote(uri)
+    ) or "\\" in unquote(uri):
+        raise ValueError("OAuth redirect URI contains invalid characters")
+    parsed = urlsplit(uri)
+    if (parsed.username is not None or parsed.password is not None
+            or parsed.fragment or parsed.query or "?" in uri or "#" in uri
+            or not parsed.hostname or not parsed.path.startswith("/")):
+        raise ValueError("OAuth redirect URI must have a host and path, without credentials, query or fragment")
+    _ = parsed.port
+    if parsed.scheme == "https":
+        return parsed
+    if parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "::1"}:
+        return parsed
+    raise ValueError("OAuth redirect URI must use HTTPS or a loopback IP")
+
+
+class OAuthClientSettings(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    redirect_uris: list[str] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_redirects(self):
+        for uri in self.redirect_uris:
+            oauth_redirect_parts(uri)
+        return self
 
 
 class Settings(BaseSettings):
@@ -33,6 +65,24 @@ class Settings(BaseSettings):
     VERSION: str = ROTOR_VERSION
 
     API_KEY_PREFIX: str = "sk-"
+    ROTOR_OAUTH_CLIENTS: dict[str, OAuthClientSettings] = Field(default_factory=lambda: {
+        "rotor-client": OAuthClientSettings(name="Rotor Client", redirect_uris=[
+            "http://127.0.0.1/auth/callback", "http://[::1]/auth/callback",
+        ]),
+    })
+    ROTOR_OAUTH_ISSUER: str | None = None
+
+    @model_validator(mode="after")
+    def validate_oauth_settings(self):
+        for client_id in self.ROTOR_OAUTH_CLIENTS:
+            if not client_id or len(client_id) > 100 or any(ord(char) <= 32 or ord(char) == 127 for char in client_id):
+                raise ValueError("OAuth client IDs must contain 1–100 non-space characters")
+        if self.ROTOR_OAUTH_ISSUER is not None:
+            parsed = oauth_redirect_parts(self.ROTOR_OAUTH_ISSUER.rstrip("/") + "/")
+            if parsed.scheme != "https":
+                raise ValueError("ROTOR_OAUTH_ISSUER must use HTTPS")
+            self.ROTOR_OAUTH_ISSUER = self.ROTOR_OAUTH_ISSUER.rstrip("/")
+        return self
     ROTOR_DEFAULT_ADMIN_USERNAME: str = "admin"
     ROTOR_DEFAULT_ADMIN_PASSWORD: str = "123456"
     ROTOR_ADMIN_SESSION_IDLE_SECONDS: int = 1800

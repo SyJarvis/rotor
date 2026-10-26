@@ -9,8 +9,7 @@ from rotor.models.token import Token
 from rotor.models.channel import Channel
 from rotor.core.exceptions import AuthenticationException, ModelNotFoundException
 from rotor.core.security import validate_api_key_format
-from rotor.config import settings
-from rotor.core.user_access import validate_token_access, effective_permissions
+from rotor.core.user_access import AccountPrincipal, validate_token_access, effective_permissions
 
 security = HTTPBearer(auto_error=False)
 
@@ -24,6 +23,12 @@ async def get_current_token(
     token_key = credentials.credentials if credentials else x_api_key
     if not token_key:
         raise AuthenticationException("Missing Authorization or x-api-key header")
+
+    from rotor.services.client_oauth import ACCESS_PREFIX, resolve_access_token
+    if credentials and token_key.startswith(ACCESS_PREFIX):
+        return await resolve_access_token(db, token_key)
+    if token_key.startswith((ACCESS_PREFIX, "rotor-refresh-", "rotor-code-")):
+        raise AuthenticationException("Use an OAuth access token in the Authorization Bearer header")
 
     if not validate_api_key_format(token_key):
         raise AuthenticationException("Invalid token format")
@@ -68,6 +73,12 @@ async def get_optional_token(
     if not token_key:
         return None
 
+    from rotor.services.client_oauth import ACCESS_PREFIX, resolve_access_token
+    if credentials and token_key.startswith(ACCESS_PREFIX):
+        return await resolve_access_token(db, token_key)
+    if token_key.startswith((ACCESS_PREFIX, "rotor-refresh-", "rotor-code-")):
+        raise AuthenticationException("Use an OAuth access token in the Authorization Bearer header")
+
     if not validate_api_key_format(token_key):
         return None
 
@@ -84,7 +95,7 @@ async def get_optional_token(
 
 async def get_available_channels(
     model: str,
-    token: Optional[Token] = None,
+    token: Token | AccountPrincipal | None = None,
     db: AsyncSession = Depends(get_db)
 ) -> list[Channel]:
     """Get available channels for a given model."""

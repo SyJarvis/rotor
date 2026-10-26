@@ -6,7 +6,7 @@ import {
   escapeHtml, formatRequestCount, formatTimeInTimezone, refreshIcons,
 } from "../ui.js";
 
-import * as performance from "./performance.js?v=2";
+import * as performance from "./performance.js?v=3";
 
 let loadSequence = 0;
 let selected = "performance";

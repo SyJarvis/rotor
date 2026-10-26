@@ -26,7 +26,7 @@ from rotor.core.anthropic_errors import (
 )
 from rotor.core.middleware import LoggingMiddleware
 from rotor.core.logging_config import LOG_FORMAT, configure_file_logging
-from rotor.api.v1 import chat, embeddings, images, models, anthropic, responses
+from rotor.api.v1 import chat, embeddings, images, models, anthropic, responses, usage
 from rotor.api.v1 import anthropic_models
 from rotor.api.admin import (
     auth as admin_auth,
@@ -39,7 +39,7 @@ from rotor.api.admin import (
     monitoring,
     settings as admin_settings,
 )
-from rotor.api import users, chat as user_chat
+from rotor.api import users, chat as user_chat, client_oauth
 from rotor.api.control import channels as control_channels
 from rotor.api.control import requests as control_requests
 from rotor.core.control_auth import (
@@ -89,10 +89,17 @@ async def lifespan(app: FastAPI):
 
     conversation_store.attach()
 
+    # Keep channel plan-usage snapshots current so quota state, not guessed
+    # deadlines, drives channel-wide cooldowns.
+    from rotor.services.quota_refresher import refresher
+
+    refresher.start()
+
     yield
 
     # Shutdown
     logger.info("Shutting down Rotor...")
+    await refresher.stop()
     await conversation_store.shutdown()
 
 
@@ -141,6 +148,7 @@ app.add_exception_handler(
     control_api_exception_handler,
 )
 app.add_exception_handler(Exception, general_exception_handler)
+app.add_exception_handler(client_oauth.OAuthError, client_oauth.oauth_error_handler)
 
 
 @app.get("/anthropic/api/hello")
@@ -198,11 +206,13 @@ async def frontend_index():
 
 
 # Include routers
+app.include_router(client_oauth.router)
 app.include_router(chat.router, prefix=settings.API_V1_STR, tags=["chat"])
 app.include_router(responses.router, prefix=settings.API_V1_STR, tags=["responses"])
 app.include_router(embeddings.router, prefix=settings.API_V1_STR, tags=["embeddings"])
 app.include_router(images.router, prefix=settings.API_V1_STR, tags=["images"])
 app.include_router(models.router, prefix=settings.API_V1_STR, tags=["models"])
+app.include_router(usage.router, prefix=settings.API_V1_STR, tags=["usage"])
 # Anthropic-compatible endpoint
 app.include_router(anthropic.router, prefix="/anthropic/v1", tags=["anthropic"])
 app.include_router(anthropic_models.router, prefix="/anthropic/v1", tags=["anthropic"])

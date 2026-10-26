@@ -9,7 +9,9 @@
 - 未发送 `Authorization` 或 `x-api-key`；
 - 使用了上游供应商 Key，而不是 Rotor 生成的 Key；
 - Key 不以配置的 `API_KEY_PREFIX` 开头；
-- Token 已禁用、过期或达到配额。
+- API Key 已禁用、过期，或达到配额后被自动禁用；
+- OAuth access token 已到期、授权已撤销、账户已停用或密码已变更；
+- 将 OAuth access token 放在 `x-api-key` 中，或使用授权码、refresh token 推理。
 
 检查：
 
@@ -18,7 +20,13 @@ curl http://127.0.0.1:8000/v1/models \
   -H "Authorization: Bearer $ROTOR_API_KEY"
 ```
 
-查看 Token 管理记录请登录管理页面；命令行访问管理 API 需要先建立管理员 Session。
+`GET /v1/models` 允许无凭证访问，部分格式不匹配的旧 API Key 输入也会按匿名处理，
+不能只凭该接口返回 `200` 判断认证成功。OAuth 续期和重新授权步骤见
+[客户端网页登录授权](../guides/client-oauth.md)。
+
+查看 Key 管理记录请登录管理页面；OAuth 授权在“设置 → 登录与安全 → 设备管理”中
+管理。命令行访问管理 API 需要先建立管理员 Session。账户额度不足返回 `429`；
+账户所属 Key、网页对话与 OAuth 共用账号额度，补充账号额度后可恢复请求。
 
 ## 管理页面要求修改密码
 
@@ -28,8 +36,8 @@ curl http://127.0.0.1:8000/v1/models \
 
 ## `Model not found`
 
-Rotor 只路由到启用渠道中 `models` 或 `model_mapping` 键包含的模型。还要确认当前
-Token 的 `allowed_channels` 没有排除相应渠道：
+Rotor 只路由到启用渠道中 `models` 或 `model_mapping` 键包含的模型。还要确认账户
+或 Key 的实际渠道、模型权限没有排除目标；账户所属 Key 使用两层权限的交集：
 
 ```bash
 curl http://127.0.0.1:8000/v1/models \
@@ -63,7 +71,7 @@ curl http://127.0.0.1:8000/v1/models \
 - Responses 请求使用了必须原生支持的 hosted tool 或状态化能力；
 - 渠道 `extra.capabilities` 缺少请求要求的能力；
 - 只有原生协议之外的渠道可用；
-- Token 渠道限制排除了兼容渠道。
+- 账户或 Key 的实际渠道、模型权限排除了兼容渠道。
 
 通过管理页检查渠道协议和能力探测结果。原生 Responses 功能需要
 `protocol=openai_responses`。
@@ -84,7 +92,8 @@ available channels: [..., 'reasons': ['capability_mismatch'] ...]
    logical model。
 3. 如果只是基础文本或可转换的 function tool，检查 Channel 的
    `extra.capabilities` 是否显式遗漏了 `stream`、`function_call` 或 `vision`。
-4. 检查当前 Rotor Token 的 `allowed_channels`，以及候选 Channel 是否处于 cooldown。
+4. 检查当前账户或 Key 的 `allowed_channels`、`allowed_models`；账户所属 Key 检查
+   两层限制的交集，同时确认候选 Channel 是否处于 cooldown。
 
 不要只给 Channel 添加 `responses_native` 能力来绕过错误；这是协议路由约束，最终仍需
 由 `Channel.protocol` 提供对应的原生适配器。日志默认不含完整上游请求 body；请先检查

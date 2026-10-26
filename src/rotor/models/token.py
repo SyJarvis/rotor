@@ -1,5 +1,5 @@
-from sqlalchemy import Index, text, Column, Integer, String, Boolean, DateTime, func, ForeignKey, JSON
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import Index, text, Integer, String, Boolean, DateTime, func, ForeignKey, JSON
+from sqlalchemy.orm import Mapped, mapped_column
 from rotor.database import Base
 from typing import Optional
 from datetime import datetime

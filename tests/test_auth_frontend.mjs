@@ -52,6 +52,7 @@ async function environment({ networkFails = false, status = 200, importFails = f
     createElement: () => element(), getElementById: (id) => nodes.get(id) || null,
   };
   let reloads = 0, imports = 0, failImport = importFails;
+  const importPaths = [];
   const window = { addEventListener() {}, location: { href, pathname: new URL(href).pathname, reload() { reloads++; } } };
   window.history = { replaceState(_state, _title, url) { window.cleanUrl = url; window.location.href = new URL(url, window.location.href).href; } };
   vm.runInNewContext(configSource, { window });
@@ -62,18 +63,20 @@ async function environment({ networkFails = false, status = 200, importFails = f
       if (networkFails) throw new TypeError('Failed to fetch');
       if (path === '/api/auth/register' && registrationError) return { ok: false, status: 400, json: async () => ({ detail: registrationError }) };
       if (path === '/api/auth/register') return { ok: true, json: async () => ({ id: 8, username: 'new-user', role: 'user', must_change_password: false }) };
+      if (path === '/api/auth/login' || path === '/api/auth/change-password') return { ok: true, json: async () => ({ id: 7, username: 'test-user', role: 'user', must_change_password: false }) };
       return { ok: status === 200, status, json: async () => ({ id: 7, username: 'test-user', role: 'user', must_change_password: mustChangePassword }) };
     },
   });
   const module = new vm.SourceTextModule(authSource + '\nexport { appLoaded, startApp, submitRegister };', { context,
-    importModuleDynamically: async () => {
+    importModuleDynamically: async (specifier) => {
+      importPaths.push(specifier);
       imports++; window.pendingDuringImport = body.classList.contains("auth-pending");
       if (failImport) throw new SyntaxError("The requested module './i18n.js' does not provide an export named 'setLocale'");
       const app = new vm.SyntheticModule([], () => {}, { context }); await app.link(() => {}); await app.evaluate(); return app;
     },
   });
   await module.link(() => new vm.SyntheticModule(['setActor', 'endSession'], function () { this.setExport('setActor', (value) => { window.ROTOR_ACTOR = value; }); this.setExport('endSession', () => { window.ROTOR_ACTOR = null; }); }, { context })); await module.evaluate();
-  return { module, document, window, requests, get: (id) => nodes.get(id), get imports() { return imports; }, get reloads() { return reloads; }, get activeElement() { return activeElement; }, allowImport() { failImport = false; }, allowRegistration() { registrationError = null; } };
+  return { module, document, window, requests, importPaths, get: (id) => nodes.get(id), get imports() { return imports; }, get reloads() { return reloads; }, get activeElement() { return activeElement; }, allowImport() { failImport = false; }, allowRegistration() { registrationError = null; } };
 }
 
 test('module startup failure is distinct from service failure, keeps loaded false, and offers reload without clearing session', async () => {
@@ -178,4 +181,65 @@ test('rejected registration preserves all fields and allows replacing the invita
   const registrations = h.requests.filter(({ path }) => path === '/api/auth/register');
   assert.equal(JSON.parse(registrations[1].options.body).invite_token, 'replacement-code');
   assert.equal(h.window.ROTOR_ACTOR.role, 'user'); assert.equal(form.resetCount, 1);
+});
+
+const oauthQuery = 'response_type=code&client_id=coding-agent&redirect_uri=http%3A%2F%2Flocalhost%3A8123%2Fcallback&state=state%2Bvalue&code_challenge=challenge&code_challenge_method=S256&scope=inference';
+
+test('authorization loads its standalone module while the console retains its app module', async () => {
+  for (const path of ['/oauth/authorize']) {
+    const h = await environment({ href: `http://localhost${path}?${oauthQuery}` });
+    assert.deepEqual(h.importPaths, ['./client-authorization.js?v=2']);
+    assert.equal(h.document.body.classList.contains('auth-pending'), false);
+  }
+  const console = await environment();
+  assert.deepEqual(console.importPaths, ['./app.js?v=68']);
+});
+
+test('authorization parameters survive registration switching, registration completion and page refresh', async () => {
+  const href = `http://localhost/oauth/authorize?${oauthQuery}`;
+  const h = await environment({ status: 401, href });
+  const registrationLink = new URL(h.get('openRegistration').href, href);
+  assert.equal(registrationLink.searchParams.get('state'), 'state+value');
+  assert.equal(registrationLink.searchParams.get('register'), '1');
+  h.get('openRegistration').click();
+  const registeredUrl = new URL(h.window.location.href);
+  assert.equal(registeredUrl.searchParams.get('register'), '1');
+  assert.equal(registeredUrl.searchParams.get('state'), 'state+value');
+  const refreshed = await environment({ status: 401, href: registeredUrl.href });
+  assert.equal(refreshed.get('registerPanel').classList.contains('hidden'), false);
+  h.get('backToLogin').click();
+  assert.equal(h.window.location.href, href);
+  h.get('openRegistration').click();
+  await fillRegistration(h).submit();
+  assert.equal(h.window.location.href, href);
+  assert.deepEqual(h.importPaths, ['./client-authorization.js?v=2']);
+});
+
+test('authorization parameters survive ordinary login and required password change', async () => {
+  const href = `http://localhost/oauth/authorize?${oauthQuery}`;
+  const login = await environment({ status: 401, href });
+  const loginForm = login.get('adminLoginForm');
+  loginForm.elements.username.value = 'test-user'; loginForm.elements.password.value = 'test-password';
+  await loginForm.submit();
+  assert.equal(login.window.location.href, href);
+  assert.deepEqual(login.importPaths, ['./client-authorization.js?v=2']);
+  const reset = await environment({ mustChangePassword: true, href });
+  const resetForm = reset.get('adminPasswordForm');
+  resetForm.elements.current_password.value = 'old-password';
+  resetForm.elements.new_password.value = 'new-password'; resetForm.elements.confirm_password.value = 'new-password';
+  await resetForm.submit();
+  assert.equal(reset.window.location.href, href);
+  assert.deepEqual(reset.importPaths, ['./client-authorization.js?v=2']);
+});
+
+test('security deep link survives sign-in and registration while root registration keeps its clean URL', async () => {
+  const href = 'http://localhost/?settings=security&other=preserved#anchor';
+  const h = await environment({ status: 401, href });
+  const link = new URL(h.get('openRegistration').href, href);
+  assert.equal(link.searchParams.get('settings'), 'security'); assert.equal(link.hash, '#anchor');
+  h.get('openRegistration').click(); await fillRegistration(h).submit();
+  assert.equal(h.window.location.href, href); assert.deepEqual(h.importPaths, ['./app.js?v=68']);
+  const login = await environment({ status: 401, href });
+  login.get('adminLoginForm').elements.username.value = 'test-user'; login.get('adminLoginForm').elements.password.value = 'test-password';
+  await login.get('adminLoginForm').submit(); assert.equal(login.window.location.href, href);
 });

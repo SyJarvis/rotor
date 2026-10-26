@@ -8,8 +8,11 @@ from threading import RLock
 from typing import Callable, Iterable, Optional
 
 from rotor.application_settings import application_settings
+from rotor.core.exceptions import normalize_upstream_error
+from rotor.gateway.fallback import CONNECT_COOLDOWN_SECONDS, is_connect_failure
 from rotor.models.channel import Channel
 from rotor.models.token import Token
+from rotor.services import quota_refresher
 from rotor.services.loadbalancer import LoadBalancer
 from rotor.gateway.adaptive import AdaptiveScorer, AdaptiveWeights
 
@@ -23,6 +26,9 @@ class RoutingDecision:
     lease_used: bool = False
     temporarily_unavailable: bool = False
     retry_after_seconds: int | None = None
+    # True when a plan-limit (quota) cooldown is among the blockers; lets the
+    # client-facing error say usage_limit_reached instead of a generic retry.
+    plan_limited: bool = False
     lease_reassessment_attempted: bool = False
 
 
@@ -44,6 +50,9 @@ class _Cooldown:
     generation: int = 0
     probe: AttemptAdmission | None = None
     cooldown_seconds: float = 30.0
+    # "plan_limit" cooldowns are quota-driven and lifted by a healthy usage
+    # snapshot; everything else is a transient provider failure.
+    reason: str = "transient"
 
 
 _RESPONSES_PROTOCOLS = {"responses", "openai_responses"}
@@ -166,6 +175,10 @@ class RoutingEngine:
                 ]
                 lease_used = True
 
+        if compatible and not active:
+            wait, plan_limited = self.cooldown_outlook(model, compatible)
+        else:
+            wait, plan_limited = None, False
         return RoutingDecision(
             candidates=ordered,
             strategy=self.strategy,
@@ -173,9 +186,8 @@ class RoutingEngine:
             lease_channel_id=preferred_channel_id,
             lease_used=lease_used,
             temporarily_unavailable=bool(compatible and not active),
-            retry_after_seconds=(
-                self.retry_after_seconds(model, compatible) if compatible and not active else None
-            ),
+            retry_after_seconds=wait,
+            plan_limited=plan_limited,
             lease_reassessment_attempted=lease_reassessment_attempted,
         )
 
@@ -273,6 +285,22 @@ class RoutingEngine:
                     delays.append(max(1.0 if state.probe is not None else 0.0, state.deadline - now))
             return max(1, math.ceil(min(delays))) if delays else 1
 
+    def cooldown_outlook(self, model: str, channels: Iterable[Channel]) -> tuple[int, bool]:
+        """Advisory wait plus whether a plan-limit cooldown is among the blockers."""
+        with self._lock:
+            now = self._now()
+            delays = []
+            plan_limited = False
+            for channel in channels:
+                state = self._cooldowns.get((model, channel.id))
+                if state is None:
+                    continue
+                delays.append(max(1.0 if state.probe is not None else 0.0, state.deadline - now))
+                if state.reason == "plan_limit":
+                    plan_limited = True
+            wait = max(1, math.ceil(min(delays))) if delays else 1
+            return wait, plan_limited
+
     def available_native_channel_ids(
         self,
         channels: Iterable[Channel],
@@ -316,6 +344,9 @@ class RoutingEngine:
         model: str,
         channel: Channel,
         cooldown_seconds: float | None = None,
+        *,
+        channel_wide: bool = False,
+        reason: str = "transient",
     ) -> None:
         """Temporarily suppress a channel after a retryable provider failure."""
         if cooldown_seconds is None:
@@ -326,28 +357,68 @@ class RoutingEngine:
                 cooldown_seconds = 30
         if not math.isfinite(cooldown_seconds) or cooldown_seconds < 0:
             cooldown_seconds = 30
+        targets = [model]
+        if channel_wide:
+            # Plan-level limits (e.g. ChatGPT Codex usage_limit_reached) block the
+            # whole account, so every model the channel serves must cool down,
+            # not just the one that happened to hit the error first.
+            targets += [entry for entry in (channel.models or []) if entry != model]
         with self._lock:
-            key = (model, channel.id)
-            state = self._cooldowns.get(key)
-            if state is None:
-                self._cooldowns[key] = _Cooldown(
-                    self._now() + cooldown_seconds,
-                    cooldown_seconds=cooldown_seconds,
-                )
-            else:
-                deadline = self._now() + cooldown_seconds
-                if deadline > state.deadline:
-                    state.cooldown_seconds = cooldown_seconds
-                state.deadline = max(state.deadline, deadline)
-                state.generation += 1
+            for target in targets:
+                key = (target, channel.id)
+                state = self._cooldowns.get(key)
+                if state is None:
+                    self._cooldowns[key] = _Cooldown(
+                        self._now() + cooldown_seconds,
+                        cooldown_seconds=cooldown_seconds,
+                        reason=reason,
+                    )
+                else:
+                    deadline = self._now() + cooldown_seconds
+                    if deadline > state.deadline:
+                        state.cooldown_seconds = cooldown_seconds
+                    state.deadline = max(state.deadline, deadline)
+                    state.generation += 1
+                    if reason == "plan_limit":
+                        # A quota-driven mark upgrades a transient entry so a
+                        # healthy snapshot can later lift the whole plan cooldown.
+                        state.reason = reason
 
-    def clear_cooldown(self, model: str | None, channel_id: int) -> list[str]:
-        """Clear process-local cooldowns for one model or an entire channel."""
+    def mark_failure(self, model: str, channel: Channel, exc: Exception) -> None:
+        """Cool a channel based on a provider failure's normalized error fact."""
+        fact = normalize_upstream_error(exc)
+        cooldown = fact.retry_after_seconds
+        if cooldown is None and is_connect_failure(exc):
+            # Connect blips are short-lived; a long exile would scatter the
+            # session's cache across accounts while the channel recovers.
+            cooldown = CONNECT_COOLDOWN_SECONDS
+        self.mark_unavailable(
+            model,
+            channel,
+            cooldown,
+            channel_wide=fact.channel_wide_cooldown,
+            reason="plan_limit" if fact.plan_limit else "transient",
+        )
+        if fact.plan_limit:
+            # Let the quota refresher replace the guessed horizon with the
+            # provider's actual window state.
+            quota_refresher.refresher.schedule(channel.id)
+
+    def clear_cooldown(
+        self, model: str | None, channel_id: int, *, reason: str | None = None
+    ) -> list[str]:
+        """Clear process-local cooldowns for one model or an entire channel.
+
+        ``reason`` restricts the clear to cooldowns with that origin (a healthy
+        quota snapshot lifts plan-limit entries only); None clears everything.
+        """
         with self._lock:
             keys = [
                 key
-                for key in self._cooldowns
-                if key[1] == channel_id and (model is None or key[0] == model)
+                for key, state in self._cooldowns.items()
+                if key[1] == channel_id
+                and (model is None or key[0] == model)
+                and (reason is None or state.reason == reason)
             ]
             for key in keys:
                 self._cooldowns.pop(key)

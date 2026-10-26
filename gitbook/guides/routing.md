@@ -65,8 +65,9 @@ curl -X PUT -b "$ROTOR_ADMIN_COOKIE_JAR" \
 
 启用 `affinity_enabled` 后，携带相同稳定 Session ID 的请求会获得稳定的加权渠道顺序。
 Session 可以来自显式 `X-Conversation-Id` / `X-Rotor-Session-Id`，也可以来自 Rotor
-已识别的 Codex、Claude Code 和 OpenCode 请求头。不同 Rotor Token 的 Session 会隔离
-命名空间。没有稳定 Session 信号时不启用亲和。
+已识别的 Codex、Claude Code 和 OpenCode 请求头。API Key 请求按 Key ID 隔离 Session；
+网页对话与 OAuth 按账户 ID 隔离，同账户多个 OAuth 授权共享账号命名空间，但与该账户
+的各个 Key 命名空间分开。没有稳定 Session 信号时不启用亲和。
 
 除 `weighted` 外，新 Session 的亲和排序仍然服从优先级边界。adaptive 使用亲和结果
 作为同分渠道的决胜顺序。
@@ -74,7 +75,8 @@ Session 可以来自显式 `X-Conversation-Id` / `X-Rotor-Session-Id`，也可�
 ## Session Lease
 
 `session_lease_enabled=true` 时，Rotor 会持久化
-`(Rotor Token, session_id, logical_model) -> channel`。路由前读取仍有效的租约；租约
+`(认证范围, session_id, logical_model) -> channel`，认证范围为 API Key ID 或账户 ID。
+路由前读取仍有效的租约；租约
 渠道仍健康且兼容时优先使用。只有成功的上游请求才 assigned/renewed 租约；fallback
 成功后迁移到实际成功渠道，因此旧渠道 cooldown 结束也不会立即抢回活跃 Session。
 

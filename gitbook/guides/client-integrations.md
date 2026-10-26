@@ -1,7 +1,15 @@
 # 接入 Codex、Claude Code 与 OpenCode
 
 本页给出仓库随附配置模板的使用方式。开始前先启动 Rotor、创建用户 Token，并
-确认目标模型可见：
+确认目标模型可见。本页随附的 Codex、Claude Code 和 OpenCode 模板均使用 API Key；
+它们不会自动把客户端的原生 `login` 流程接入 Rotor。需要免复制 Key 的客户端，应
+另行实现 [Rotor 网页登录授权](client-oauth.md)的授权码与 PKCE 流程。
+
+账户名下的 API Key 请求遵循所属账户与 Key 自身的权限和额度。Rotor OAuth 与网页对话直接使用
+账户，不依赖默认或 `base` Key；同一账户的这些请求共享账户额度。上游 [ChatGPT OAuth 渠道](chatgpt-oauth.md)
+只负责 Rotor 到 ChatGPT 的认证，不能代替客户端向 Rotor 登录。
+
+检查服务与当前 Key 可见的模型：
 
 ```bash
 export ROTOR_BASE_URL=http://127.0.0.1:8000

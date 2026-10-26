@@ -73,7 +73,7 @@ async function environment({ listedChannels = [], channelDetails = {}, detailErr
   };
   const context = vm.createContext({
     document: { getElementById: getNode, querySelectorAll: () => [], querySelector: () => null, addEventListener() {}, },
-    window: {}, Element: class {},
+    window: { location: { href: "http://localhost/" } }, Element: class {}, URL,
     setTimeout: () => 1, clearTimeout() {},
     FormData: class { constructor(target) { this.target = target; } get(name) { return name === 'enabled' ? (this.target.elements.enabled.checked ? 'on' : null) : this.target.elements[name]?.value; } },
   });

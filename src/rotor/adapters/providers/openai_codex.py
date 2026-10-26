@@ -89,10 +89,14 @@ class OpenAICodexAdapter(OpenAIResponsesAdapter):
             )
         body["store"] = False
         body["stream"] = True
+        # The Chat Completions -> Responses converter materializes schema
+        # defaults (notably temperature=1.0). ChatGPT Codex rejects this
+        # parameter, including when it came from a default rather than the
+        # client's JSON body.
+        body.pop("temperature", None)
         if request.responses_payload is None:
-            for name in ("temperature", "top_p"):
-                if name not in request.model_fields_set:
-                    body.pop(name, None)
+            if "top_p" not in request.model_fields_set:
+                body.pop("top_p", None)
             system_items = [
                 item for item in body.get("input", [])
                 if isinstance(item, dict) and item.get("role") in {"system", "developer"}

@@ -31,7 +31,7 @@ def test_all_cooling_channels_have_no_candidates_and_retry_after_rounds_up(state
     assert not engine.diagnose([first], "model")[0]["routable"]
     request = Request({"type": "http", "method": "POST", "path": "/v1/chat/completions", "headers": []})
     response = asyncio.run(api_router_exception_handler(request, ChannelsTemporarilyUnavailable("model", decision.retry_after_seconds)))
-    assert response.status_code == 503
+    assert response.status_code == 429
     assert response.headers["Retry-After"] == "3"
     assert b"channels_temporarily_unavailable" in response.body
 

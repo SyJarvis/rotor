@@ -13,7 +13,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from rotor.api.admin import chat as engine
 from rotor.config import settings
 from rotor.core.admin_auth import AdminActor, require_user_access
-from rotor.core.user_access import resolve_default_chat_token
 from rotor.services.user_chat_store import ChatStore, ChatStoreError, GenerationLease
 
 
@@ -108,6 +107,8 @@ async def get_conversation(conversation_id: str, actor: AdminActor = Depends(req
 @router.patch("/conversations/{conversation_id}")
 async def patch_conversation(conversation_id: str, payload: ConversationPatch, actor: AdminActor = Depends(require_user_access)):
     changes = payload.model_dump(exclude={"expected_revision", "expected_draft_revision"}, exclude_none=True)
+    if payload.settings is not None:
+        changes["settings"] = payload.settings.model_dump()
     return await _call(_store().patch, actor.user_id, conversation_id, payload.expected_revision, changes,
                        expected_draft=payload.expected_draft_revision)
 
@@ -161,7 +162,7 @@ async def _canonical_request(store: ChatStore, user_id: int, conversation: dict)
 
 
 async def _persisted_stream(store: ChatStore, lease: GenerationLease, conversation: dict, payload: engine.AdminChatRequest,
-                            request: Request, token) -> Any:
+                            request: Request, principal) -> Any:
     content = ""
     persisted = ""
     terminal = False
@@ -192,7 +193,7 @@ async def _persisted_stream(store: ChatStore, lease: GenerationLease, conversati
 
     try:
         yield engine._sse({"type": "start", "conversation": conversation, "revision": conversation["revision"]})
-        async with aclosing(engine._completion_events(payload, request, token)) as events:
+        async with aclosing(engine._completion_events(payload, request, principal)) as events:
             async for event in events:
                 if checkpoint_error is not None:
                     raise RuntimeError("Chat response could not be saved")
@@ -267,7 +268,7 @@ async def _begin_generation(store: ChatStore, user_id: int, payload: CompletionR
 
 @router.post("/completions")
 async def completions(payload: CompletionRequest, request: Request, actor: AdminActor = Depends(require_user_access)):
-    token = await resolve_default_chat_token(actor, payload.settings.model)
+    principal = await engine._chat_principal(payload.settings.model, actor)
     store = _store()
     conversation, lease = await _begin_generation(store, actor.user_id, payload)
     try:
@@ -283,5 +284,5 @@ async def completions(payload: CompletionRequest, request: Request, actor: Admin
             raise HTTPException(400, "Conversation exceeds the supported message or attachment limits") from None
         raise
     return _StoredChatResponse(
-        _persisted_stream(store, lease, conversation, canonical, request, token), store, lease,
+        _persisted_stream(store, lease, conversation, canonical, request, principal), store, lease,
     )

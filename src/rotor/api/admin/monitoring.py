@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.application_settings import application_settings
@@ -34,13 +34,14 @@ _AGENTS = (
     ("mindcode", "MindCode"),
 )
 _SUMMARY_LIMIT = 180
-SessionKey = tuple[str, int, str]
-RequestKey = tuple[int, str]
+SessionKey = tuple[str, int | str, str]
+RequestKey = tuple[int | str, str]
 
 
 class MonitoringSession(BaseModel):
     session_id: str
-    token_id: int
+    token_id: int | None
+    owner_id: int | None = None
     summary: str | None
     turn_count: int
     total_tokens: int
@@ -88,6 +89,14 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _identity_scope(token_id: int | None, owner_id: int | None) -> int | str | None:
+    if token_id is not None:
+        return token_id
+    if type(owner_id) is int and owner_id > 0:
+        return f"account:{owner_id}"
+    return None
+
+
 @router.get("/sources", response_model=MonitoringSourcesResponse)
 async def get_monitoring_sources(
     db: AsyncSession = Depends(get_db),
@@ -120,8 +129,9 @@ async def get_monitoring_sources(
         agent_id = features.get("client_source")
         if agent_id not in agent_ids:
             agent_id = SESSION_SOURCE_TO_CLIENT.get(source)
-        if agent_id is not None and row.token_id is not None:
-            request_key = (row.token_id, row.request_id)
+        scope = _identity_scope(row.token_id, features.get("owner_id"))
+        if agent_id is not None and scope is not None:
+            request_key = (scope, row.request_id)
             source_by_request[request_key] = agent_id
             if source:
                 session_requests.add(request_key)
@@ -131,13 +141,14 @@ async def get_monitoring_sources(
             UsageLedger.request_id,
             UsageLedger.conversation_id,
             UsageLedger.token_id,
+            UsageLedger.owner_id,
             UsageLedger.model,
             UsageLedger.total_tokens,
             UsageLedger.created_at,
         ).where(
             UsageLedger.created_at >= start_time,
             UsageLedger.created_at < end_time,
-            UsageLedger.token_id.is_not(None),
+            or_(UsageLedger.token_id.is_not(None), UsageLedger.owner_id.is_not(None)),
         )
     )).all()
 
@@ -145,19 +156,23 @@ async def get_monitoring_sources(
     sessions: dict[SessionKey, dict] = {}
     earliest_requests: dict[SessionKey, tuple[datetime, str]] = {}
     for row in usage_rows:
-        request_key = (row.token_id, row.request_id)
+        scope = _identity_scope(row.token_id, row.owner_id)
+        if scope is None:
+            continue
+        request_key = (scope, row.request_id)
         agent_id = source_by_request.get(request_key)
         if agent_id is None:
             continue
         tokens_by_agent[agent_id] += int(row.total_tokens or 0)
         if request_key not in session_requests or not row.conversation_id:
             continue
-        session_key = (agent_id, row.token_id, row.conversation_id)
+        session_key = (agent_id, scope, row.conversation_id)
         activity_at = _as_utc(row.created_at)
         session = sessions.setdefault(session_key, {
             "agent_id": agent_id,
             "session_id": row.conversation_id,
             "token_id": row.token_id,
+            "owner_id": row.owner_id,
             "request_ids": set(),
             "total_tokens": 0,
             "models": set(),
@@ -179,14 +194,16 @@ async def get_monitoring_sources(
         request_key = (session_key[1], request_id)
         request_targets.setdefault(request_key, []).append(session_key)
 
-    active_keys = {
-        (row.token_id, row.session_id)
-        for row in (await db.execute(
-            select(SessionLease.token_id, SessionLease.session_id).where(
-                SessionLease.expires_at > generated_at.replace(tzinfo=None)
-            )
-        )).all()
-    }
+    lease_rows = (await db.execute(
+        select(SessionLease.token_id, SessionLease.owner_id, SessionLease.session_id).where(
+            SessionLease.expires_at > generated_at.replace(tzinfo=None)
+        )
+    )).all()
+    active_keys = set()
+    for row in lease_rows:
+        scope = _identity_scope(row.token_id, row.owner_id)
+        if scope is not None:
+            active_keys.add((scope, row.session_id))
     summaries = await _load_summaries(
         db,
         request_targets,
@@ -200,6 +217,7 @@ async def get_monitoring_sources(
             MonitoringSession(
                 session_id=session["session_id"],
                 token_id=session["token_id"],
+                owner_id=session["owner_id"],
                 summary=summaries.get(session_key),
                 turn_count=len(session["request_ids"]),
                 total_tokens=session["total_tokens"],
@@ -252,6 +270,7 @@ async def _load_summaries(
             ConversationRecord.file_path,
             ConversationRecord.request_id,
             ConversationRecord.token_id,
+            ConversationRecord.owner_id,
         ).where(
             ConversationRecord.created_at >= start_time,
             ConversationRecord.created_at < end_time,
@@ -261,16 +280,25 @@ async def _load_summaries(
         str,
         dict[str, list[SessionKey]],
     ] = {}
+    archive_scopes: dict[tuple[str, str], set[int | str | None]] = {}
     for record in records:
-        if record.token_id is None:
+        scope = _identity_scope(record.token_id, record.owner_id)
+        archive_scopes.setdefault((record.file_path, record.request_id), set()).add(scope)
+        if scope is None:
             continue
-        target = request_targets.get((record.token_id, record.request_id))
+        target = request_targets.get((scope, record.request_id))
         if target is None:
             continue
         path_targets.setdefault(record.file_path, {}).setdefault(
             record.request_id,
             [],
         ).extend(target)
+    # Archives do not store principal IDs, so repeated request IDs across
+    # identities in the same file cannot produce a trustworthy summary.
+    for file_path, targets_by_request in path_targets.items():
+        for request_id in list(targets_by_request):
+            if len(archive_scopes[(file_path, request_id)]) > 1:
+                del targets_by_request[request_id]
     return await asyncio.to_thread(_read_summary_files, path_targets)
 
 
@@ -282,6 +310,8 @@ def _read_summary_files(
 ) -> dict[SessionKey, str]:
     summaries: dict[SessionKey, str] = {}
     for file_path, targets_by_request in path_targets.items():
+        if not targets_by_request:
+            continue
         unresolved = set(targets_by_request)
         try:
             with Path(file_path).open(encoding="utf-8") as lines:
@@ -344,17 +374,3 @@ async def get_performance():
     from rotor.observability import performance_metrics
 
     return {**performance_metrics.snapshot(), "store": conversation_store.status()}
-
-
-@router.get("/reconciliation")
-async def get_reconciliation():
-    from rotor.observability import reconciliation_monitor
-
-    return await reconciliation_monitor.check()
-
-
-@router.post("/reconciliation/reset")
-async def reset_reconciliation():
-    from rotor.observability import reconciliation_monitor
-
-    return await reconciliation_monitor.reset()

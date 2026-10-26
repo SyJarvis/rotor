@@ -12,6 +12,7 @@ from urllib.parse import quote
 from httpx import HTTPStatusError, Response, Timeout
 
 from rotor.adapters.base import BaseAdapter
+from rotor.adapters.protocol.openai_integrity import _DETAIL_COUNT_KEYS
 from rotor.core.exceptions import UpstreamOverloaded, UpstreamProtocolError, is_overload_error_signal
 from rotor.schemas.request import (
     ChatCompletionRequest,
@@ -541,8 +542,10 @@ def extract_responses_usage(payload: dict[str, Any]) -> dict[str, Any] | None:
         if details is None:
             continue
         if not isinstance(details, dict) or any(
-            isinstance(value, bool) or not isinstance(value, int) or value < 0
-            for value in details.values() if value is not None
+            key in _DETAIL_COUNT_KEYS
+            and value is not None
+            and (isinstance(value, bool) or not isinstance(value, int) or value < 0)
+            for key, value in details.items()
         ):
             raise UpstreamProtocolError("Responses usage contains invalid token details")
         result[name] = {key: value for key, value in details.items() if value is not None}

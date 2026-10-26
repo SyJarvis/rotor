@@ -344,7 +344,7 @@ def test_connection_test_performs_real_sdk_generation_with_selected_settings(mon
             for item in (chat_sse("OK") if api_format == "chat" else responses_sse("OK")):
                 yield item
         return StreamingResponse(body())
-    monkeypatch.setattr(endpoint, "_chat_token", select_token)
+    monkeypatch.setattr(endpoint, "_chat_principal", select_token)
     monkeypatch.setattr(endpoint, "chat_completions", gateway)
     monkeypatch.setattr(endpoint, "create_response", gateway)
     result = asyncio.run(endpoint.test_connection(
@@ -372,7 +372,7 @@ def test_connection_test_failure_is_http_error(monkeypatch):
         return SimpleNamespace(id=1)
     async def gateway(*args):
         raise HTTPException(403, "permission denied")
-    monkeypatch.setattr(endpoint, "_chat_token", select_token)
+    monkeypatch.setattr(endpoint, "_chat_principal", select_token)
     monkeypatch.setattr(endpoint, "async_session_maker", Sessions())
     monkeypatch.setattr(endpoint, "chat_completions", gateway)
     with pytest.raises(HTTPException) as caught:
@@ -381,7 +381,7 @@ def test_connection_test_failure_is_http_error(monkeypatch):
     assert "permission denied" in caught.value.detail
 
 
-def test_model_listing_and_selection_respect_same_token_channel_scope(monkeypatch):
+def test_model_listing_and_selection_respect_same_account_channel_scope(monkeypatch):
     from rotor.core import user_access
     from rotor.models.admin_auth import AdminUser
     async def run():
@@ -390,11 +390,10 @@ def test_model_listing_and_selection_respect_same_token_channel_scope(monkeypatc
             await connection.run_sync(Base.metadata.create_all)
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         monkeypatch.setattr(endpoint, "async_session_maker", sessions)
-        monkeypatch.setattr(user_access, "async_session_maker", sessions)
         async with sessions() as db:
             db.add_all([
                 AdminUser(id=1, username="first-user", password_hash="test", enabled=True, must_change_password=False,
-                          role="admin", quota=None, allowed_channels=None, default_token_id=2),
+                          role="admin", quota=None, allowed_channels=[2, 4], default_token_id=1),
                 Channel(id=1, name="first", type="openai", base_url="https://one.invalid", key="k1", models=["one"], enabled=True),
                 Channel(id=2, name="second", type="openai", base_url="https://two.invalid", key="k2", models=["two"], model_mapping={"alias": "real"}, enabled=True),
                 Channel(id=3, name="hidden", type="openai", base_url="https://three.invalid", key="k3", models=["hidden"], enabled=True),
@@ -408,11 +407,13 @@ def test_model_listing_and_selection_respect_same_token_channel_scope(monkeypatc
             await db.commit()
         actor = SimpleNamespace(user_id=1)
         models = await endpoint.chat_models(actor)
-        assert models == {"models": ["alias", "two"], "token_available": True}
-        assert (await endpoint._chat_token("alias", actor)).id == 2
-        assert (await endpoint._chat_token("two", actor)).allowed_channels == [2, 4]
+        assert models == {"models": ["alias", "two"], "account_available": True}
+        principal = await endpoint._chat_principal("alias", actor)
+        assert isinstance(principal, user_access.AccountPrincipal) and principal.id is None and principal.owner_id == 1
+        async with sessions() as db:
+            assert await user_access.accessible_models(principal, db) == ["alias", "two"]
         with pytest.raises(HTTPException) as caught:
-            await endpoint._chat_token("one", actor)
+            await endpoint._chat_principal("one", actor)
         assert caught.value.status_code == 403
         await engine.dispose()
     asyncio.run(run())
@@ -557,7 +558,7 @@ def test_upstream_unauthorized_does_not_log_out_admin(monkeypatch):
         return SimpleNamespace(id=1)
     async def gateway(*args):
         raise HTTPException(401, {"error": {"message": "Upstream API key expired", "token": "sensitive"}})
-    monkeypatch.setattr(endpoint, "_chat_token", select_token)
+    monkeypatch.setattr(endpoint, "_chat_principal", select_token)
     monkeypatch.setattr(endpoint, "async_session_maker", Sessions())
     monkeypatch.setattr(endpoint, "chat_completions", gateway)
     with pytest.raises(HTTPException) as caught:

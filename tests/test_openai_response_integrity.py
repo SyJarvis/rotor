@@ -15,6 +15,10 @@ from rotor.schemas.request import ChatCompletionRequest
 PROVIDERS = ["openai", "deepseek", "moonshot", "kimi", "minimax", "zhipu"]
 USAGE = {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10,
          "prompt_tokens_details": {"cached_tokens": 2}}
+# Mercury (api.inceptionlabs.ai) appends this encrypted reasoning state after
+# the terminal stream chunk so clients can resume reasoning on the next turn.
+REASONING_TAIL = [{"type": "reasoning.encrypted", "data": "mrt1_v1_x",
+                   "format": "mercury-v1", "index": 0}]
 
 
 def completion(*, finish="stop", **fields):
@@ -187,6 +191,22 @@ def test_missing_zero_or_partial_usage_remains_compatible(usage):
     assert state.provider_usage == (usage or None)
 
 
+@pytest.mark.parametrize("details", [
+    {"reasoning_tokens": 38, "reasoning_tokens_estimated": True, "image_tokens": 0},
+    {"cached_tokens": 0, "audio_tokens": 0, "video_tokens": 0},
+    {"cached_tokens": 5, "vendor_cache_kind": "prefix"},
+])
+@pytest.mark.parametrize("field", ["prompt_tokens_details", "completion_tokens_details"])
+def test_non_counter_usage_detail_metadata_is_passed_through(field, details):
+    usage = {"prompt_tokens": 17, "completion_tokens": 44, "total_tokens": 61, field: details}
+    body = completion(usage=usage)
+    assert validate_chat_response(body) is body
+    state = ChatStreamIntegrity()
+    state.feed({**chunk(finish="stop"), "usage": usage})
+    state.finish()
+    assert state.provider_usage == usage
+
+
 @pytest.mark.parametrize("details", [None, {"cached_tokens": None, "audio_tokens": 0},
                                      {"reasoning_tokens": None, "accepted_prediction_tokens": 2}])
 @pytest.mark.parametrize("field", ["prompt_tokens_details", "completion_tokens_details"])
@@ -327,6 +347,33 @@ def test_stream_content_or_conflicting_finish_after_terminal_is_invalid(late):
         state.feed(late)
 
 
+def test_mercury_encrypted_reasoning_details_after_finish_are_tolerated():
+    # Captured from api.inceptionlabs.ai (Mercury): the stream appends an
+    # encrypted reasoning_details delta after the terminal chunk; it is
+    # provider bookkeeping for cross-turn continuation, not response
+    # content, so the stream stays complete.
+    state = ChatStreamIntegrity()
+    state.feed(chunk(finish="stop"))
+    state.feed(chunk(delta={"role": "assistant", "reasoning_details": REASONING_TAIL}))
+    state.finish()
+
+
+def test_content_mixed_with_reasoning_details_after_finish_is_still_invalid():
+    state = ChatStreamIntegrity()
+    state.feed(chunk(finish="stop"))
+    mixed = {"content": "more text", "reasoning_details": REASONING_TAIL}
+    with pytest.raises(UpstreamProtocolError,
+                       match="Chat content followed a choice finish reason"):
+        state.feed(chunk(delta=mixed))
+
+
+def test_empty_reasoning_details_after_finish_is_tolerated():
+    state = ChatStreamIntegrity()
+    state.feed(chunk(finish="stop"))
+    state.feed(chunk(delta={"reasoning_details": []}))
+    state.finish()
+
+
 @pytest.mark.parametrize("native,canonical", [
     ("STOP", "stop"),
     ("end_turn", "stop"),
@@ -371,6 +418,22 @@ def test_openrouter_role_echo_after_finish_is_tolerated_and_usage_kept():
         state.feed(event)
     state.finish()
     assert state.provider_usage == USAGE
+
+
+def test_mercury_reasoning_tail_after_finish_is_passed_through():
+    # End to end over the captured Mercury wire shape: the encrypted
+    # reasoning tail reaches the client like any other chunk and the
+    # integrity state machine still sees a complete stream.
+    answer = chunk(delta={"content": "ok"})
+    finish = chunk(finish="stop")
+    tail = chunk(delta={"role": "assistant", "reasoning_details": REASONING_TAIL})
+    body = wire([answer, finish, tail]) + "data: [DONE]\n\n"
+    result = asyncio.run(convert("openai", body, stream=True))
+    assert result == [answer, finish, tail]
+    state = ChatStreamIntegrity(expected_choices=1, upstream_status=200)
+    for event in result:
+        state.feed(event)
+    state.finish()
 
 
 def test_data_after_done_is_invalid_even_if_choices_finished():

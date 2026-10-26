@@ -90,7 +90,7 @@ async function navigation(admin) {
   const document = { getElementById: (id) => nodes.get(id), querySelector: (selector) => nodes.get(selector), querySelectorAll: (selector) => selector === '.nav-item[data-tab]' ? nav : selector === '.panel' ? panels : selector === '[data-admin-only]' ? nav.filter((item) => item.adminOnly) : [],
     addEventListener(name, callback) { (events[name] ||= []).push(callback); }, dispatchEvent(event) { for (const callback of events[event.type] || []) callback(event); },
   };
-  const context = vm.createContext({ window: { location: { origin } }, Element, document, CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options?.detail; } } });
+  const context = vm.createContext({ window: { location: { origin, href: `${origin}/` } }, URL, Element, document, CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options?.detail; } } });
   const app = new vm.SourceTextModule(appSource, { context }), realOverview = new vm.SourceTextModule(overviewSource, { context });
   const modules = new Map();
   const link = (specifier) => {

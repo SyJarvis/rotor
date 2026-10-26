@@ -59,11 +59,13 @@ Responses；反之 Responses 客户端也可在基础字段可表达时选择 Ch
 ### 1.3 provider type、preset 与 adapter
 
 `Channel.type` 先用于 provider preset 和 adapter registry；`Channel.protocol` 再决定
-wire adapter。当前注册关系如下（Responses/Anthropic protocol 会优先覆盖 type）：
+wire adapter。当前注册关系如下（除 `openai_codex` 专用 adapter 外，
+Responses/Anthropic protocol 会优先覆盖 type）：
 
 | type | 默认 preset/adapter |
 | --- | --- |
 | `openai`、`deepseek` | OpenAI-compatible，通常 `/chat/completions` |
+| `openai_codex` | ChatGPT OAuth 专用 Responses adapter，只使用 Responses 上行 |
 | `azure` | `AzureOpenAIAdapter`；直接在 `channel.base_url` 后追加 `/chat/completions?api-version=2023-05-15`（base_url 通常已含 deployment），不完全遵循通用 path 规则 |
 | `anthropic` | Anthropic adapter；常见 `/messages` + `x-api-key` |
 | `moonshot`、`minimax`、`zhipu`、`kimi` | 各自 provider 子类或 OpenAI-compatible |
@@ -87,8 +89,9 @@ wire adapter。当前注册关系如下（Responses/Anthropic protocol 会优先
 
 ### 2.1 客户端入口和请求模型
 
-入口为 `POST /v1/chat/completions`，需要 Rotor Token，可使用
-`Authorization: Bearer` 或 `x-api-key`。请求模型为
+入口为 `POST /v1/chat/completions`，Bearer 可携带 Rotor API Key 或客户端 OAuth
+access token；`x-api-key` 仅用于 API Key。授权码和 refresh token 不能用于推理。
+认证与登录流程见[客户端 API](../reference/client-api.md)。请求模型为
 [`ChatCompletionRequest`](../../src/rotor/schemas/request.py)：`model` 和
 `messages` 必填，其余字段为可选子集。
 

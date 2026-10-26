@@ -2,6 +2,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Integer,
@@ -22,12 +23,18 @@ class ResponseRoute(Base):
         UniqueConstraint(
             "token_id", "response_id", name="uq_response_routes_token_response"
         ),
+        UniqueConstraint("owner_id", "response_id", name="uq_response_routes_owner_response"),
+        CheckConstraint("(token_id IS NOT NULL AND owner_id IS NULL) OR (token_id IS NULL AND owner_id IS NOT NULL)",
+                        name="ck_response_routes_identity"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     response_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
-    token_id: Mapped[int] = mapped_column(
-        ForeignKey("tokens.id", ondelete="CASCADE"), nullable=False, index=True
+    token_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tokens.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    owner_id: Mapped[int | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="CASCADE"), nullable=True, index=True
     )
     channel_id: Mapped[int] = mapped_column(
         ForeignKey("channels.id", ondelete="CASCADE"), nullable=False, index=True

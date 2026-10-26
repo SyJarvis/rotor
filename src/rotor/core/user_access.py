@@ -1,5 +1,6 @@
 """Account-owned API keys and effective gateway permissions."""
 from datetime import datetime, timezone
+from dataclasses import dataclass, field
 import secrets
 
 from fastapi import HTTPException
@@ -7,10 +8,50 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects.sqlite import insert
 
 from rotor.config import settings
-from rotor.database import async_session_maker
 from rotor.models.admin_auth import AdminUser
 from rotor.models.channel import Channel
 from rotor.models.token import Token
+
+
+@dataclass(frozen=True, slots=True)
+class AccountPrincipal:
+    owner_id: int
+    id: None = field(default=None, init=False)
+    user_id: None = field(default=None, init=False)
+
+
+async def validate_account_access(owner_id: int, db) -> AdminUser:
+    owner = await db.get(AdminUser, owner_id, populate_existing=True)
+    if owner is None or not owner.enabled:
+        raise HTTPException(403, "Account is disabled")
+    if owner.must_change_password:
+        raise HTTPException(403, "Account password must be changed")
+    if owner.quota is not None and owner.used_quota >= owner.quota:
+        raise HTTPException(429, "Account token quota exceeded")
+    return owner
+
+
+async def resolve_account_principal(db, owner_id: int, model: str | None = None) -> AccountPrincipal:
+    principal = AccountPrincipal(owner_id)
+    await validate_account_access(owner_id, db)
+    if model is not None and model not in await accessible_models(principal, db):
+        raise HTTPException(403, "Model is not available to the account")
+    return principal
+
+
+async def reload_principal(db, principal):
+    if isinstance(principal, AccountPrincipal):
+        owner = await db.get(AdminUser, principal.owner_id, populate_existing=True)
+        return principal if owner is not None else None
+    return await db.get(type(principal), principal.id)
+
+
+def principal_scope_key(principal) -> int | str:
+    if isinstance(principal, AccountPrincipal):
+        return f"account:{principal.owner_id}"
+    if principal.id is None:
+        raise ValueError("API Key identity must have a persistent ID")
+    return principal.id
 
 
 def new_token_key() -> str:
@@ -44,6 +85,8 @@ async def token_owner(token, db) -> AdminUser | None:
 
 
 async def validate_token_access(token, db) -> AdminUser | None:
+    if isinstance(token, AccountPrincipal):
+        return await validate_account_access(token.owner_id, db)
     if not token.enabled or token.expired:
         raise HTTPException(403, "API Key is disabled or expired")
     if token.expire_time:
@@ -70,6 +113,8 @@ def _intersect(account, key):
 
 async def effective_permissions(token, db):
     owner = await token_owner(token, db)
+    if isinstance(token, AccountPrincipal):
+        return owner.allowed_channels, owner.allowed_models
     if owner is None:
         return (token.allowed_channels or None), getattr(token, "allowed_models", None)
     return (_intersect(owner.allowed_channels, token.allowed_channels),
@@ -85,17 +130,3 @@ async def accessible_models(token, db) -> list[str]:
     channels = (await db.scalars(query)).all()
     return sorted({model for channel in channels for model in [*(channel.models or []), *(channel.model_mapping or {})]
                    if model_ids is None or model in model_ids})
-
-
-async def resolve_default_chat_token(actor, model: str | None = None) -> Token:
-    async with async_session_maker() as db:
-        owner = await db.get(AdminUser, actor.user_id)
-        if owner is None or not owner.enabled:
-            raise HTTPException(403, "Account is disabled")
-        token = await db.get(Token, owner.default_token_id) if owner.default_token_id else None
-        if token is None or token.owner_id != owner.id:
-            raise HTTPException(400, "Default API Key is unavailable; select another default Key")
-        await validate_token_access(token, db)
-        if model is not None and model not in await accessible_models(token, db):
-            raise HTTPException(403, "Model is not available to the default API Key")
-        return token

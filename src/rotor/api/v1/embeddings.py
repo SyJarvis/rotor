@@ -33,12 +33,12 @@ from rotor.gateway.provider_facts import (
 )
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.fallback import (
-    retry_after_seconds,
     set_routing_headers,
     should_fallback,
 )
 from rotor.gateway.routing import routing_engine, session_lease_success_reason
 from rotor.services.session_leases import get_session_lease_preference
+from rotor.core.user_access import AccountPrincipal, principal_scope_key
 from rotor.schemas.error import ErrorPhase
 
 
@@ -285,6 +285,7 @@ async def create_embeddings(
     lease_preference = await get_session_lease_preference(
         db,
         token_id=token.id,
+        owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
         session_id=lease_session_id,
         logical_model=embedding_request.model,
         request_protocol="openai_embeddings",
@@ -298,7 +299,7 @@ async def create_embeddings(
         ),
     )
     affinity_key = (
-        client_session.affinity_key(token.id)
+        client_session.affinity_key(principal_scope_key(token))
         if routing_settings.affinity_enabled
         else None
     )
@@ -335,7 +336,9 @@ async def create_embeddings(
     )
     if not candidates:
         if routing_decision.temporarily_unavailable:
-            raise ChannelsTemporarilyUnavailable(embedding_request.model, routing_decision.retry_after_seconds)
+            raise ChannelsTemporarilyUnavailable(
+                embedding_request.model, routing_decision.retry_after_seconds,
+                plan_limited=routing_decision.plan_limited)
         raise ChannelException(
             f"No compatible embeddings channel for model "
             f"'{embedding_request.model}'",
@@ -345,6 +348,7 @@ async def create_embeddings(
 
     http_client = AsyncClient(timeout=_timeout())
     last_error: Exception | None = None
+    fallback_reason: str | None = None
     try:
         for attempt, channel in enumerate(candidates):
             admission = routing_engine.admit_attempt(embedding_request.model, channel)
@@ -390,12 +394,17 @@ async def create_embeddings(
                         routing_decision, attempt, channel=channel, request_protocol="openai_embeddings"
                     ),
                 )
-                set_routing_headers(api_response, channel, embedding_request.model, attempt > 0)
+                set_routing_headers(api_response, channel, embedding_request.model, attempt > 0, fallback_reason=fallback_reason)
                 return response_data
             except (HTTPStatusError, RequestError, UpstreamProtocolError) as exc:
                 last_error = exc
+                if fallback_reason is None:
+                    fallback_reason = (
+                        f"{channel.name if (channel.name or '').isascii() else f'channel-{channel.id}'}: "
+                        f"{normalize_upstream_error(exc).code}"
+                    )
                 if should_fallback(exc):
-                    routing_engine.mark_unavailable(embedding_request.model, channel, retry_after_seconds(exc))
+                    routing_engine.mark_failure(embedding_request.model, channel, exc)
                 await _record_failure(
                     db,
                     token=token,
@@ -419,7 +428,8 @@ async def create_embeddings(
                 admission.engine.release_attempt(admission)
 
         if last_error is None:
-            raise ChannelsTemporarilyUnavailable(embedding_request.model, routing_engine.retry_after_seconds(embedding_request.model, candidates))
+            wait, plan_limited = routing_engine.cooldown_outlook(embedding_request.model, candidates)
+            raise ChannelsTemporarilyUnavailable(embedding_request.model, wait, plan_limited=plan_limited)
         raise ChannelException(
             f"All embeddings channels failed for model '{embedding_request.model}'",
             status_code=classify_error_status(last_error),

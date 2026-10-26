@@ -139,6 +139,24 @@ def _indicates_missing_model(body: Any) -> bool:
     )
 
 
+def _indicates_account_model_unsupported(body: Any) -> bool:
+    """Detect account-level model gating (e.g. "not supported with a ChatGPT account").
+
+    Such 400s describe the account, not the request: another channel serving
+    the same model must be tried instead of failing the request outright.
+    """
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error", body)
+    if not isinstance(error, dict):
+        return False
+    evidence = " ".join(
+        str(error.get(name, ""))
+        for name in ("code", "type", "message")
+    ).lower()
+    return "not supported" in evidence and "account" in evidence
+
+
 def _parse_retry_after(value: str | None) -> float | None:
     """Parse an upstream delay or HTTP date without accepting invalid cooldowns."""
     if value is None:
@@ -155,6 +173,49 @@ def _parse_retry_after(value: str | None) -> float | None:
         except (TypeError, ValueError, OverflowError, OSError):
             return None
     return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+_PLAN_LIMIT_ERROR_TYPES = {"usage_limit_reached", "insufficient_quota"}
+# ChatGPT plan windows roll over at most every few hours; anything larger is
+# treated as corrupt upstream data rather than a cooldown to honor.
+_PLAN_RESET_MAX_SECONDS = 6 * 3600.0
+# Zhipu reports the Coding-Plan 5-hour cap as error.code 1308. Its reset
+# message is a timezone-less wall-clock string, and the rolling window can
+# recover as soon as old usage ages out, so a short recheck horizon is used
+# instead of parsing it; the quota refresher then holds the real state.
+_ZHIPU_PLAN_LIMIT_CODES = {"1308"}
+_PLAN_RECHECK_SECONDS = 120.0
+
+
+def _plan_reset_seconds(body: Any) -> float | None:
+    """Extract the cooldown horizon of a plan-level usage limit from an error body.
+
+    ChatGPT reports exhausted plan windows (for example the Codex 5-hour Plus
+    limit) as ``error.type=usage_limit_reached`` with ``resets_at``/``resets_in_seconds``.
+    The absolute deadline is preferred over the relative field because the two
+    have been observed to disagree. Zhipu is detected by error code instead;
+    it gets the recheck horizon because its reset message carries no timezone.
+    """
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return None
+    if error.get("code") in _ZHIPU_PLAN_LIMIT_CODES:
+        return _PLAN_RECHECK_SECONDS
+    if error.get("type") not in _PLAN_LIMIT_ERROR_TYPES:
+        return None
+    seconds: float | None = None
+    resets_at = error.get("resets_at")
+    if isinstance(resets_at, (int, float)) and math.isfinite(resets_at):
+        seconds = float(resets_at) - time()
+    if seconds is None or seconds < 0:
+        resets_in = error.get("resets_in_seconds")
+        if isinstance(resets_in, (int, float)) and math.isfinite(resets_in):
+            seconds = float(resets_in)
+    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+        return None
+    return min(seconds, _PLAN_RESET_MAX_SECONDS)
 
 
 def normalize_upstream_error(
@@ -176,6 +237,8 @@ def normalize_upstream_error(
         provider_request_ids = provider_error["request_ids"]
 
     retry_after = None
+    channel_wide = False
+    plan_limit = False
     if isinstance(exc, httpx.TimeoutException):
         code = "upstream_timeout"
         category = ErrorCategory.TIMEOUT
@@ -199,6 +262,11 @@ def normalize_upstream_error(
         elif status_code == 404:
             code = "upstream_resource_not_found"
             category = ErrorCategory.PROTOCOL_OR_PARAMETER_ERROR
+        elif status_code == 400 and _indicates_account_model_unsupported(sanitized_body):
+            # Account-level gating ("not supported with a ChatGPT account"):
+            # the request may still be served by a different channel.
+            code = "upstream_model_not_available_on_account"
+            category = ErrorCategory.MODEL_NOT_FOUND
         elif status_code in {408, 425}:
             code = "upstream_temporarily_unavailable"
             category = ErrorCategory.UPSTREAM_AVAILABILITY
@@ -211,6 +279,7 @@ def normalize_upstream_error(
         fallback_allowed = (
             status_code in {401, 402, 403, 404, 408, 409, 425, 429}
             or status_code >= 500
+            or code == "upstream_model_not_available_on_account"
         )
         retry_same_channel = (
             status_code in {408, 409, 425, 429}
@@ -218,6 +287,14 @@ def normalize_upstream_error(
         )
         if fallback_allowed:
             retry_after = _parse_retry_after(exc.response.headers.get("retry-after"))
+        plan_reset = _plan_reset_seconds(sanitized_body)
+        if plan_reset is not None:
+            # The plan window blocks the whole account, so immediate same-channel
+            # retries are pointless; cool every model until the window resets.
+            retry_after = max(retry_after or 0.0, plan_reset)
+            retry_same_channel = False
+            channel_wide = True
+            plan_limit = True
         message = f"Upstream returned HTTP {status_code}"
     elif isinstance(exc, httpx.RequestError):
         code = "upstream_connection_failed"
@@ -255,6 +332,8 @@ def normalize_upstream_error(
         retry_same_channel=retry_same_channel,
         fallback_allowed=fallback_allowed,
         retry_after_seconds=retry_after,
+        channel_wide_cooldown=channel_wide,
+        plan_limit=plan_limit,
         message=message,
         sanitized_body=sanitized_body,
         provider_request_ids=provider_request_ids,
@@ -431,17 +510,34 @@ class RateLimitException(APIRouterException):
 
 
 class ChannelsTemporarilyUnavailable(APIRouterException):
-    """Compatible channels are cooling down or running a recovery probe."""
+    """Compatible channels are cooling down or running a recovery probe.
 
-    def __init__(self, model: str, retry_after_seconds: int) -> None:
+    Reported as 429 with a structured body so coding agents can back off to
+    the local cooldown deadline instead of treating a retryable quota state
+    as a server error. ``resets_at`` is derived from the local deadline; it
+    deliberately does not echo upstream reset fields, which have shown
+    timezone drift.
+    """
+
+    def __init__(self, model: str, retry_after_seconds: int, *, plan_limited: bool = False) -> None:
+        wait = max(1, int(retry_after_seconds))
+        if plan_limited:
+            message = (f"Channels for model '{model}' are cooling down until the "
+                       f"usage window resets; retry in {wait}s")
+            error_type = "usage_limit_reached"
+        else:
+            message = f"Channels for model '{model}' are temporarily unavailable; retry in {wait}s"
+            error_type = "rate_limit_error"
         super().__init__(
-            status_code=503,
+            status_code=429,
             detail={"error": {
-                "message": f"Channels for model '{model}' are temporarily unavailable",
-                "type": "channel_error",
+                "message": message,
+                "type": error_type,
                 "code": "channels_temporarily_unavailable",
+                "retry_after_seconds": wait,
+                "resets_at": time() + wait,
             }},
-            headers={"Retry-After": str(max(1, retry_after_seconds))},
+            headers={"Retry-After": str(wait)},
         )
 
 

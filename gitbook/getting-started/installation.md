@@ -5,7 +5,7 @@
 ## 前置条件
 
 - Python 3.11 或更高版本；
-- 一个可访问的上游模型服务及其 API Key。
+- 一个可访问的上游模型服务及其 API Key，或可用于 [ChatGPT OAuth 渠道](../guides/chatgpt-oauth.md)的 ChatGPT 账户。
 
 ## 安装
 

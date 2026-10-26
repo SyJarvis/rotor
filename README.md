@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | [English](README.en.md)
 
-Rotor 是一个自托管的 LLM API 网关。它把多个模型供应商和 API Key 组织为 Channel，
+Rotor 是一个自托管的 LLM API 网关。它把多个模型供应商及其认证配置组织为 Channel，
 向客户端提供统一的 OpenAI Chat Completions、OpenAI Responses、OpenAI Images 和
 Anthropic Messages 接口，并负责协议转换、路由、故障转移、Token 记账和运行状态
 观测。
@@ -19,9 +19,11 @@ Rotor 同时提供浏览器管理页面、管理 API、面向机器调用的只�
 - **多渠道路由**：按模型、协议、优先级、权重和运行状态选择 Channel，支持 fallback、
   会话亲和与自适应评分；同协议渠道优先（可关闭），需要原生语义的请求不会被静默降级。
 - **可观测性**：记录请求日志、每次渠道尝试、归一化错误、延迟、Token 用量和缓存
-  Token；管理页的「监控」页展示进程内性能样本、客户端来源与增量对账。
+  Token；管理页的「监控」页展示进程内性能样本和客户端来源。
 - **管理与诊断**：通过管理页面维护 Channel 和用户 Token；通过独立鉴权的 Control
   API 向 MCP、CLI 和自动化任务提供只读诊断数据。
+- **账号接入**：网页对话和[客户端 OAuth](gitbook/guides/client-oauth.md)直接使用账号权限与额度，
+  不依赖默认或 `base` Key；API Key 继续可用，并额外受 Key 自身的权限和额度限制。
 - **本地优先存储**：使用文件型 SQLite；会话和运行数据保存在本地。
 
 ## 工作方式
@@ -124,7 +126,9 @@ docker compose logs -f rotor
 
 ### 1. 添加 Channel
 
-使用管理员账号登录管理页面，在“渠道”中添加供应商地址、API Key、模型和协议。
+使用管理员账号登录管理页面，在“渠道”中添加供应商地址、认证、模型和协议。
+上游认证可选择 API Key，或按 [ChatGPT OAuth 渠道指南](gitbook/guides/chatgpt-oauth.md)
+通过 ChatGPT 登录授权；后者用于 Rotor 访问上游，区别于客户端登录 Rotor 的 OAuth。
 需要通过 HTTP 自动化管理时，先按[管理 API](gitbook/reference/admin-api.md)建立管理
 Session。
 
@@ -140,7 +144,10 @@ Provider 类型负责鉴权规则，协议只决定请求路径和转换方式�
 
 ### 2. 创建 Rotor 用户 Token
 
-在管理页面的“API Key”中生成 Rotor 用户 Token。
+以下示例使用 API Key 接入，在管理页面的“API Key → 我的 Key”中生成归属当前
+账户的 Rotor 用户 Token。
+网页对话无需创建或填写 Key；支持 Rotor 登录流程的客户端也可通过
+[网页登录授权](gitbook/guides/client-oauth.md)接入。
 
 保存响应中的 `sk-` Token：
 
@@ -176,12 +183,15 @@ Codex、Claude Code 和 OpenCode 的配置方式见
 | OpenAI Embeddings | `POST /v1/embeddings` |
 | OpenAI Images | `POST /v1/images/generations` |
 | Anthropic | `POST /anthropic/v1/messages`、`POST /anthropic/v1/messages/count_tokens`、`GET /anthropic/v1/models` |
-| 模型 | `GET /v1/models` |
+| 模型 | `GET /v1/models`、`GET /v1/models/{id}` |
+| 用量 | `GET /v1/usage`(令牌配额 + 上游计划窗口快照) |
 | 管理 API | `/api/admin/channels`、`/api/admin/tokens`、`/api/admin/logs`、`/api/admin/settings` |
-| 监控 | `/api/admin/monitoring/sources`、`/api/admin/monitoring/performance`、`/api/admin/monitoring/reconciliation` |
+| 监控 | `/api/admin/monitoring/sources`、`/api/admin/monitoring/performance` |
 | Control API | `/api/control/v1/channels`、请求 trace、近期失败、模型用量和 Session Lease 评估 |
 
 Responses API 支持创建、查询、取消、删除、输入项查询、输入 Token 计数和 compact。
+
+coding agent(pi agent、opencode、Claude Code、Codex CLI 等)的接入方式见 [docs/agent-integration.md](docs/agent-integration.md)。
 当上游是原生 Responses Channel 时，Rotor 会把后续资源操作路由回原 Channel 和账号。
 
 ## 路由策略
@@ -229,13 +239,19 @@ usage:read
 ## 用户聊天
 
 管理员和普通用户登录后均可使用聊天。管理员可以创建账户，或生成邀请码供用户在注册页
-填写；每个账户创建时会获得 `base` Key。聊天的模型列表、连接测试和生成请求均使用
-当前账户的默认 Key，并遵循账户与 Key 的额度、渠道和模型限制。默认 Key 不可用时
-需要先处理该 Key 或更换默认 Key。
+填写。聊天的模型列表、连接测试和生成请求通过网页登录会话直接绑定当前账户，
+遵循账户的额度、渠道和模型限制，不依赖默认或 `base` Key。
+
+网页聊天、Rotor 客户端 OAuth 和属于该账户的 API Key 请求共同累计账户已用额度。
+API Key 还受该 Key 自身的权限和额度限制；创建、切换或停用 Key 不影响网页聊天
+和客户端 OAuth。个人资料在“设置 → 账户”中管理；修改密码和客户端授权管理位于
+“设置 → 登录与安全”。其中“设备管理”按每条客户端 OAuth 授权显示名称、授权时间、
+最近使用与到期时间，并可确认撤销单项授权。这些记录不是物理设备或浏览器会话。
 
 聊天通过 OpenAI SDK 调用 Rotor 网关，沿用渠道路由、用量计量和请求日志。
 默认使用 Chat Completions，也可切换到 Responses。每个对话独立保存右侧面板中的
-模型、API 格式、System Prompt、temperature 和 max_tokens；后两项留空时使用上游默认值。
+模型、API 格式、System Prompt、temperature 和 max_tokens；后两项留空时不向上游
+发送对应参数，使用模型默认值。
 System Prompt 最多 10 万字符。
 “连接测试”会按当前参数发起一次简短的真实文本生成请求，可能产生上游费用；它不验证
 模型的图片或文档理解能力。

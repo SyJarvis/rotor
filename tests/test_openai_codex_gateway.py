@@ -81,10 +81,10 @@ def prepare(monkeypatch, *, fallback=False):
     return SimpleNamespace(token=token, db=db, accounting=accounting, sent=sent, resolver=resolver, engine=engine)
 
 
-async def invoke(env, entrypoint, stream=False):
-    value = {"model": "model", "stream": stream, "messages": [{"role": "user", "content": "hi"}]}
+async def invoke(env, entrypoint, stream=False, **fields):
+    value = {"model": "model", "stream": stream, "messages": [{"role": "user", "content": "hi"}], **fields}
     if entrypoint == "responses":
-        request = ResponsesRequest(model="model", input="hi", stream=stream)
+        request = ResponsesRequest(model="model", input="hi", stream=stream, **fields)
         handler = responses_endpoint.create_response
         path = "/v1/responses"
     elif entrypoint == "anthropic":
@@ -163,6 +163,27 @@ def test_chat_omitted_sampling_succeeds_with_strict_codex_and_accounting(monkeyp
     assert (usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens) == (12, 3, 8)
     assert usage.usage_source == "provider"
     assert "[DONE]" in response if stream else response["choices"][0]["message"]["content"] == "hello"
+
+
+@pytest.mark.parametrize("entrypoint", ["chat", "responses", "anthropic"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("temperature", [0.0, 0.3, 1.0])
+def test_explicit_temperature_succeeds_with_strict_codex_and_accounting(monkeypatch, entrypoint, stream, temperature):
+    env = prepare(monkeypatch)
+    response = asyncio.run(invoke(env, entrypoint, stream, temperature=temperature))
+    assert len(env.sent) == 1
+    assert "temperature" not in json.loads(env.sent[0].content)
+    env.accounting.record_failure.assert_not_awaited()
+    env.accounting.record_success.assert_awaited_once()
+    usage = env.accounting.record_success.await_args.kwargs["usage"]
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens) == (12, 3, 8)
+    assert usage.usage_source == "provider"
+    if stream:
+        assert "hello" in response
+        assert {"chat": "[DONE]", "responses": "response.completed", "anthropic": "message_stop"}[entrypoint] in response
+        assert "response.failed" not in response and "stream_error" not in response
+    else:
+        assert "hello" in json.dumps(response)
 
 
 @pytest.mark.parametrize("entrypoint", ["chat", "responses", "anthropic"])

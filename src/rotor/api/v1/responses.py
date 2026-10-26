@@ -1,3 +1,4 @@
+import asyncio
 import time
 import uuid
 import json
@@ -27,7 +28,7 @@ from rotor.adapters.protocol.responses import (
     validate_responses_response,
 )
 from rotor.core.deps import get_available_channels, get_current_token
-from rotor.core.user_access import effective_permissions
+from rotor.core.user_access import AccountPrincipal, principal_scope_key, reload_principal, effective_permissions
 from rotor.core.client_session import resolve_client_session
 from rotor.core.header_forwarding import snapshot_inbound_headers
 from rotor.application_settings import application_settings
@@ -50,7 +51,8 @@ from rotor.gateway.routing import routing_engine, session_lease_success_reason
 from rotor.services.session_leases import get_session_lease_preference
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.fallback import (
-    retry_after_seconds,
+    ConnectRetry,
+    is_connect_failure,
     set_routing_headers,
     should_fallback,
 )
@@ -405,7 +407,8 @@ async def create_response(
     previous_route = None
     if request.previous_response_id:
         previous_route = await get_response_route(
-            db, request.previous_response_id, token.id
+            db, request.previous_response_id, token.id,
+            owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
         )
         if previous_route is None:
             raise HTTPException(status_code=404, detail="Response not found")
@@ -464,6 +467,7 @@ async def create_response(
         lease_preference = await get_session_lease_preference(
             db,
             token_id=token.id,
+            owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
             session_id=lease_session_id,
             logical_model=chat_request.model,
             request_protocol="openai_responses",
@@ -477,7 +481,7 @@ async def create_response(
             ),
         )
         affinity_key = (
-            client_session.affinity_key(token.id)
+            client_session.affinity_key(principal_scope_key(token))
             if routing_settings.affinity_enabled
             else None
         )
@@ -516,7 +520,9 @@ async def create_response(
 
     if not routing_candidates:
         if routing_decision is not None and routing_decision.temporarily_unavailable:
-            raise ChannelsTemporarilyUnavailable(chat_request.model, routing_decision.retry_after_seconds)
+            raise ChannelsTemporarilyUnavailable(
+                chat_request.model, routing_decision.retry_after_seconds,
+                plan_limited=routing_decision.plan_limited)
         required_capabilities = responses_required_capabilities(request)
         if "responses_persistence" in required_capabilities and any(
             str(channel.type or "").lower() == "openai_codex" for channel in channels
@@ -553,7 +559,18 @@ async def create_response(
         protocol="openai_responses",
     )
     try:
-        for attempt, channel in enumerate(routing_candidates):
+        # The plan starts as the routed candidates; a connect failure inserts a
+        # same-channel retry right behind itself so a blip never scatters the
+        # session to another account (and its cold KV cache).
+        plan = list(routing_candidates)
+        connect_retry = ConnectRetry()
+        attempt = -1
+        fallback_reason = None
+        while True:
+            attempt += 1
+            if attempt >= len(plan):
+                break
+            channel = plan[attempt]
             admission = routing_engine.admit_attempt(chat_request.model, channel)
             if admission is None:
                 continue
@@ -601,6 +618,7 @@ async def create_response(
                                 route_db,
                                 response_id=native_response["id"],
                                 token_id=token.id,
+                                owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
                                 channel_id=channel.id,
                                 conversation_id=conversation_id,
                                 model=native_response.get("model") or chat_request.model,
@@ -643,7 +661,8 @@ async def create_response(
                         ),
                     )
                     set_routing_headers(
-                        result, channel, chat_request.model, attempt > 0
+                        result, channel, chat_request.model, attempt > 0,
+                        fallback_reason=fallback_reason,
                     )
                     # Ownership of http_client transfers to the streaming
                     # generator, which closes it in its own finally block.
@@ -675,7 +694,8 @@ async def create_response(
                     ),
                 )
                 set_routing_headers(
-                    api_response, channel, chat_request.model, attempt > 0
+                    api_response, channel, chat_request.model, attempt > 0,
+                    fallback_reason=fallback_reason,
                 )
                 if response_data.get("object") == "response":
                     response_id = response_data.get("id")
@@ -684,6 +704,7 @@ async def create_response(
                             db,
                             response_id=response_id,
                             token_id=token.id,
+                            owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
                             channel_id=channel.id,
                             conversation_id=conversation_id,
                             model=response_data.get("model") or chat_request.model,
@@ -700,11 +721,20 @@ async def create_response(
 
             except (HTTPStatusError, RequestError) as exc:
                 last_error = exc
-                if should_fallback(exc):
-                    routing_engine.mark_unavailable(chat_request.model, channel, retry_after_seconds(exc))
+                retry_delay = None
+                if should_fallback(exc) and is_connect_failure(exc):
+                    retry_delay = connect_retry.plan_retry(channel.id)
+                if retry_delay is not None:
+                    plan.insert(attempt + 1, channel)
+                elif should_fallback(exc):
+                    routing_engine.mark_failure(chat_request.model, channel, exc)
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
                 error_fact = normalize_upstream_error(exc)
+                if fallback_reason is None:
+                    fallback_reason = (
+                        f"{channel.name if (channel.name or '').isascii() else f'channel-{channel.id}'}: {error_fact.code}"
+                    )
                 await attempt_recorder.record(
                     context=attempt_context,
                     request_id=request_id,
@@ -743,6 +773,8 @@ async def create_response(
                     )
                 await db.commit()
                 if should_fallback(exc):
+                    if retry_delay is not None:
+                        await asyncio.sleep(retry_delay)
                     continue
                 if conversation_handle:
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)
@@ -751,7 +783,7 @@ async def create_response(
             except Exception as exc:
                 last_error = exc
                 if should_fallback(exc):
-                    routing_engine.mark_unavailable(chat_request.model, channel, retry_after_seconds(exc))
+                    routing_engine.mark_failure(chat_request.model, channel, exc)
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
                 if isinstance(exc, (UpstreamProtocolError, UpstreamOverloaded)) and not attempt_context.recorded:
@@ -813,7 +845,8 @@ async def create_response(
         conversation_handle, "failed", int((time.time() - start_time) * 1000)
     )
     if last_error is None:
-        raise ChannelsTemporarilyUnavailable(chat_request.model, routing_engine.retry_after_seconds(chat_request.model, routing_candidates))
+        wait, plan_limited = routing_engine.cooldown_outlook(chat_request.model, routing_candidates)
+        raise ChannelsTemporarilyUnavailable(chat_request.model, wait, plan_limited=plan_limited)
     raise ChannelException(
         f"All channels failed for model '{chat_request.model}'",
         status_code=classify_error_status(last_error),
@@ -826,7 +859,8 @@ async def _resolve_response_channel(
     response_id: str,
     token,
 ) -> tuple[ResponseRoute, Channel]:
-    route = await get_response_route(db, response_id, token.id)
+    route = await get_response_route(db, response_id, token.id,
+                                     owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None)
     if route is None:
         raise HTTPException(status_code=404, detail="Response not found")
     channel = await db.get(Channel, route.channel_id)
@@ -955,7 +989,8 @@ async def _native_collection_request(
     candidates = decision.candidates
     if not candidates:
         if decision.temporarily_unavailable:
-            raise ChannelsTemporarilyUnavailable(model, decision.retry_after_seconds)
+            raise ChannelsTemporarilyUnavailable(
+                model, decision.retry_after_seconds, plan_limited=decision.plan_limited)
         if any(str(channel.type or "").lower() == "openai_codex" for channel in channels):
             raise HTTPException(status_code=400, detail="ChatGPT OAuth does not support Responses resources")
         raise ChannelException(
@@ -983,7 +1018,7 @@ async def _native_collection_request(
             except (HTTPStatusError, RequestError) as exc:
                 last_error = exc
                 if should_fallback(exc):
-                    routing_engine.mark_unavailable(model, channel, retry_after_seconds(exc))
+                    routing_engine.mark_failure(model, channel, exc)
                     continue
                 if isinstance(exc, HTTPStatusError):
                     return _upstream_error(exc)
@@ -991,7 +1026,8 @@ async def _native_collection_request(
             finally:
                 admission.engine.release_attempt(admission)
     if last_error is None:
-        raise ChannelsTemporarilyUnavailable(model, routing_engine.retry_after_seconds(model, candidates))
+        wait, plan_limited = routing_engine.cooldown_outlook(model, candidates)
+        raise ChannelsTemporarilyUnavailable(model, wait, plan_limited=plan_limited)
     if isinstance(last_error, HTTPStatusError):
         return _upstream_error(last_error)
     raise ChannelException(
@@ -1097,10 +1133,11 @@ async def retrieve_response(
                     try:
                         async with async_session_maker() as stream_db:
                             stream_route = await get_response_route(
-                                stream_db, response_id, token.id
+                                stream_db, response_id, token.id,
+                                owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
                             )
                             stream_channel = await stream_db.get(Channel, channel.id)
-                            stream_token = await stream_db.get(type(token), token.id)
+                            stream_token = await reload_principal(stream_db, token)
                             if stream_route and stream_channel and stream_token:
                                 stream_route.status = (
                                     terminal_response.get("status") or stream_route.status

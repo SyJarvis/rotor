@@ -127,7 +127,9 @@ scope 保持请求发生时的快照，不随之后的 Channel 配置变化。
 
 ## Session Lease 事实
 
-`session_leases` 保存当前权威绑定，唯一键为 Rotor Token、Session ID 和 logical model。
+`session_leases` 保存当前权威绑定，唯一键为认证范围、Session ID 和 logical model。
+API Key 请求使用 Key ID；网页对话与 OAuth 使用账户 ID，同账户多个 OAuth 授权
+共享账号范围，与 Key 范围隔离。租约及事件的 `token_id`、`owner_id` 只能有一个非空。
 `session_lease_events` 追加记录 `assigned`、`renewed`、`migrated`、`expired`，以及旧/新
 Channel 和原因。事件通过 `request_id` 出现在 Control API request trace 的
 `session_lease_events` 中；routing decision 的 feature snapshot 同时说明本次是否读到
@@ -171,8 +173,6 @@ usage、provider usage / v2 / cost 覆盖不完整，或窗口内存在多个币
 ```text
 GET  /api/admin/monitoring/sources         # 会话来源
 GET  /api/admin/monitoring/performance     # 性能快照
-GET  /api/admin/monitoring/reconciliation  # 增量对账
-POST /api/admin/monitoring/reconciliation/reset
 ```
 
 自动刷新默认关闭，启用后约每 10 秒刷新一次；离开页面、页面隐藏或认证失效时停止
@@ -195,20 +195,6 @@ POST /api/admin/monitoring/reconciliation/reset
 这些指标保存在有界内存中，**重启清零**，不写入指标数据库，也不保存请求正文、SQL
 文本或密钥。性能计数属于**单进程**：页面会显示 PID 与启动时间；多 worker 部署下不能
 把一次页面查询当作全局汇总。
-
-## 增量对账
-
-对账接口比较基线之后成功账本与 Token 累计的增量，并在同一读取快照中比较。检查结果
-缓存 30 秒，不会因每次页面刷新而扫描全部历史账本。
-
-- `baseline`：刚建立基线，尚不能证明历史数据一致；
-- `ok`：基线之后的增量一致；
-- `mismatch`：增量不同，可能是记账差异或人工修改累计值，需要核查；
-- `invalid`：Token 集合、额度或身份发生变化，使基线失效；
-- `error`：无法完成检查，不能解释为对账成功。
-
-重建基线只重置内存中的比较起点，**不会修账，也不会消除既有历史差异**。当前只支持
-SQLite，其他数据库返回不支持状态。
 
 ## 路由响应头
 

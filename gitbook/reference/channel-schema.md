@@ -1,12 +1,14 @@
 # Channel 字段
 
-Channel 是路由和上游适配的主要配置对象。
+Channel 是路由和上游适配的主要配置对象。下表列出主要创建请求字段。
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `name` | string | 必填 | 渠道名称，1–100 字符 |
 | `type` | string | 必填 | provider adapter 类型 |
-| `key` | string | 必填 | 上游供应商 API Key |
+| `auth_type` | string | `api_key` | 上游认证方式：`api_key` 或 `oauth` |
+| `key` | string/null | `null` | `api_key` 方式必填；OAuth 渠道不接受 API Key |
+| `oauth_session_id` | string/null | `null` | 新建 OAuth 渠道或重新登录保存时提交已授权的临时会话 ID |
 | `base_url` | string | 必填 | 上游 API 根地址 |
 | `models` | string[] | `[]` | 客户端可请求的模型 |
 | `model_mapping` | object | `{}` | 客户端模型到上游模型的映射 |
@@ -22,6 +24,17 @@ Channel 是路由和上游适配的主要配置对象。
 当前代码保存 `rpm_limit` 和 `tpm_limit`，但没有证据表明请求路径会强制执行这两个
 限制；不要把它们当作已生效的限流保证。
 
+顶层 `auth_type` 选择上游凭证来源，与 `extra.auth_type` 的请求头格式不同。
+认证登录目前仅支持 ChatGPT OAuth，要求 `type=openai_codex`、
+`protocol=openai_responses` 和 `base_url=https://chatgpt.com/backend-api/codex`。
+创建时必须提供已完成授权的 `oauth_session_id`；编辑已有 OAuth 渠道而不重新登录时
+可省略，保留现有凭证。`oauth_session_id` 是保存请求字段，不是渠道响应字段。
+
+渠道响应提供 `auth_status`、`auth_expires_at` 和 `auth_error` 状态元数据，不返回上游
+API Key 或 OAuth access/refresh token；OAuth 凭证也不能写入 `extra`。上游登录流程
+和 Responses 功能限制见[ChatGPT OAuth 渠道](../guides/chatgpt-oauth.md)。
+客户端登录 Rotor 的 OAuth 是另一套账户授权，见[客户端网页登录授权](../guides/client-oauth.md)。
+
 ## 常用 extra 字段
 
 | 字段 | 用途 |
@@ -29,7 +42,7 @@ Channel 是路由和上游适配的主要配置对象。
 | `models_path` | 覆盖模型发现路径 |
 | `request_path` | 覆盖生成请求路径 |
 | `images_path` | 覆盖 Images 生成路径 |
-| `auth_type` | 选择 `bearer`、`x-api-key` 或 `api-key` |
+| `auth_type` | API Key 渠道的请求头格式：`bearer`、`x-api-key` 或 `api-key` |
 | `headers` | 添加上游请求头 |
 | `forward_headers` | 允许透传到上游的入站请求头白名单（列表） |
 | `capabilities` | 显式声明渠道能力集合，见下文 |
@@ -99,12 +112,13 @@ Responses 请求会要求 `responses_native`，只有 `protocol=openai_responses
 adapter factory 当前注册：
 
 ```text
-openai, deepseek, azure, anthropic,
+openai, openai_codex, deepseek, azure, anthropic,
 moonshot, minimax, zhipu, kimi
 ```
 
-`protocol=openai_responses` 会优先选择 Responses adapter，不依赖 `type` 指定一个
-单独的 Responses provider。
+`openai_codex` 使用专用 ChatGPT OAuth Responses adapter；其他类型在
+`protocol=openai_responses` 时优先选择通用 Responses adapter，不必指定单独的
+Responses provider。
 
 ## 资源 Scope 配置
 

@@ -30,9 +30,11 @@ from rotor.gateway.capabilities import chat_required_capabilities
 from rotor.conversations.store import ConversationHandle, ConversationStore
 from rotor.gateway.routing import routing_engine, session_lease_success_reason
 from rotor.services.session_leases import get_session_lease_preference
+from rotor.core.user_access import AccountPrincipal, principal_scope_key, reload_principal
 from rotor.gateway.streaming import AdmissionStreamingResponse
 from rotor.gateway.fallback import (
-    retry_after_seconds,
+    ConnectRetry,
+    is_connect_failure,
     set_routing_headers,
     should_fallback,
 )
@@ -108,6 +110,7 @@ async def chat_completions(
     lease_preference = await get_session_lease_preference(
         db,
         token_id=token.id,
+        owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
         session_id=lease_session_id,
         logical_model=request.model,
         request_protocol="openai_chat",
@@ -121,7 +124,7 @@ async def chat_completions(
         ),
     )
     affinity_key = (
-        client_session.affinity_key(token.id)
+        client_session.affinity_key(principal_scope_key(token))
         if routing_settings.affinity_enabled
         else None
     )
@@ -139,7 +142,9 @@ async def chat_completions(
     candidates = routing_decision.candidates
     if not candidates:
         if routing_decision.temporarily_unavailable:
-            raise ChannelsTemporarilyUnavailable(request.model, routing_decision.retry_after_seconds)
+            raise ChannelsTemporarilyUnavailable(
+                request.model, routing_decision.retry_after_seconds,
+                plan_limited=routing_decision.plan_limited)
         raise ChannelException(
             f"No compatible channel available for Chat model '{request.model}'. "
             f"Required capabilities: {sorted(required_capabilities)}",
@@ -184,7 +189,18 @@ async def chat_completions(
         protocol="openai_chat",
     )
     try:
-        for attempt, channel in enumerate(candidates):
+        # The plan starts as the routed candidates; a connect failure inserts a
+        # same-channel retry right behind itself so a blip never scatters the
+        # session to another account (and its cold KV cache).
+        plan = list(candidates)
+        connect_retry = ConnectRetry()
+        attempt = -1
+        fallback_reason = None
+        while True:
+            attempt += 1
+            if attempt >= len(plan):
+                break
+            channel = plan[attempt]
             admission = routing_engine.admit_attempt(request.model, channel)
             if admission is None:
                 continue
@@ -212,14 +228,15 @@ async def chat_completions(
                             routing_decision, attempt, channel=channel, request_protocol="openai_chat"
                         ),
                     )
-                    set_routing_headers(result, channel, request.model, attempt > 0)
+                    set_routing_headers(result, channel, request.model, attempt > 0, fallback_reason=fallback_reason)
                     # Ownership of http_client transfers to the streaming
                     # generator, which closes it in its own finally block.
                     streaming_response_returned = True
                     return result
                 else:
                     set_routing_headers(
-                        api_response, channel, request.model, attempt > 0
+                        api_response, channel, request.model, attempt > 0,
+                        fallback_reason=fallback_reason,
                     )
                     return await _handle_non_streaming_request(
                         request, adapter, channel, token, db, start_time, http_request,
@@ -233,12 +250,24 @@ async def chat_completions(
 
             except (HTTPStatusError, RequestError) as e:
                 last_error = e
-                if should_fallback(e):
-                    routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(e))
-                logger.warning(f"Channel {channel.name} failed: {format_error_message(e)}")
+                retry_delay = None
+                if should_fallback(e) and is_connect_failure(e):
+                    retry_delay = connect_retry.plan_retry(channel.id)
+                if retry_delay is not None:
+                    plan.insert(attempt + 1, channel)
+                elif should_fallback(e):
+                    routing_engine.mark_failure(request.model, channel, e)
+                logger.warning(
+                    f"Channel {channel.name} failed: {format_error_message(e)}"
+                    + (f"; same-channel retry in {retry_delay}s" if retry_delay is not None else "")
+                )
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
                 error_fact = normalize_upstream_error(e)
+                if fallback_reason is None:
+                    fallback_reason = (
+                        f"{channel.name if (channel.name or '').isascii() else f'channel-{channel.id}'}: {error_fact.code}"
+                    )
                 await attempt_recorder.record(
                     context=attempt_context,
                     request_id=request_id,
@@ -277,6 +306,8 @@ async def chat_completions(
                     )
                 await db.commit()
                 if should_fallback(e):
+                    if retry_delay is not None:
+                        await asyncio.sleep(retry_delay)
                     continue
                 if conversation_handle:
                     await conversation_store.finish(conversation_handle, "failed", latency_ms)
@@ -285,7 +316,7 @@ async def chat_completions(
             except Exception as e:
                 last_error = e
                 if should_fallback(e):
-                    routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(e))
+                    routing_engine.mark_failure(request.model, channel, e)
                 logger.error(f"Unexpected error with channel {channel.name}: {format_error_message(e)}")
                 latency_ms = int((time.time() - start_time) * 1000)
                 attempt_latency_ms = attempt_context.elapsed_ms()
@@ -352,7 +383,8 @@ async def chat_completions(
         conversation_handle, "failed", int((time.time() - start_time) * 1000)
     )
     if last_error is None:
-        raise ChannelsTemporarilyUnavailable(request.model, routing_engine.retry_after_seconds(request.model, candidates))
+        wait, plan_limited = routing_engine.cooldown_outlook(request.model, candidates)
+        raise ChannelsTemporarilyUnavailable(request.model, wait, plan_limited=plan_limited)
     raise ChannelException(
         f"All channels failed for model '{request.model}'",
         status_code=classify_error_status(last_error),
@@ -849,8 +881,10 @@ async def _handle_streaming_request(
                             outcome="success",
                             db=stream_db,
                         )
-                    stream_token = await stream_db.get(type(token), token.id)
+                    stream_token = await reload_principal(stream_db, token)
                     if stream_token is None:
+                        if isinstance(token, AccountPrincipal):
+                            raise RuntimeError(f"Account {token.owner_id} no longer exists")
                         raise RuntimeError(f"Token {token.id} no longer exists")
                     await accounting_service.record_success(
                         stream_db,
@@ -975,7 +1009,7 @@ async def _handle_streaming_request(
                 stream_usage.observe(error_usage)
             logger.error(f"Streaming error: {format_error_message(e)}")
             if isinstance(e, EmptyUpstreamResponse) or should_fallback(e):
-                routing_engine.mark_unavailable(request.model, channel, retry_after_seconds(e))
+                routing_engine.mark_failure(request.model, channel, e)
             latency_ms = int((time.time() - start_time) * 1000)
             attempt_latency_ms = (
                 attempt_context.elapsed_ms() if attempt_context is not None else None

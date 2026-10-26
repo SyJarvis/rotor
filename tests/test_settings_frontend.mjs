@@ -107,7 +107,8 @@ async function environment({ storageFails = false, storedLocale, gap = 0, cached
     modules.set(name, module);
     await module.link(async (specifier) => {
       if (specifier.startsWith('./session.js')) return new vm.SyntheticModule(['isAdmin'], function () { this.setExport('isAdmin', () => role === 'admin'); }, { context });
-      if (specifier.startsWith('./account.js')) return new vm.SyntheticModule(['initAccount'], function () { this.setExport('initAccount', () => ({ load() {} })); }, { context });
+      if (specifier.startsWith('./account.js')) return new vm.SyntheticModule(['initAccount'], function () { this.setExport('initAccount', () => ({ load() {}, close() {} })); }, { context });
+      if (specifier.startsWith('./security.js')) return new vm.SyntheticModule(['initSecurity'], function () { this.setExport('initSecurity', () => ({ open() {}, close() {} })); }, { context });
       if (specifier.startsWith('./api.js')) return new vm.SyntheticModule(['api'], function () {
         this.setExport('api', (path, options = {}) => new Promise((resolve, reject) => calls.push({ path, options, resolve, reject })));
       }, { context });
@@ -122,7 +123,7 @@ async function environment({ storageFails = false, storedLocale, gap = 0, cached
   async function openAndLoad(result = savedSettings()) { opener.focus(); await opener.emit('click'); calls.at(-1).resolve(result); await settle(); }
   async function edit(name, value) { const field = form.elements[name]; field[typeof value === 'boolean' ? 'checked' : 'value'] = value; await field.emit('input'); }
   return { get: (id) => nodes.get(id), form, modal, document, window, shell, opener, calls, saved, events, storage, controller, openAndLoad, edit,
-    selectTab: (name) => nodes.get(name === 'routing' ? 'settingsTabRouting' : 'settingsTabGeneral').emit('click'),
+    selectTab: (name) => nodes.get(`settingsTab${name[0].toUpperCase()}${name.slice(1)}`).emit('click'),
     submit: () => form.emit('submit'),
   };
 }
@@ -279,7 +280,7 @@ test('Settings links against cached i18n exports and language selection only tog
   assert.equal(h.document.documentElement.lang, 'zh-CN'); assert.equal(h.get('settingsModalTitle').textContent, '设置');
 });
 
-test('ordinary user settings never request admin settings and expose only General and Account', async () => {
+test('ordinary user settings never request admin settings and expose General, Account and Login and security', async () => {
   const h = await environment({ role: 'user' }); h.controller.open();
   assert.equal(h.calls.length, 0); assert.equal(h.get('settingsTabRouting').hidden, true);
   assert.equal(h.get('settingsFooter').hidden, true); assert.equal(h.form.elements.display_timezone.closest('[data-admin-setting]').hidden, true);
@@ -287,4 +288,46 @@ test('ordinary user settings never request admin settings and expose only Genera
   assert.equal(h.get('settingsAccount').hidden, false); assert.equal(h.document.activeElement, h.get('settingsTabAccount'));
   await h.submit(); assert.equal(h.calls.length, 0);
   await h.get('settingsThemeDark').emit('click'); assert.equal(h.storage.get('rotor.theme'), 'dark');
+});
+
+test('security opens for an ordinary account and keeps server settings footer hidden', async () => {
+  const h = await environment({ role: 'user' }); h.controller.open('security');
+  assert.ok(h.get('settingsTabSecurity'), 'Login and security tab is present');
+  assert.equal(h.get('settingsSecurity').hidden, false);
+  assert.equal(h.get('settingsAccount').hidden, true);
+  assert.equal(h.get('settingsFooter').hidden, true);
+  assert.equal(h.calls.length, 0, 'ordinary account never loads admin settings');
+  assert.equal(h.get('accountCurrentPassword').closest('[data-settings-panel]').dataset.settingsPanel, 'security');
+  assert.equal(h.get('accountLogout').closest('[data-settings-panel]').dataset.settingsPanel, 'security');
+});
+
+test('security category preserves administrator draft and never submits it from account actions', async () => {
+  const h = await environment(); await h.openAndLoad(); await h.edit('display_timezone', 'UTC');
+  await h.selectTab('security'); assert.equal(h.get('settingsFooter').hidden, true);
+  await h.submit(); assert.equal(h.calls.length, 1);
+  h.controller.close(); h.controller.open(); assert.equal(h.get('settingsSecurity').hidden, false);
+  await h.selectTab('general'); assert.equal(h.form.elements.display_timezone.value, 'UTC');
+  assert.equal(h.get('settingsSave').disabled, false);
+});
+
+test('admin load errors are only shown in server settings categories and reappear with retry intact', async () => {
+  const h = await environment(); h.controller.open(); h.calls[0].reject(new Error('admin offline')); await settle();
+  assert.equal(h.get('settingsLoadNotice').classList.contains('hidden'), false);
+  await h.selectTab('security'); assert.equal(h.get('settingsLoadNotice').classList.contains('hidden'), true);
+  await h.selectTab('account'); assert.equal(h.get('settingsLoadNotice').classList.contains('hidden'), true);
+  await h.selectTab('routing'); assert.equal(h.get('settingsLoadNotice').classList.contains('hidden'), false);
+  assert.match(h.get('settingsLoadMessage').textContent, /admin offline/); assert.equal(h.get('settingsRetry').hidden, false);
+});
+
+test('deep-linked security opened from the document body restores focus to the navigation button on Escape', async () => {
+  const h = await environment({ role: 'user' }); h.document.body.focus(); h.controller.open('security');
+  await h.get('settingsClose').emit('keydown', { key: 'Escape' });
+  assert.equal(h.document.activeElement, h.get('menuToggle'));
+});
+
+test('desktop deep-linked security restores focus to visible Settings when the mobile navigation button is hidden', async () => {
+  const h = await environment({ role: 'user' }); h.get('menuToggle').getClientRects = () => [];
+  h.document.body.focus(); h.controller.open('security');
+  await h.get('settingsClose').emit('keydown', { key: 'Escape' });
+  assert.equal(h.document.activeElement.id, 'openSettings');
 });

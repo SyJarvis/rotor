@@ -159,7 +159,13 @@ class ModelInfo(BaseModel):
     id: str
     object: str = "model"
     created: int
-    owned_by: str
+    owned_by: str = "rotor"
+    # Optional capability metadata, merged from channel extra.model_info when
+    # configured; omitted otherwise so standard OpenAI clients are unaffected.
+    display_name: Optional[str] = None
+    max_input_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None
+    capabilities: Optional[Dict[str, Any]] = None
 
 
 class ModelsResponse(BaseModel):

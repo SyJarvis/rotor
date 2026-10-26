@@ -180,7 +180,7 @@ def test_headers_cannot_override_oauth_authentication_or_account(monkeypatch):
     assert config.key == "" and "refresh" not in outgoing.content.decode()
 
 
-def test_native_body_preserves_tools_and_explicit_generation_parameters(monkeypatch):
+def test_native_body_filters_temperature_and_preserves_other_generation_parameters(monkeypatch):
     value = request("native")
     value.responses_payload.update({
         "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
@@ -191,7 +191,8 @@ def test_native_body_preserves_tools_and_explicit_generation_parameters(monkeypa
     original = deepcopy(value.responses_payload)
     body = json.loads(exercise(monkeypatch, value=value)["request"].content)
     assert body["instructions"] == "Be precise"
-    for key in ("tools", "max_output_tokens", "top_p", "temperature", "user"):
+    assert "temperature" not in body
+    for key in ("tools", "max_output_tokens", "top_p", "user"):
         assert body[key] == original[key]
     assert value.responses_payload == original
 
@@ -222,12 +223,16 @@ def test_codex_native_input_list_preserves_provider_items(monkeypatch):
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_ordinary_responses_preserves_native_string_input(stream):
+@pytest.mark.parametrize("temperature", [0.0, 0.3, 1.0])
+def test_ordinary_responses_preserves_native_input_and_temperature(stream, temperature):
     value = request("native", stream=stream)
+    value.responses_payload["temperature"] = temperature
+    original = deepcopy(value.responses_payload)
     adapter = AdapterFactory.create_adapter(channel(type="openai", auth_type="api_key"), None)
     body = asyncio.run(adapter.convert_request(value))
     assert body["input"] == "hi"
-    assert value.responses_payload["input"] == "hi"
+    assert body["temperature"] == temperature
+    assert value.responses_payload == original
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -248,20 +253,31 @@ def test_codex_omitted_sampling_survives_system_validator_and_stream_copy(monkey
 
 
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("mode", ["chat", "native"])
-@pytest.mark.parametrize("fields", [{"temperature": 1.0}, {"top_p": 1.0}, {"temperature": 0.3, "top_p": 0.8}])
-def test_codex_explicit_sampling_is_preserved(monkeypatch, stream, mode, fields):
+@pytest.mark.parametrize("mode", ["chat", "native", "anthropic"])
+@pytest.mark.parametrize("fields", [{"temperature": 1.0}, {"temperature": 0.0},
+                                    {"top_p": 1.0}, {"temperature": 0.3, "top_p": 0.8}])
+def test_codex_filters_temperature_and_preserves_explicit_top_p(monkeypatch, stream, mode, fields):
     if mode == "native":
         value = request(mode, stream)
         value.responses_payload.update(fields)
     else:
         value = request(mode, stream, **fields)
+        if mode == "anthropic":
+            value.anthropic_payload.update(fields)
+    original = deepcopy(value.model_dump())
+    original_responses = deepcopy(value.responses_payload)
+    original_anthropic = deepcopy(value.anthropic_payload)
+    original_fields = set(value.model_fields_set)
     body = json.loads(exercise(monkeypatch, value=value)["request"].content)
-    for name in ("temperature", "top_p"):
-        if name in fields:
-            assert body[name] == fields[name]
-        else:
-            assert name not in body
+    assert "temperature" not in body
+    if "top_p" in fields:
+        assert body["top_p"] == fields["top_p"]
+    else:
+        assert "top_p" not in body
+    assert value.model_dump() == original
+    assert value.responses_payload == original_responses
+    assert value.anthropic_payload == original_anthropic
+    assert value.model_fields_set == original_fields
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -271,6 +287,18 @@ def test_ordinary_adapters_preserve_chat_sampling_defaults(stream, protocol):
     adapter = AdapterFactory.create_adapter(channel(type="openai", auth_type="api_key", protocol=protocol), None)
     body = asyncio.run(adapter.convert_request(value))
     assert body["temperature"] == 1.0 and body["top_p"] == 1.0
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("protocol", ["openai_responses", "openai"])
+@pytest.mark.parametrize("temperature", [0.0, 0.3, 1.0])
+def test_ordinary_adapters_preserve_explicit_chat_sampling(stream, protocol, temperature):
+    value = request(stream=stream, temperature=temperature, top_p=0.8)
+    original = deepcopy(value.model_dump())
+    adapter = AdapterFactory.create_adapter(channel(type="openai", auth_type="api_key", protocol=protocol), None)
+    body = asyncio.run(adapter.convert_request(value))
+    assert body["temperature"] == temperature and body["top_p"] == 0.8
+    assert value.model_dump() == original
 
 
 def test_missing_instructions_has_nonempty_default(monkeypatch):

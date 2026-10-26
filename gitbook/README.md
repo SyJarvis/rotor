@@ -1,6 +1,6 @@
 # Rotor
 
-Rotor 是一个 API-only 的 LLM 网关。它把多个上游模型渠道统一暴露为
+Rotor 是一个自托管的 LLM API 网关，提供网页对话与管理页面。它把多个上游模型渠道统一暴露为
 OpenAI Chat Completions、OpenAI Responses、OpenAI Images 和 Anthropic
 Messages 兼容接口。
 
@@ -10,10 +10,11 @@ Messages 兼容接口。
 - 使用优先级、权重、会话亲和或自适应策略选择渠道；
 - 在可重试的上游错误发生时切换到其他渠道；
 - 为调用方签发独立 API Key，并限制配额和可访问渠道；
+- 通过[网页登录授权](guides/client-oauth.md)让客户端获得推理凭证，直接使用账户的权限与配额，不依赖默认或 `base` Key；
 - 查看请求日志、用量、延迟和路由决策；
 - 在首页查看最近请求的运行状态和近期异常，并按自然日、周或月分析用量；
 - 为 MCP Client 创建可单独停用的只读 Control Key；
-- 使用浏览器管理页或 HTTP 管理 API 完成配置。
+- 使用浏览器管理页或 HTTP 管理 API 完成配置，上游认证支持 API Key 或 [ChatGPT OAuth](guides/chatgpt-oauth.md)。
 
 ## 最短路径
 
@@ -31,10 +32,12 @@ Messages 兼容接口。
 | Anthropic Messages | `POST /anthropic/v1/messages` |
 
 Rotor 的页面位于 `/`，健康检查位于 `/health`。管理员和普通用户登录后均可聊天；
-管理员可以创建账户或生成邀请码供用户注册。每个账户创建时获得 `base` Key，聊天使用
-该账户当前默认 Key，遵循账户与 Key 的额度、渠道和模型限制。聊天默认使用 Chat Completions，
+管理员可以创建账户或生成邀请码供用户注册。聊天直接使用当前登录账户的权限和额度，
+不依赖默认或 `base` Key。网页聊天、Rotor 客户端 OAuth 和账户名下的 API Key 共享
+账户额度；API Key 请求另外受 Key 自身的权限与额度限制。聊天默认使用 Chat Completions，
 也可切换到 Responses；右侧的模型、API 格式、System Prompt、temperature 和 max_tokens 按对话
-保存。连接测试会按当前参数发起一次简短的真实文本生成请求，可能产生上游费用，
+保存，temperature 和 max_tokens 留空时不发送对应参数，使用模型默认值。
+连接测试会按当前参数发起一次简短的真实文本生成请求，可能产生上游费用，
 不验证图片或文档理解能力。
 
 聊天支持文字、图片及 UTF-8 文本、PDF、DOCX 文档。PDF/DOCX 仅提取文字，不保留图片
@@ -42,7 +45,12 @@ Rotor 的页面位于 `/`，健康检查位于 `/health`。管理员和普通用
 `CHAT_STORE_DIR` 下各用户目录的 JSON 文件中，附件单独保存。同一账户在其他浏览器
 登录后可读取已保存的内容。历史列表每项的“…”菜单支持导出 JSON 或删除会话及其附件。
 旧版本浏览器本地对话不迁移，网关请求记录也不会导入为聊天历史。
-附件限制和存储说明见 [README 的用户聊天说明](../README.md#用户聊天)。
+附件限制和存储说明见 [README 的用户聊天说明](https://github.com/SyJarvis/rotor/blob/develop/README.md#用户聊天)。
+
+个人资料位于“设置 → 账户”，修改密码与设备管理位于“设置 → 登录与安全”。
+设备管理显示每条客户端 OAuth 授权的名称、授权时间、最近使用和到期时间，支持
+确认后独立撤销；这些是授权记录，不是物理设备或浏览器会话。客户端授权流程见
+[网页登录授权](guides/client-oauth.md)，上游渠道登录见 [ChatGPT OAuth](guides/chatgpt-oauth.md)。
 
 ## 项目边界
 

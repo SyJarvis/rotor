@@ -223,7 +223,7 @@ def test_malformed_success_is_accounted_as_failure(harness, data):
 
 def test_admission_unavailable(harness, monkeypatch):
     monkeypatch.setattr(harness.engine, 'admit_attempt', lambda *args: None)
-    assert asyncio.run(harness.request()).status_code == 503
+    assert asyncio.run(harness.request()).status_code == 429
     assert not harness.requests
     assert harness.clients[0].is_closed
 

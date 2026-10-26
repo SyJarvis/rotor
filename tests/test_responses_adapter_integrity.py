@@ -159,6 +159,18 @@ def test_invalid_usage_is_not_fabricated_or_attached_as_known(usage):
     assert not getattr(captured.value, "provider_usage", None)
 
 
+@pytest.mark.parametrize("details", [
+    {"cached_tokens": 8, "cache_write_tokens": 2},
+    {"cached_tokens": 8, "reasoning_tokens_estimated": True},
+    {"cached_tokens": 8, "vendor_cache_kind": "prefix"},
+])
+def test_non_counter_usage_detail_metadata_is_passed_through(details):
+    usage = {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15, "input_tokens_details": details}
+    assert extract_responses_usage(result(usage=usage))["input_tokens_details"] == details
+    converted = execute(result(usage=usage))
+    assert AccountingService().extract_usage(converted).usage_source == "provider"
+
+
 @pytest.mark.parametrize("status", ["failed", "cancelled"])
 def test_failed_nonstream_preserves_only_verified_usage(status):
     payload = result(status, private_response_text="do not attach")

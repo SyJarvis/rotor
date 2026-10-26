@@ -11,8 +11,7 @@ let controller;
 let pending;
 let generation = 0;
 let performanceData = null;
-let reconciliationData = null;
-let errors = {};
+let error = null;
 
 const label = (key) => escapeHtml(t(key));
 const number = (value) => value == null || !Number.isFinite(Number(value))
@@ -23,16 +22,6 @@ const timestamp = (value) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "—" : escapeHtml(date.toLocaleString());
 };
-const states = {
-  baseline: "perfBaseline", ok: "perfOk", mismatch: "perfMismatch",
-  invalid: "perfInvalid", error: "perfError",
-};
-
-function stateLabel(data) {
-  if (data?.status === "baseline" && !data.checked_at) return label("perfBaselinePending");
-  return label(states[data?.status] || "perfNoData");
-}
-
 function metricRow(name, metric, unit = "ms") {
   const value = unit === "ms" ? duration : number;
   return `<tr><th scope="row">${label(name)}</th>
@@ -45,37 +34,6 @@ function metricTable(rows) {
     <thead><tr><th>${label("perfMetric")}</th><th>p95</th>
     <th>${label("perfSamples")}</th><th>${label("perfTotalCount")}</th></tr></thead>
     <tbody>${rows}</tbody></table></div>`;
-}
-
-function renderReconciliation(data) {
-  const state = states[data?.status] ? data.status : "empty";
-  const hint = state === "baseline" && !data.checked_at
-    ? "perfBaselinePendingHint" : `${states[state] || "perfNoData"}Hint`;
-  const hasDelta = ["ok", "mismatch"].includes(state);
-  const cell = (value) => hasDelta ? number(value) : "—";
-  return `<section class="performance-section">
-    <div class="performance-section-head"><h3>${label("perfReconciliation")}</h3>
-      <span class="performance-status ${state}">${stateLabel(data)}</span></div>
-    <p class="performance-note">${label(hint)}</p>
-    ${data?.reason ? `<p class="performance-note">${escapeHtml(data.reason)}</p>` : ""}
-    <div class="performance-table-wrap"><table class="performance-table">
-      <thead><tr><th>${label("perfMetric")}</th><th>${label("perfLedger")}</th>
-      <th>${label("perfTokenCounters")}</th><th>${label("perfQuota")}</th></tr></thead>
-      <tbody><tr><th scope="row">${label("perfRequests")}</th>
-      <td>${cell(data?.requests?.ledger)}</td><td>${cell(data?.requests?.token)}</td><td>—</td></tr>
-      <tr><th scope="row">${label("perfTokens")}</th><td>${cell(data?.total_tokens?.ledger)}</td>
-      <td>${cell(data?.total_tokens?.token)}</td><td>${cell(data?.total_tokens?.quota)}</td></tr></tbody>
-    </table></div>
-    <div class="performance-reconciliation-footer">
-      <div class="performance-note">${label("perfBaselineSince")}: ${timestamp(data?.since)}<br>
-      ${label("perfCheckedAt")}: ${timestamp(data?.checked_at)} · ${label("perfCacheNote")}
-      ${data?.cached ? ` · ${label("perfCached")}` : ""}<br>
-      ${label("perfProcess")}: ${number(data?.pid)} · ${label("perfStartedAt")}: ${timestamp(data?.started_at)}</div>
-      <button class="btn-secondary" type="button" data-performance-action="reset" ${pending ? "disabled" : ""}>
-      ${label("perfResetBaseline")}</button>
-    </div>
-    <p class="performance-note">${label("perfResetHint")}</p>
-  </section>`;
 }
 
 function render() {
@@ -93,7 +51,6 @@ function render() {
       <td>${duration(row?.latency_ms?.p95)} <small>n=${number(row?.latency_ms?.sample_count)}</small></td>
       <td>${duration(row?.ttft_ms?.p95)} <small>n=${number(row?.ttft_ms?.sample_count)}</small></td></tr>`;
   }).join("");
-  const state = states[reconciliationData?.status] ? reconciliationData.status : "empty";
   container.innerHTML = `
     <div class="section-head performance-heading"><div><h2>${label("perfTitle")}</h2>
       <p>${label("perfDescription")}</p></div>
@@ -101,14 +58,11 @@ function render() {
       data-performance-auto ${automatic ? "checked" : ""}>${label("perfAutoRefresh")}</label>
       <button class="btn-secondary" type="button" data-performance-action="refresh" ${pending ? "disabled" : ""}>
       <i data-lucide="refresh-cw"></i>${label(pending ? "perfRefreshing" : "refresh")}</button></div></div>
-    ${Object.values(errors).map((error) => `<div class="performance-alert" role="alert">${escapeHtml(error)}</div>`).join("")}
-    ${data?.pid != null && reconciliationData?.pid != null && data.pid !== reconciliationData.pid
-      ? `<div class="performance-alert" role="status">${label("perfDifferentProcess")}</div>` : ""}
+    ${error ? `<div class="performance-alert" role="alert">${escapeHtml(error)}</div>` : ""}
     <div class="performance-summary">
       <article><span>${label("perfRequests")}</span><strong>${number(total)}</strong><small>${label("perfSinceStart")}</small></article>
       <article><span>${label("perfAcquire")}</span><strong>${duration(metrics["db.acquire_ms"]?.p95)}</strong><small>p95</small></article>
       <article><span>${label("perfQueue")}</span><strong>${number(store?.queue_size)} <small>/ ${number(store?.queue_maxsize)}</small></strong><small>${label("perfPendingEvents")}</small></article>
-      <article><span>${label("perfReconciliation")}</span><strong class="performance-state-text ${state}">${stateLabel(reconciliationData)}</strong><small>${label("perfIncremental")}</small></article>
     </div>
     <div class="performance-columns">
       <section class="performance-section"><h3>${label("perfDatabase")}</h3>
@@ -134,7 +88,6 @@ function render() {
       </tr></thead><tbody>${protocolRows}</tbody></table></div>
       <p class="performance-note">${label("perfProtocolHint")}</p>
     </section>
-    ${renderReconciliation(reconciliationData)}
     <footer class="performance-footnote">${label("perfSampleNote")} ${number(data?.window_seconds)} s / ${number(data?.sample_limit)}.
       ${label("perfCumulativeNote")}<br>${label("perfProcess")}: ${number(data?.pid)} ·
       ${label("perfStartedAt")}: ${timestamp(data?.started_at)} · ${label("monitoringUpdatedAt")}: ${timestamp(data?.generated_at)}</footer>`;
@@ -153,32 +106,22 @@ function schedule() {
   }
 }
 
-async function refresh(reset = false) {
+async function refresh() {
   if (!active || document.hidden || pending) return pending;
   stopTimer();
   const sequence = generation;
   controller = new AbortController();
-  const options = { signal: controller.signal };
-  pending = Promise.allSettled([
-    api("/api/admin/monitoring/performance", options),
-    api(`/api/admin/monitoring/reconciliation${reset ? "/reset" : ""}`,
-        { ...options, ...(reset ? { method: "POST" } : {}) }),
-  ]);
+  pending = api("/api/admin/monitoring/performance", { signal: controller.signal });
   render();
   try {
-    const [perf, reconciliation] = await pending;
+    const data = await pending;
     if (sequence !== generation || !active) return;
-    errors = {};
-    if (perf.status === "fulfilled") performanceData = perf.value;
-    else {
-      performanceData = null;
-      errors.performance = `${t("perfLoadFailed")}: ${perf.reason?.message || perf.reason}`;
-    }
-    if (reconciliation.status === "fulfilled") reconciliationData = reconciliation.value;
-    else {
-      reconciliationData = { status: "error" };
-      errors.reconciliation = `${t("perfReconciliationFailed")}: ${reconciliation.reason?.message || reconciliation.reason}`;
-    }
+    performanceData = data;
+    error = null;
+  } catch (reason) {
+    if (sequence !== generation || !active) return;
+    performanceData = null;
+    error = `${t("perfLoadFailed")}: ${reason?.message || reason}`;
   } finally {
     if (sequence === generation) {
       pending = null;
@@ -208,7 +151,7 @@ export function load(target) {
     container = target;
     container.addEventListener("click", (event) => {
       const action = event.target.closest("[data-performance-action]")?.dataset.performanceAction;
-      if (action) refresh(action === "reset");
+      if (action === "refresh") refresh();
     });
     container.addEventListener("change", (event) => {
       if (event.target.matches("[data-performance-auto]")) {

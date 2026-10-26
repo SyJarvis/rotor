@@ -9,12 +9,17 @@ from rotor.models.response_route import ResponseRoute
 async def get_response_route(
     db: AsyncSession,
     response_id: str,
-    token_id: int,
+    token_id: int | None = None,
+    *,
+    owner_id: int | None = None,
 ) -> ResponseRoute | None:
+    if (token_id is None) == (owner_id is None):
+        raise ValueError("Response ownership requires exactly one account or API Key")
     result = await db.execute(
         select(ResponseRoute).where(
             ResponseRoute.response_id == response_id,
             ResponseRoute.token_id == token_id,
+            ResponseRoute.owner_id == owner_id,
         )
     )
     return result.scalar_one_or_none()
@@ -24,7 +29,8 @@ async def save_response_route(
     db: AsyncSession,
     *,
     response_id: str,
-    token_id: int,
+    token_id: int | None = None,
+    owner_id: int | None = None,
     channel_id: int,
     conversation_id: str | None = None,
     model: str | None = None,
@@ -32,17 +38,12 @@ async def save_response_route(
     usage_accounted: bool = False,
     request_started_at: datetime | None = None,
 ) -> ResponseRoute:
-    result = await db.execute(
-        select(ResponseRoute).where(
-            ResponseRoute.response_id == response_id,
-            ResponseRoute.token_id == token_id,
-        )
-    )
-    route = result.scalar_one_or_none()
+    route = await get_response_route(db, response_id, token_id, owner_id=owner_id)
     if route is None:
         route_kwargs = {
             "response_id": response_id,
             "token_id": token_id,
+            "owner_id": owner_id,
             "channel_id": channel_id,
         }
         if request_started_at is not None:
