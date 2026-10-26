@@ -192,7 +192,7 @@ test('authorization loads its standalone module while the console retains its ap
     assert.equal(h.document.body.classList.contains('auth-pending'), false);
   }
   const console = await environment();
-  assert.deepEqual(console.importPaths, ['./app.js?v=67']);
+  assert.deepEqual(console.importPaths, ['./app.js?v=68']);
 });
 
 test('authorization parameters survive registration switching, registration completion and page refresh', async () => {
@@ -238,7 +238,7 @@ test('security deep link survives sign-in and registration while root registrati
   const link = new URL(h.get('openRegistration').href, href);
   assert.equal(link.searchParams.get('settings'), 'security'); assert.equal(link.hash, '#anchor');
   h.get('openRegistration').click(); await fillRegistration(h).submit();
-  assert.equal(h.window.location.href, href); assert.deepEqual(h.importPaths, ['./app.js?v=67']);
+  assert.equal(h.window.location.href, href); assert.deepEqual(h.importPaths, ['./app.js?v=68']);
   const login = await environment({ status: 401, href });
   login.get('adminLoginForm').elements.username.value = 'test-user'; login.get('adminLoginForm').elements.password.value = 'test-password';
   await login.get('adminLoginForm').submit(); assert.equal(login.window.location.href, href);
