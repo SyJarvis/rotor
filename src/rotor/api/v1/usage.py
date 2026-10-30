@@ -68,6 +68,7 @@ async def account_usage(
                 "channel": channel.name,
                 "provider": _provider(channel),
                 "plan": usage.plan,
+                "subscription_status": usage.subscription_status,
                 "rate_limit": {
                     "primary_window": usage.primary.model_dump() if usage.primary else None,
                     "secondary_window": usage.secondary.model_dump() if usage.secondary else None,

@@ -13,6 +13,11 @@ CACHE_TTL_SECONDS = 90.0
 _entries: dict[int, tuple[float, ChannelUsageResponse]] = {}
 
 
+def invalidate(channel_id: int) -> None:
+    """Discard usage after a channel configuration or status change."""
+    _entries.pop(channel_id, None)
+
+
 def store(channel_id: int, usage: ChannelUsageResponse, *, now: float | None = None) -> None:
     """Cache a fresh snapshot for a channel."""
     _entries[channel_id] = (time.time() if now is None else now, usage)

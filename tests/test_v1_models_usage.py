@@ -160,3 +160,21 @@ def test_usage_reports_zhipu_provider_and_unlimited_quota():
         entry = next(item for item in payload["channels"] if item["channel_id"] == 2)
         assert entry["provider"] == "zhipu"
     asyncio.run(exercise())
+
+
+def test_usage_reports_missing_subscription_without_inventing_windows():
+    async def exercise():
+        async with discovery_client() as client:
+            usage_cache.store(2, ChannelUsageResponse(
+                subscription_status="inactive", allowed=False, fetched_at=time.time(),
+            ))
+            result = await client.get("/v1/usage", headers=AUTH)
+        assert result.status_code == 200
+        entry = result.json()["channels"][0]
+        assert entry["provider"] == "zhipu"
+        assert entry["subscription_status"] == "inactive"
+        assert entry["plan"] is None
+        assert entry["allowed"] is False
+        assert entry["limit_reached"] is None
+        assert entry["rate_limit"] == {"primary_window": None, "secondary_window": None}
+    asyncio.run(exercise())

@@ -1,4 +1,5 @@
 import time
+from types import SimpleNamespace
 from typing import List, Literal
 
 import httpx
@@ -24,7 +25,7 @@ from rotor.services.chatgpt_oauth import (
     resolve_oauth_credentials,
     validate_configuration,
 )
-from rotor.services.zhipu_quota import ZhipuQuotaError
+from rotor.services.zhipu_quota import ZhipuQuotaError, is_zhipu_coding_channel
 from rotor.schemas.channel import (
     ChannelCooldownResetRequest,
     ChannelCooldownResetResponse,
@@ -414,10 +415,6 @@ async def get_channel_oauth_usage(
     channel's plan-limit cooldowns (rolling windows can recover early).
     """
     now = time.time()
-    cached = usage_cache.fresh(channel_id, now=now)
-    if cached and not refresh:
-        return cached
-
     result = await db.execute(select(Channel).where(Channel.id == channel_id))
     channel = result.scalar_one_or_none()
     if not channel:
@@ -425,6 +422,13 @@ async def get_channel_oauth_usage(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Channel {channel_id} not found",
         )
+    cached = usage_cache.fresh(channel_id, now=now)
+    if cached and not refresh:
+        try:
+            await quota_refresher.apply_subscription_status(db, channel, cached)
+        except ZhipuQuotaError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        return cached
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             usage = await quota_refresher.fetch_usage(channel, client)
@@ -433,6 +437,7 @@ async def get_channel_oauth_usage(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Channel has no quota provider (OAuth or Zhipu required)",
             )
+        await quota_refresher.apply_subscription_status(db, channel, usage)
     except OAuthError as exc:
         raise HTTPException(
             status_code=exc.status_code if exc.status_code >= 500 else status.HTTP_502_BAD_REQUEST,
@@ -606,6 +611,22 @@ async def _probe_generation_capability(
                 raise RuntimeError("Provider did not return a function call")
 
 
+async def _validate_coding_subscription(channel, db: AsyncSession | None = None) -> None:
+    """Validate explicit enable requests against the current or proposed credentials."""
+    if not is_zhipu_coding_channel(channel):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            usage = await quota_refresher.fetch_usage(channel, client)
+        if db is not None:
+            await quota_refresher.apply_subscription_status(db, channel, usage)
+            quota_refresher.apply_usage(channel, usage)
+    except ZhipuQuotaError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if usage.subscription_status == "inactive":
+        raise HTTPException(status_code=409, detail="Channel has no Coding Plan subscription")
+
+
 @router.put("/{channel_id}", response_model=ChannelResponse)
 async def update_channel(
     channel_id: int,
@@ -677,12 +698,18 @@ async def update_channel(
             if not migrated_extra.get(name) or migrated_extra.get(name) == old_defaults[name]:
                 migrated_extra[name] = new_defaults[name]
         update_data["extra"] = migrated_extra
+    if update_data.get("enabled") is True:
+        await _validate_coding_subscription(SimpleNamespace(
+            auth_type=auth_type, base_url=base_url, key=key,
+            extra=update_data.get("extra", channel.extra) or {},
+        ))
     # Explicit values also clear a refresh lease claimed after the ORM read.
     # ORM dirty tracking would omit an unchanged None and leave that lease live.
     if update_data:
         await db.execute(sql_update(Channel).where(Channel.id == channel_id).values(**update_data))
 
     await db.commit()
+    usage_cache.invalidate(channel_id)
     await db.refresh(channel)
 
     stats = await _channel_stats(db, [channel.id])
@@ -861,6 +888,7 @@ async def disable_channel(
 
     channel.enabled = False
     await db.commit()
+    usage_cache.invalidate(channel_id)
     await db.refresh(channel)
 
     stats = await _channel_stats(db, [channel.id])
@@ -884,8 +912,10 @@ async def enable_channel(
             detail=f"Channel {channel_id} not found"
         )
 
+    await _validate_coding_subscription(channel, db)
     channel.enabled = True
     await db.commit()
+    usage_cache.invalidate(channel_id)
     await db.refresh(channel)
 
     stats = await _channel_stats(db, [channel.id])

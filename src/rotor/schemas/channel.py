@@ -167,9 +167,11 @@ class ChannelUsageWindow(BaseModel):
 
 
 class ChannelUsageResponse(BaseModel):
-    """ChatGPT plan usage snapshot for an OAuth channel."""
+    """Subscription usage snapshot for a channel with a quota provider."""
 
     plan: Optional[str] = None
+    subscription_status: Literal["inactive"] | None = None
+    channel_enabled: Optional[bool] = None
     allowed: Optional[bool] = None
     limit_reached: Optional[bool] = None
     primary: Optional[ChannelUsageWindow] = None

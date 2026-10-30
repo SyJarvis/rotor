@@ -663,6 +663,7 @@ export async function load() {
     ]);
     if (!active || generation !== loadGeneration) return;
     state.channels = channels;
+    state.quota = {};
     state.authSyncError = {};
     state.routingState = indexRoutingState(routingState);
     state.routingError = routingError;
@@ -687,6 +688,7 @@ function hasUsagePanel(c) {
 }
 
 async function loadQuota(forceId = null) {
+  const generation = loadGeneration;
   const targets = state.channels.filter(
     (c) => hasUsagePanel(c) && (!forceId || String(c.id) === String(forceId)),
   );
@@ -699,13 +701,16 @@ async function loadQuota(forceId = null) {
     changed = true;
     try {
       const data = await api(`/api/admin/channels/${c.id}/oauth/usage${forceId ? "?refresh=1" : ""}`);
+      if (!active || generation !== loadGeneration) return;
+      if (typeof data.channel_enabled === "boolean") c.enabled = data.channel_enabled;
       state.quota[c.id] = { loading: false, data, fetchedAt: Date.now() };
     } catch (error) {
+      if (!active || generation !== loadGeneration) return;
       // 404 = this server build predates quota reporting; hide the block instead of nagging.
       state.quota[c.id] = { loading: false, error, unsupported: error?.status === 404 };
     }
   }));
-  if (changed) render();
+  if (changed && active && generation === loadGeneration) render();
 }
 
 function quotaTone(percent) {
@@ -744,6 +749,13 @@ function renderOAuthBlock(c) {
   } else if (q?.error) {
     quotaHtml = `<span class="oauth-quota-error">${t("oauthQuotaFailed")}</span>
       <button class="oauth-quota-retry" data-channel-quota-refresh="${c.id}">${t("oauthRetry")}</button>`;
+  } else if (q?.data?.subscription_status === "inactive") {
+    quotaHtml = `<div class="quota-foot">
+      <span class="muted text-sm">${t("oauthNoSubscription")}</span>
+      <button class="icon-btn" data-channel-quota-refresh="${c.id}" title="${t("oauthQuotaRefresh")}" aria-label="${t("oauthQuotaRefresh")}">
+        <i data-lucide="refresh-cw"></i>
+      </button>
+    </div>`;
   } else if (q?.data) {
     const d = q.data;
     const row = (label, win) => {

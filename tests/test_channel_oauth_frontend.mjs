@@ -25,7 +25,7 @@ const savedChannel = (overrides = {}) => ({
   extra: { request_path: '/responses', auth_type: 'bearer' }, ...overrides,
 });
 
-async function environment({ language = 'en', start = session(), parses = [], completes = [], probes = [], confirmResult = true, failSave = 0, onSave = null, listed = [], check = {}, checks = [], details = [] } = {}) {
+async function environment({ language = 'en', start = session(), parses = [], completes = [], probes = [], confirmResult = true, failSave = 0, onSave = null, listed = [], check = {}, checks = [], details = [], usages = [] } = {}) {
   const nodes = new Map();
   const timers = [];
   const calls = [];
@@ -95,6 +95,7 @@ async function environment({ language = 'en', start = session(), parses = [], co
   const pendingProbes = [...probes];
   const pendingChecks = [...checks];
   const pendingDetails = [...details];
+  const pendingUsages = [...usages];
   const bindings = {
     api: async (url, options = {}) => {
       const body = options.body ? JSON.parse(options.body) : null;
@@ -130,6 +131,11 @@ async function environment({ language = 'en', start = session(), parses = [], co
         return typeof value === 'function' ? value() : value;
       }
       if (url.endsWith('/routing-state')) return { cooldowns: [] };
+      if (url.includes('/oauth/usage')) {
+        const value = pendingUsages.shift() ?? {};
+        if (value instanceof Error) throw value;
+        return value;
+      }
       if (options.method === 'POST' || options.method === 'PUT') {
         if (failSave-- > 0) throw new Error('Save temporarily failed');
         if (onSave) return onSave();
@@ -147,7 +153,7 @@ async function environment({ language = 'en', start = session(), parses = [], co
     parseJson: (text, fallback) => text?.trim() ? JSON.parse(text) : fallback,
     parseCsv: (text) => (text || '').split(',').map((part) => part.trim()).filter(Boolean),
     escapeHtml: (text) => String(text ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;'),
-    badge: (text) => `<span>${text}</span>`, statusBadge: () => '', toast: (...args) => toasts.push(args),
+    badge: (text) => `<span>${text}</span>`, statusBadge: (enabled) => `<span data-status="${enabled}">${locale[enabled ? 'enable' : 'disable']}</span>`, toast: (...args) => toasts.push(args),
   };
   const helper = new vm.SourceTextModule(helperSource, { context });
   const channels = new vm.SourceTextModule(channelsSource, { context });
@@ -206,6 +212,92 @@ async function environment({ language = 'en', start = session(), parses = [], co
     probes: () => calls.filter((entry) => entry.url.endsWith('/probe-models')),
   };
 }
+
+for (const language of ['zh-CN', 'en']) {
+  test(`missing subscription is a normal status and refresh can restore plan windows (${language})`, async () => {
+    const env = await environment({
+      language,
+      listed: [savedChannel({ enabled: true, auth_type: 'api_key', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
+      usages: [
+        { subscription_status: 'inactive', channel_enabled: false, plan: null, allowed: false, limit_reached: null, primary: null, secondary: null },
+        { channel_enabled: false, plan: 'pro', primary: { used_percent: 12 }, secondary: { used_percent: 34 } },
+      ],
+    });
+    await env.page.load();
+    await new Promise(setImmediate);
+    const html = env.getNode('channels').innerHTML;
+    assert.match(html, language === 'zh-CN' ? /未订阅/ : /No subscription/);
+    assert.doesNotMatch(html, /quota-bar|oauth-quota-error|oauth-quota-retry/);
+    assert.match(html, /data-channel-quota-refresh="7"/);
+    assert.match(html, /data-status="false"/);
+    await env.page.onClick({ dataset: {}, closest: (selector) => selector === '[data-channel-menu]' ? { dataset: { channelMenu: '7' } } : null });
+    assert.match(env.getNode('channels').innerHTML, /data-channel-toggle="7" data-enabled="false"/);
+    await env.page.onClick({ dataset: {}, closest: (selector) => selector === '[data-channel-quota-refresh]' ? { dataset: { channelQuotaRefresh: '7' } } : null });
+    assert.ok(env.calls.some(({ url }) => url.endsWith('/oauth/usage?refresh=1')));
+    const renewed = env.getNode('channels').innerHTML;
+    assert.match(renewed, /quota-bar/);
+    assert.match(renewed, /12%/);
+    assert.match(renewed, /34%/);
+    assert.doesNotMatch(renewed, /未订阅|No subscription/);
+    assert.match(renewed, /data-status="false"/);
+    env.page.unload();
+  });
+
+  test(`quota fetch errors still offer retry (${language})`, async () => {
+    const env = await environment({
+      language,
+      listed: [savedChannel({ auth_type: 'api_key', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
+      usages: [new Error('authentication failed')],
+    });
+    await env.page.load();
+    await new Promise(setImmediate);
+    const html = env.getNode('channels').innerHTML;
+    assert.match(html, language === 'zh-CN' ? /额度获取失败/ : /Usage fetch failed/);
+    assert.match(html, /oauth-quota-retry/);
+    assert.doesNotMatch(html, /未订阅|No subscription/);
+    env.page.unload();
+  });
+}
+
+test('reloading channels discards a cached missing subscription after configuration changes', async () => {
+  const env = await environment({
+    listed: [savedChannel({ enabled: false, auth_type: 'api_key', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
+    usages: [
+      { subscription_status: 'inactive', channel_enabled: false },
+      { channel_enabled: false, plan: 'pro', primary: { used_percent: 12 } },
+    ],
+  });
+  await env.page.load();
+  await new Promise(setImmediate);
+  assert.match(env.getNode('channels').innerHTML, /No subscription/);
+  await env.page.load();
+  await new Promise(setImmediate);
+  assert.equal(env.calls.filter(({ url }) => url.includes('/oauth/usage')).length, 2);
+  assert.doesNotMatch(env.getNode('channels').innerHTML, /No subscription/);
+  assert.match(env.getNode('channels').innerHTML, /12%/);
+  assert.match(env.getNode('channels').innerHTML, /data-status="false"/);
+  env.page.unload();
+});
+
+test('an old missing-subscription response cannot overwrite usage from a newer page load', async () => {
+  let finishOld;
+  const pending = new Promise((resolve) => { finishOld = resolve; });
+  const env = await environment({
+    listed: [savedChannel({ enabled: true, auth_type: 'api_key', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
+    usages: [pending, { channel_enabled: true, plan: 'pro', primary: { used_percent: 12 } }],
+  });
+  await env.page.load();
+  await env.page.load();
+  await new Promise(setImmediate);
+  const current = env.getNode('channels').innerHTML;
+  finishOld({ subscription_status: 'inactive', channel_enabled: false });
+  await new Promise(setImmediate);
+  assert.equal(env.getNode('channels').innerHTML, current);
+  assert.match(current, /data-status="true"/);
+  assert.match(current, /12%/);
+  assert.doesNotMatch(current, /No subscription/);
+  env.page.unload();
+});
 
 test('API key creation remains the default; OAuth fixes the connection and gates probing on authorization', async () => {
   const env = await environment();
@@ -833,6 +925,7 @@ for (const action of ['unload', 'reload']) {
     const checking = env.check(); await ready;
     assert.equal(typeof finish, 'function');
     if (action === 'unload') env.page.unload(); else await env.page.load();
+    await new Promise(setImmediate);
     const current = env.getNode('channels').innerHTML;
     finish(savedChannel({ auth_status: 'reauth_required' })); await checking;
     assert.equal(env.getNode('channels').innerHTML, current);

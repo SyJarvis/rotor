@@ -12,12 +12,13 @@ import logging
 import time
 
 import httpx
+from sqlalchemy import update
 
 from rotor.database import async_session_maker
 from rotor.models.channel import Channel
 from rotor.services import usage_cache
 from rotor.services.chatgpt_oauth import codex_usage_snapshot, fetch_codex_usage, resolve_oauth_credentials
-from rotor.services.zhipu_quota import fetch_zhipu_usage, is_zhipu_quota_channel
+from rotor.services.zhipu_quota import ZhipuQuotaError, fetch_zhipu_usage, is_zhipu_coding_channel, is_zhipu_quota_channel
 
 logger = logging.getLogger("rotor.quota_refresher")
 
@@ -52,6 +53,9 @@ def apply_usage(channel, usage, *, now: float | None = None) -> None:
 
     moment = time.time() if now is None else now
     usage_cache.store(channel.id, usage, now=moment)
+    if usage.subscription_status == "inactive":
+        # Missing a subscription proves neither quota exhaustion nor recovery.
+        return
     if usage.limit_reached:
         horizon = _limit_horizon(usage, moment)
         for model in {*(channel.models or [])}:
@@ -78,6 +82,27 @@ async def fetch_usage(channel, client: httpx.AsyncClient):
     if is_zhipu_quota_channel(channel):
         return await fetch_zhipu_usage(client, channel)
     return None
+
+
+async def apply_subscription_status(db, channel, usage) -> None:
+    """Persist confirmed loss of a Coding Plan; renewal never enables a channel."""
+    if usage.subscription_status == "inactive" and is_zhipu_coding_channel(channel) and channel.enabled:
+        result = await db.execute(
+            update(Channel).where(
+                Channel.id == channel.id,
+                Channel.base_url == channel.base_url,
+                Channel.key == channel.key,
+                Channel.auth_type == channel.auth_type,
+                Channel.extra == channel.extra,
+            ).values(enabled=False).execution_options(synchronize_session=False)
+        )
+        await db.commit()
+        if not result.rowcount:
+            usage_cache.invalidate(channel.id)
+            raise ZhipuQuotaError("Channel configuration changed; refresh usage again", 503)
+        await db.refresh(channel)
+        logger.info("channel %s (%s) disabled: no Coding Plan subscription", channel.id, channel.name)
+    usage.channel_enabled = channel.enabled
 
 
 class QuotaRefresher:
@@ -140,13 +165,14 @@ class QuotaRefresher:
     async def _refresh(self, channel_id: int) -> None:
         async with async_session_maker() as db:
             channel = await db.get(Channel, channel_id)
-        if channel is None or not channel.enabled:
-            self._backoff.pop(channel_id, None)
-            return
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            usage = await fetch_usage(channel, client)
-        if usage is None:
-            return
+            if channel is None or not channel.enabled:
+                self._backoff.pop(channel_id, None)
+                return
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                usage = await fetch_usage(channel, client)
+            if usage is None:
+                return
+            await apply_subscription_status(db, channel, usage)
         apply_usage(channel, usage)
         if not usage.limit_reached:
             self._backoff.pop(channel_id, None)

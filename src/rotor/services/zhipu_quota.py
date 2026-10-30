@@ -13,6 +13,7 @@ must be tried on both; ordering by reset time is wrong because near the end of
 a cycle the weekly window resets before the 5-hour one.
 """
 import time
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -45,6 +46,18 @@ def zhipu_quota_host(base_url: str | None) -> str | None:
 def is_zhipu_quota_channel(channel) -> bool:
     """True when the channel's base URL points at Zhipu's API hosts."""
     return channel.auth_type != "oauth" and zhipu_quota_host(getattr(channel, "base_url", None)) is not None
+
+
+def is_zhipu_coding_channel(channel) -> bool:
+    """Coding Plan endpoints, excluding the same hosts' pay-as-you-go APIs."""
+    if channel.auth_type == "oauth":
+        return False
+    url = urlsplit(channel.base_url or "")
+    return url.hostname in {"open.bigmodel.cn", "api.z.ai"} and (
+        url.path.startswith("/api/coding/")
+        or url.path.rstrip("/") == "/api/anthropic"
+        or url.path.startswith("/api/anthropic/")
+    )
 
 
 def _window(item: dict, now: float) -> ChannelUsageWindow:
@@ -114,6 +127,14 @@ async def fetch_zhipu_usage(client: httpx.AsyncClient, channel) -> ChannelUsageR
         payload = response.json()
     except (ValueError, UnicodeDecodeError):
         raise ZhipuQuotaError("Zhipu returned an invalid quota payload", 502) from None
+    if not isinstance(payload, dict):
+        raise ZhipuQuotaError("Zhipu returned an invalid quota payload", 502)
     if payload.get("success") is False:
+        if payload.get("code") == 500 and payload.get("msg") == "当前用户不存在coding plan":
+            return ChannelUsageResponse(
+                subscription_status="inactive",
+                allowed=False,
+                fetched_at=time.time(),
+            )
         raise ZhipuQuotaError(f"Zhipu quota error: {payload.get('msg') or 'unknown'}", 502)
     return parse_zhipu_usage(payload, fetched_at=time.time())
