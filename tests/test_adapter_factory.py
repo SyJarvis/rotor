@@ -4,6 +4,7 @@ import pytest
 
 from rotor.adapters.factory import AdapterFactory
 from rotor.adapters.protocol.anthropic import AnthropicAdapter
+from rotor.adapters.protocol.openai import OpenAIAdapter
 
 
 def test_bedrock_provider_is_not_registered_without_sigv4_support() -> None:
@@ -26,6 +27,17 @@ def test_explicit_anthropic_protocol_uses_anthropic_adapter() -> None:
     adapter = AdapterFactory.create_adapter(channel, http_client=None)
 
     assert isinstance(adapter, AnthropicAdapter)
+    assert adapter.build_request_headers() == {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer secret",
+    }
+
+
+def test_command_provider_reuses_openai_adapter_and_bearer_auth() -> None:
+    channel = SimpleNamespace(type="command", protocol="openai", key="secret", extra={})
+    adapter = AdapterFactory.create_adapter(channel, http_client=None)
+    assert type(adapter) is OpenAIAdapter
+    assert "command" in AdapterFactory.get_supported_providers()
     assert adapter.build_request_headers() == {
         "Content-Type": "application/json",
         "Authorization": "Bearer secret",

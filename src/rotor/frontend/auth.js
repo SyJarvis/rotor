@@ -176,7 +176,7 @@ async function startApp(actor) {
   if (!appLoaded) {
     try {
       if (clientAuthorizationPage) await import("./client-authorization.js?v=2");
-      else await import("./app.js?v=69");
+      else await import("./app.js?v=70");
       appLoaded = true;
       authScreen().classList.add("hidden");
       document.body.classList.remove("auth-pending");

@@ -682,9 +682,15 @@ const QUOTA_FRESH_MS = 90_000;
 
 function hasUsagePanel(c) {
   if (c.auth_type === "oauth") return true;
-  // Zhipu GLM Coding Plan channels are generic openai/anthropic types; their
-  // base URL is the discriminator the backend uses too.
-  return /bigmodel\.cn|z\.ai/.test(c.base_url || "");
+  if (c.type !== "zhipu" || c.auth_type !== "api_key") return false;
+  try {
+    const url = new URL(c.base_url);
+    return url.protocol === "https:" &&
+      ["open.bigmodel.cn", "api.z.ai"].includes(url.hostname) &&
+      (!url.port || url.port === "443") && !url.username && !url.password;
+  } catch {
+    return false;
+  }
 }
 
 async function loadQuota(forceId = null) {

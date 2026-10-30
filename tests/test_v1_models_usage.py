@@ -35,7 +35,7 @@ def _usage(limit_reached=False, plan="plus"):
 
 
 @asynccontextmanager
-async def discovery_client(*, allowed_channels=None, quota=None, used_quota=0):
+async def discovery_client(*, allowed_channels=None, quota=None, used_quota=0, zhipu_type="zhipu"):
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
@@ -48,7 +48,7 @@ async def discovery_client(*, allowed_channels=None, quota=None, used_quota=0):
                     extra={"model_info": {"gpt-6": {
                         "display_name": "GPT-6", "max_input_tokens": 272000, "max_tokens": 128000,
                     }}}),
-            Channel(id=2, name="zhipu", type="openai", protocol="openai",
+            Channel(id=2, name="zhipu", type=zhipu_type, protocol="openai",
                     key="provider-secret", base_url="https://open.bigmodel.cn/api/coding/paas/v4",
                     models=["glm-6"], model_mapping={"glm-alias": "glm-6"}, priority=1,
                     extra={}),
@@ -177,4 +177,15 @@ def test_usage_reports_missing_subscription_without_inventing_windows():
         assert entry["allowed"] is False
         assert entry["limit_reached"] is None
         assert entry["rate_limit"] == {"primary_window": None, "secondary_window": None}
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("provider_type", ["openai", "anthropic", "command"])
+def test_usage_omits_old_zhipu_snapshot_for_wrong_selected_provider(provider_type):
+    async def exercise():
+        async with discovery_client(zhipu_type=provider_type) as client:
+            usage_cache.store(2, _usage(plan="pro"))
+            result = await client.get("/v1/usage", headers=AUTH)
+            assert result.status_code == 200
+            assert result.json()["channels"] == []
     asyncio.run(exercise())

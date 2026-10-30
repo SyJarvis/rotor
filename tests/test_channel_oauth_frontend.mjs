@@ -217,7 +217,7 @@ for (const language of ['zh-CN', 'en']) {
   test(`missing subscription is a normal status and refresh can restore plan windows (${language})`, async () => {
     const env = await environment({
       language,
-      listed: [savedChannel({ enabled: true, auth_type: 'api_key', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
+      listed: [savedChannel({ enabled: true, auth_type: 'api_key', type: 'zhipu', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
       usages: [
         { subscription_status: 'inactive', channel_enabled: false, plan: null, allowed: false, limit_reached: null, primary: null, secondary: null },
         { channel_enabled: false, plan: 'pro', primary: { used_percent: 12 }, secondary: { used_percent: 34 } },
@@ -246,7 +246,7 @@ for (const language of ['zh-CN', 'en']) {
   test(`quota fetch errors still offer retry (${language})`, async () => {
     const env = await environment({
       language,
-      listed: [savedChannel({ auth_type: 'api_key', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
+      listed: [savedChannel({ auth_type: 'api_key', type: 'zhipu', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
       usages: [new Error('authentication failed')],
     });
     await env.page.load();
@@ -259,9 +259,44 @@ for (const language of ['zh-CN', 'en']) {
   });
 }
 
+for (const [type, base_url, shouldQuery] of [
+  ['zhipu', 'https://open.bigmodel.cn/api/coding/paas/v4', true],
+  ['zhipu', 'https://api.z.ai:443/api/anthropic', true],
+  ['openai', 'https://open.bigmodel.cn/api/coding/paas/v4', false],
+  ['anthropic', 'https://api.z.ai/api/anthropic', false],
+  ['command', 'https://open.bigmodel.cn/api/coding/paas/v4', false],
+  ['unknown', 'https://open.bigmodel.cn/api/coding/paas/v4', false],
+  ['zhipu', 'https://open.bigmodel.cn.evil.test/api/coding/paas/v4', false],
+  ['zhipu', 'http://open.bigmodel.cn/api/coding/paas/v4', false],
+  ['zhipu', 'https://api.z.ai:8443/api/anthropic', false],
+  ['zhipu', 'https://secret@api.z.ai/api/anthropic', false],
+  ['zhipu', 'https://elsewhere.test/?host=open.bigmodel.cn', false],
+  ['zhipu', 'not a URL', false],
+]) {
+  test(`quota panel requires selected zhipu provider and official HTTPS origin: ${type} ${base_url}`, async () => {
+    const env = await environment({
+      listed: [savedChannel({ type, auth_type: 'api_key', base_url })],
+      usages: [{ plan: 'pro', primary: { used_percent: 12 } }],
+    });
+    await env.page.load();
+    await new Promise(setImmediate);
+    assert.equal(env.calls.filter(({ url }) => url.includes('/oauth/usage')).length, shouldQuery ? 1 : 0);
+    if (!shouldQuery) assert.doesNotMatch(env.getNode('channels').innerHTML, /quota-bar|data-channel-quota-refresh/);
+    env.page.unload();
+  });
+}
+
+test('OAuth usage remains available independently of API-key provider matching', async () => {
+  const env = await environment({ listed: [savedChannel()] });
+  await env.page.load();
+  await new Promise(setImmediate);
+  assert.equal(env.calls.filter(({ url }) => url.includes('/oauth/usage')).length, 1);
+  env.page.unload();
+});
+
 test('reloading channels discards a cached missing subscription after configuration changes', async () => {
   const env = await environment({
-    listed: [savedChannel({ enabled: false, auth_type: 'api_key', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
+    listed: [savedChannel({ enabled: false, auth_type: 'api_key', type: 'zhipu', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
     usages: [
       { subscription_status: 'inactive', channel_enabled: false },
       { channel_enabled: false, plan: 'pro', primary: { used_percent: 12 } },
@@ -283,7 +318,7 @@ test('an old missing-subscription response cannot overwrite usage from a newer p
   let finishOld;
   const pending = new Promise((resolve) => { finishOld = resolve; });
   const env = await environment({
-    listed: [savedChannel({ enabled: true, auth_type: 'api_key', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
+    listed: [savedChannel({ enabled: true, auth_type: 'api_key', type: 'zhipu', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
     usages: [pending, { channel_enabled: true, plan: 'pro', primary: { used_percent: 12 } }],
   });
   await env.page.load();

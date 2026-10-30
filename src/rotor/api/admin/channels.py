@@ -25,7 +25,8 @@ from rotor.services.chatgpt_oauth import (
     resolve_oauth_credentials,
     validate_configuration,
 )
-from rotor.services.zhipu_quota import ZhipuQuotaError, is_zhipu_coding_channel
+from rotor.services.zhipu_quota import ZhipuQuotaError, is_zhipu_coding_channel, is_zhipu_quota_channel
+from rotor.services.command_goat_quota import CommandGoatQuotaError, is_command_goat_quota_channel
 from rotor.schemas.channel import (
     ChannelCooldownResetRequest,
     ChannelCooldownResetResponse,
@@ -408,11 +409,10 @@ async def get_channel_oauth_usage(
 ):
     """Current subscription usage for a channel with a quota provider.
 
-    Covers ChatGPT OAuth channels (Codex plan windows) and API-key Zhipu
-    channels (GLM Coding Plan rolling windows, matched by base-URL host).
-    The snapshot reconciles channel-wide cooldowns: an exhausted window cools
-    every model until it resets, and a healthy one immediately lifts the
-    channel's plan-limit cooldowns (rolling windows can recover early).
+    Covers ChatGPT OAuth, Zhipu Coding Plan, and Command Goat API-key channels.
+    ChatGPT and Zhipu snapshots reconcile channel-wide plan cooldowns.
+    Command Goat snapshots only report usage: paid credits and free models
+    can remain available when a subscription window is exhausted.
     """
     now = time.time()
     result = await db.execute(select(Channel).where(Channel.id == channel_id))
@@ -421,6 +421,14 @@ async def get_channel_oauth_usage(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Channel {channel_id} not found",
+        )
+    if channel.auth_type != "oauth" and not (
+        is_zhipu_quota_channel(channel) or is_command_goat_quota_channel(channel)
+    ):
+        usage_cache.invalidate(channel_id)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Channel has no quota provider (OAuth, Zhipu or Command Goat required)",
         )
     cached = usage_cache.fresh(channel_id, now=now)
     if cached and not refresh:
@@ -435,7 +443,7 @@ async def get_channel_oauth_usage(
         if usage is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Channel has no quota provider (OAuth or Zhipu required)",
+                detail="Channel has no quota provider (OAuth, Zhipu or Command Goat required)",
             )
         await quota_refresher.apply_subscription_status(db, channel, usage)
     except OAuthError as exc:
@@ -443,7 +451,7 @@ async def get_channel_oauth_usage(
             status_code=exc.status_code if exc.status_code >= 500 else status.HTTP_502_BAD_REQUEST,
             detail=str(exc),
         ) from exc
-    except ZhipuQuotaError as exc:
+    except (ZhipuQuotaError, CommandGoatQuotaError) as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     quota_refresher.apply_usage(channel, usage, now=now)
@@ -700,7 +708,7 @@ async def update_channel(
         update_data["extra"] = migrated_extra
     if update_data.get("enabled") is True:
         await _validate_coding_subscription(SimpleNamespace(
-            auth_type=auth_type, base_url=base_url, key=key,
+            type=provider_type, auth_type=auth_type, base_url=base_url, key=key,
             extra=update_data.get("extra", channel.extra) or {},
         ))
     # Explicit values also clear a refresh lease claimed after the ORM read.

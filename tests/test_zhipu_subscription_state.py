@@ -29,7 +29,7 @@ CODING_URL = "https://open.bigmodel.cn/api/coding/paas/v4"
 
 
 @asynccontextmanager
-async def environment(tmp_path, monkeypatch, *, base_url=CODING_URL, enabled=True):
+async def environment(tmp_path, monkeypatch, *, base_url=CODING_URL, enabled=True, provider_type="zhipu"):
     db_url = f"sqlite+aiosqlite:///{tmp_path / 'subscription.db'}"
     engine = create_async_engine(db_url)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -37,7 +37,7 @@ async def environment(tmp_path, monkeypatch, *, base_url=CODING_URL, enabled=Tru
         await connection.run_sync(Base.metadata.create_all)
     async with sessions() as db:
         db.add_all([
-            Channel(id=1, name="coding", type="openai", auth_type="api_key", key="old-key",
+            Channel(id=1, name="coding", type=provider_type, auth_type="api_key", key="old-key",
                     base_url=base_url, enabled=enabled, models=["glm"], model_mapping={}, extra={}),
             Channel(id=2, name="fallback", type="openai", key="fallback-key", base_url="https://example.com/v1",
                     enabled=True, models=["glm"], model_mapping={}, extra={}),
@@ -185,13 +185,14 @@ def test_edit_cannot_enable_missing_subscription_or_save_unverified_new_credenti
     asyncio.run(exercise())
 
 
-def test_inflight_old_credentials_cannot_disable_updated_channel(tmp_path, monkeypatch):
+@pytest.mark.parametrize("field,value", [("key", "new-key"), ("type", "openai")])
+def test_inflight_old_configuration_cannot_disable_updated_channel(tmp_path, monkeypatch, field, value):
     async def exercise():
         async with environment(tmp_path, monkeypatch) as env:
             async def replace_credentials():
                 async with env.sessions() as db:
                     channel = await db.get(Channel, 1)
-                    channel.key = "new-key"
+                    setattr(channel, field, value)
                     await db.commit()
             env.state["before_reply"] = replace_credentials
             response = await env.client.get("/api/admin/channels/1/oauth/usage")
@@ -199,7 +200,29 @@ def test_inflight_old_credentials_cannot_disable_updated_channel(tmp_path, monke
             assert usage_cache.fresh(1) is None
             async with env.sessions() as db:
                 channel = await db.get(Channel, 1)
-                assert channel.enabled is True and channel.key == "new-key"
+                assert channel.enabled is True and getattr(channel, field) == value
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("provider_type", ["openai", "anthropic", "command"])
+@pytest.mark.parametrize("path", ["admin", "background", "apply"])
+def test_wrong_provider_never_queries_or_disables_even_with_old_cache(tmp_path, monkeypatch, provider_type, path):
+    async def exercise():
+        async with environment(tmp_path, monkeypatch, provider_type=provider_type) as env:
+            missing = ChannelUsageResponse(subscription_status="inactive", fetched_at=1)
+            usage_cache.store(1, missing)
+            if path == "admin":
+                response = await env.client.get("/api/admin/channels/1/oauth/usage")
+                assert response.status_code == 400
+                assert usage_cache.fresh(1) is None
+            elif path == "background":
+                await quota_refresher.QuotaRefresher()._refresh(1)
+            else:
+                async with env.sessions() as db:
+                    await quota_refresher.apply_subscription_status(db, await db.get(Channel, 1), missing)
+            assert env.state["requests"] == []
+            async with env.sessions() as db:
+                assert (await db.get(Channel, 1)).enabled is True
     asyncio.run(exercise())
 
 
@@ -210,7 +233,7 @@ def test_inflight_old_credentials_cannot_disable_updated_channel(tmp_path, monke
     ("https://open.bigmodel.cn.example.com/api/coding/paas/v4", False),
 ])
 def test_only_official_coding_endpoints_can_be_auto_disabled(url, expected):
-    assert is_zhipu_coding_channel(SimpleNamespace(auth_type="api_key", base_url=url)) is expected
+    assert is_zhipu_coding_channel(SimpleNamespace(type="zhipu", auth_type="api_key", base_url=url)) is expected
 
 
 def test_frontend_entry_html_requires_cache_revalidation():

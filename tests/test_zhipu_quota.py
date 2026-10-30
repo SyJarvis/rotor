@@ -10,6 +10,7 @@ from rotor.services.zhipu_quota import (
     ZhipuQuotaError,
     fetch_zhipu_usage,
     is_zhipu_quota_channel,
+    is_zhipu_coding_channel,
     parse_zhipu_usage,
     zhipu_quota_host,
 )
@@ -26,12 +27,66 @@ def test_quota_host_matches_data_plane_domains():
 
 
 def test_is_zhipu_quota_channel_ignores_oauth():
-    zhipu = SimpleNamespace(auth_type="api_key", base_url="https://open.bigmodel.cn/api/coding/paas/v4")
-    other = SimpleNamespace(auth_type="api_key", base_url="https://api.openai.com/v1")
-    oauth_zhipu = SimpleNamespace(auth_type="oauth", base_url="https://open.bigmodel.cn")
+    zhipu = SimpleNamespace(type="zhipu", auth_type="api_key", base_url="https://open.bigmodel.cn/api/coding/paas/v4")
+    other = SimpleNamespace(type="zhipu", auth_type="api_key", base_url="https://api.openai.com/v1")
+    oauth_zhipu = SimpleNamespace(type="zhipu", auth_type="oauth", base_url="https://open.bigmodel.cn")
     assert is_zhipu_quota_channel(zhipu) is True
     assert is_zhipu_quota_channel(other) is False
     assert is_zhipu_quota_channel(oauth_zhipu) is False
+
+
+@pytest.mark.parametrize("url", [
+    "http://open.bigmodel.cn/api/coding/paas/v4",
+    "https://open.bigmodel.cn:8443/api/coding/paas/v4",
+    "https://open.bigmodel.cn.evil.test/api/coding/paas/v4",
+    "https://api.z.ai.evil.test/api/anthropic",
+    "https://evil.test/open.bigmodel.cn/api/coding/paas/v4",
+    "https://open.bigmodel.cn@evil.test/api/coding/paas/v4",
+    "https://secret@open.bigmodel.cn/api/coding/paas/v4",
+    "https://api.z.ai:invalid/api/anthropic",
+    "https://[invalid", None,
+])
+def test_nonofficial_zhipu_origins_are_rejected_without_request(url):
+    channel = SimpleNamespace(type="zhipu", auth_type="api_key", base_url=url, key="secret", extra={})
+    assert zhipu_quota_host(url) is None
+    assert not is_zhipu_quota_channel(channel)
+    assert not is_zhipu_coding_channel(channel)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: pytest.fail("untrusted origin must not be queried"),
+        )) as client:
+            with pytest.raises(ZhipuQuotaError):
+                await fetch_zhipu_usage(client, channel)
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("provider_type", ["openai", "anthropic", "command", "unknown", None])
+@pytest.mark.parametrize("url", ["https://open.bigmodel.cn/api/coding/paas/v4", "https://api.z.ai/api/anthropic"])
+def test_zhipu_queries_require_explicit_provider_selection(provider_type, url):
+    from rotor.services import quota_refresher
+
+    channel = SimpleNamespace(type=provider_type, auth_type="api_key", base_url=url, key="secret", extra={})
+    assert not is_zhipu_quota_channel(channel)
+    assert not is_zhipu_coding_channel(channel)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: pytest.fail("wrong provider must not query upstream"),
+        )) as client:
+            assert await quota_refresher.fetch_usage(channel, client) is None
+            with pytest.raises(ZhipuQuotaError):
+                await fetch_zhipu_usage(client, channel)
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("url,host", [
+    ("https://OPEN.BIGMODEL.CN:443/api/coding/paas/v4", "https://open.bigmodel.cn"),
+    ("https://api.z.ai:443/api/anthropic", "https://api.z.ai"),
+])
+def test_official_zhipu_default_https_port_is_supported(url, host):
+    assert zhipu_quota_host(url) == host
+    assert is_zhipu_coding_channel(SimpleNamespace(type="zhipu", auth_type="api_key", base_url=url))
 
 
 def test_parse_classifies_windows_by_unit_not_order():
@@ -82,7 +137,7 @@ def test_fetch_uses_bare_key_and_reports_business_errors():
         , success=False))
 
     channel = SimpleNamespace(
-        auth_type="api_key",
+        type="zhipu", auth_type="api_key",
         base_url="https://open.bigmodel.cn/api/coding/paas/v4",
         key="test-key",
         extra={},
@@ -101,7 +156,7 @@ _NO_SUBSCRIPTION = {"code": 500, "success": False, "msg": "当前用户不存在
 
 def test_fetch_reports_confirmed_missing_subscription():
     async def exercise():
-        channel = SimpleNamespace(base_url="https://open.bigmodel.cn", key="test-key", extra={})
+        channel = SimpleNamespace(type="zhipu", auth_type="api_key", base_url="https://open.bigmodel.cn", key="test-key", extra={})
         async with httpx.AsyncClient(transport=httpx.MockTransport(
             lambda request: httpx.Response(200, json=_NO_SUBSCRIPTION),
         )) as client:
@@ -136,7 +191,7 @@ def test_other_failures_are_not_missing_subscriptions(response):
         return response
 
     async def exercise():
-        channel = SimpleNamespace(base_url="https://open.bigmodel.cn", key="test-key", extra={})
+        channel = SimpleNamespace(type="zhipu", auth_type="api_key", base_url="https://open.bigmodel.cn", key="test-key", extra={})
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             with pytest.raises(ZhipuQuotaError):
                 await fetch_zhipu_usage(client, channel)
@@ -149,7 +204,7 @@ def test_admin_usage_caches_missing_subscription_and_refreshes_after_renewal(mon
     from rotor.database import get_db
     from rotor.services import usage_cache
 
-    channel = SimpleNamespace(id=901, name="zhipu", auth_type="api_key", models=[], enabled=True,
+    channel = SimpleNamespace(id=901, name="zhipu", type="zhipu", auth_type="api_key", models=[], enabled=True,
                               base_url="https://open.bigmodel.cn", key="private-key", extra={})
 
     class DB:

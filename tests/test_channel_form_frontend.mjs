@@ -118,6 +118,22 @@ test('frontend defaults match backend provider and protocol combinations', async
   }
 });
 
+test('Command Code can be selected from backend presets with API-key defaults', async () => {
+  const env = await environment();
+  const fields = env.form.elements;
+  assert.match(fields.type.innerHTML, /<option value="command">Command Code<\/option>/);
+  fields.type.value = 'command';
+  fields.type.listeners.change({ target: fields.type });
+  assert.equal(fields.protocol.value, 'openai');
+  assert.equal(fields.base_url.value, 'https://api.commandcode.ai/provider/v1');
+  assert.equal(fields.models_path.value, '/models');
+  assert.equal(fields.request_path.value, '/chat/completions');
+  assert.equal(fields.auth_type.value, 'bearer');
+  const draft = env.helper.channelConnection(env.form);
+  assert.equal(draft.type, 'command');
+  assert.equal(draft.auth_type, 'api_key');
+});
+
 test('editing legacy native/Responses channels fills protocol paths and provider auth', async () => {
   const env = await environment();
   for (const [provider, protocol, path, auth] of [['anthropic', 'anthropic', '/messages', 'x-api-key'], ['zhipu', 'anthropic', '/messages', 'bearer'], ['openai', 'openai_responses', '/responses', 'bearer']]) {

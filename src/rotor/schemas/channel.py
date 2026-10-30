@@ -158,7 +158,7 @@ class ChannelListItem(BaseModel):
 
 
 class ChannelUsageWindow(BaseModel):
-    """One ChatGPT plan usage window (5-hour primary or weekly secondary)."""
+    """One plan usage window (5-hour primary or weekly secondary)."""
 
     used_percent: Optional[float] = None
     window_seconds: Optional[int] = None
@@ -166,16 +166,59 @@ class ChannelUsageWindow(BaseModel):
     reset_at: Optional[float] = None
 
 
+class CommandGoatSubscription(BaseModel):
+    plan_id: str
+    status: str
+    current_period_start: Optional[str] = None
+    current_period_end: Optional[str] = None
+    cancel_at_period_end: Optional[bool] = None
+    canceled_at: Optional[str] = None
+    ended_at: Optional[str] = None
+
+
+class CommandGoatCredits(BaseModel):
+    monthly_remaining: float
+    purchased_remaining: float
+    free_remaining: float
+
+
+class CommandGoatWindow(BaseModel):
+    used: float
+    cap: float
+    exceeded: bool
+    reset_at: Optional[float] = None
+
+
+class CommandGoatSummary(BaseModel):
+    total_cost: float
+    total_monthly_credits: float
+    total_purchased_credits: float
+    total_free_credits: float
+    total_count: int
+    period_start: Optional[str] = None
+    period_basis: Optional[str] = None
+
+
+class CommandGoatUsage(BaseModel):
+    subscription: Optional[CommandGoatSubscription] = None
+    credits: CommandGoatCredits
+    window_limited: Optional[bool] = None
+    five_hour: Optional[CommandGoatWindow] = None
+    weekly: Optional[CommandGoatWindow] = None
+    summary: CommandGoatSummary
+
+
 class ChannelUsageResponse(BaseModel):
     """Subscription usage snapshot for a channel with a quota provider."""
 
     plan: Optional[str] = None
-    subscription_status: Literal["inactive"] | None = None
+    subscription_status: Optional[str] = None
     channel_enabled: Optional[bool] = None
     allowed: Optional[bool] = None
     limit_reached: Optional[bool] = None
     primary: Optional[ChannelUsageWindow] = None
     secondary: Optional[ChannelUsageWindow] = None
+    command_goat: Optional[CommandGoatUsage] = None
     fetched_at: float
 
 

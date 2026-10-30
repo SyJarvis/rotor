@@ -18,6 +18,7 @@ from rotor.database import async_session_maker
 from rotor.models.channel import Channel
 from rotor.services import usage_cache
 from rotor.services.chatgpt_oauth import codex_usage_snapshot, fetch_codex_usage, resolve_oauth_credentials
+from rotor.services.command_goat_quota import fetch_command_goat_usage, is_command_goat_quota_channel
 from rotor.services.zhipu_quota import ZhipuQuotaError, fetch_zhipu_usage, is_zhipu_coding_channel, is_zhipu_quota_channel
 
 logger = logging.getLogger("rotor.quota_refresher")
@@ -53,6 +54,9 @@ def apply_usage(channel, usage, *, now: float | None = None) -> None:
 
     moment = time.time() if now is None else now
     usage_cache.store(channel.id, usage, now=moment)
+    if usage.command_goat is not None:
+        # Paid credits and free models can remain usable beyond plan windows.
+        return
     if usage.subscription_status == "inactive":
         # Missing a subscription proves neither quota exhaustion nor recovery.
         return
@@ -79,6 +83,8 @@ async def fetch_usage(channel, client: httpx.AsyncClient):
         credential = await resolve_oauth_credentials(channel, client)
         payload = await fetch_codex_usage(client, credential)
         return codex_usage_snapshot(payload, fetched_at=time.time())
+    if is_command_goat_quota_channel(channel):
+        return await fetch_command_goat_usage(client, channel)
     if is_zhipu_quota_channel(channel):
         return await fetch_zhipu_usage(client, channel)
     return None
@@ -90,6 +96,7 @@ async def apply_subscription_status(db, channel, usage) -> None:
         result = await db.execute(
             update(Channel).where(
                 Channel.id == channel.id,
+                Channel.type == channel.type,
                 Channel.base_url == channel.base_url,
                 Channel.key == channel.key,
                 Channel.auth_type == channel.auth_type,
