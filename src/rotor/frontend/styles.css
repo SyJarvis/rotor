@@ -881,6 +881,12 @@ code, pre { font-family: var(--font-mono); }
   width: 14px;
   height: 14px;
 }
+.opencode-meta, .command-goat-meta {
+  overflow-wrap: anywhere;
+}
+.opencode-block .quota-foot, .command-goat-block .quota-foot {
+  flex-wrap: wrap;
+}
 
 .channel-card .ch-actions {
   display: flex;
