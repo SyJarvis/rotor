@@ -273,7 +273,7 @@ def test_converted_nonstream_failure_keeps_actual_upstream_status(api, invalid):
     assert records(api, False).upstream_status == 200
 
 
-def test_partial_failure_never_switches_channel_or_recovers_probe(api):
+def test_partial_failure_never_switches_channel_or_rearms_expired_cooldown(api):
     api.engine._clock = api.clock.monotonic
     api.engine.mark_unavailable("model", api.channels[0], 0)
     alternate = deepcopy(api.channels[0])
@@ -290,8 +290,9 @@ def test_partial_failure_never_switches_channel_or_recovers_probe(api):
     assert "partial" in result.text and "event: error\n" in result.text
     records(api, False)
     assert len(api.sent) == 1
-    assert api.engine._cooldowns[("model", 1)].probe is None
-    assert api.engine._is_cooling_down("model", 1)
+    assert "event: message_stop\n" not in result.text
+    assert api.engine.routing_state() == []
+    assert api.engine._in_flight == {}
 
 
 @pytest.mark.parametrize("kind,status,expected_type", [
@@ -315,7 +316,7 @@ def test_actual_asgi_error_handlers_use_safe_anthropic_envelopes(api, kind, stat
             raise RuntimeError("provider-key and confidential input")
         api.app.dependency_overrides[get_current_token] = denied
     elif kind == "upstream":
-        api.reply.update(status=429, body={"error": {"message": "provider-key", "x-api-key": "provider-key"}}, headers={"Retry-After": "7"})
+        api.reply.update(status=429, body={"error": {"message": "upstream rate limited for test", "x-api-key": "provider-key"}}, headers={"Retry-After": "7"})
     payload = {"model": "model", "secret": "confidential input"} if kind == "validation" else None
     result = asyncio.run(api.call(payload=payload, path="/anthropic/v1/messages"))
     assert result.status_code == status
@@ -323,6 +324,8 @@ def test_actual_asgi_error_handlers_use_safe_anthropic_envelopes(api, kind, stat
     assert result.json()["error"]["type"] == expected_type
     assert result.json()["request_id"]
     assert "provider-key" not in result.text and "confidential input" not in result.text
+    if kind == "upstream":
+        assert "upstream rate limited for test" in result.text
     if kind in {"http", "temporary", "upstream"}:
         assert result.headers["retry-after"] == "7"
 

@@ -8,8 +8,13 @@ from threading import RLock
 from typing import Callable, Iterable, Optional
 
 from rotor.application_settings import application_settings
+from rotor.config import settings
 from rotor.core.exceptions import normalize_upstream_error
-from rotor.gateway.fallback import CONNECT_COOLDOWN_SECONDS, is_connect_failure
+from rotor.gateway.fallback import (
+    CONNECT_COOLDOWN_SECONDS,
+    connect_cooldown_for_streak,
+    is_connect_failure,
+)
 from rotor.models.channel import Channel
 from rotor.models.token import Token
 from rotor.services import quota_refresher
@@ -47,8 +52,6 @@ class AttemptAdmission:
 @dataclass(slots=True)
 class _Cooldown:
     deadline: float
-    generation: int = 0
-    probe: AttemptAdmission | None = None
     cooldown_seconds: float = 30.0
     # "plan_limit" cooldowns are quota-driven and lifted by a healthy usage
     # snapshot; everything else is a transient provider failure.
@@ -78,8 +81,12 @@ class RoutingEngine:
         self.strategy = strategy
         self.protocol_affinity_enabled = True
         self._cooldowns: dict[tuple[str, int], _Cooldown] = {}
+        # Consecutive connect-failure count per (model, channel); drives the
+        # exponential backoff in mark_failure, reset by any success.
+        self._connect_streaks: dict[tuple[str, int], int] = {}
         self._clock = clock
         self._lock = RLock()
+        self._in_flight: dict[int, int] = {}
         self.adaptive = AdaptiveScorer()
 
     def route(
@@ -209,6 +216,27 @@ class RoutingEngine:
         if protocol_affinity is not None:
             self.protocol_affinity_enabled = bool(protocol_affinity)
 
+    def max_in_flight_for(self, channel: Channel) -> int:
+        """Max concurrent upstream requests for a channel.
+
+        ChatGPT Codex OAuth accounts serve one /codex/responses stream at a
+        time; a second concurrent request is dropped by the provider (seen as
+        ``RemoteProtocolError``). Aggregators tolerate a few parallel streams.
+        Override per channel with ``extra.max_in_flight``.
+        """
+        configured = (channel.extra or {}).get("max_in_flight")
+        if configured is not None:
+            try:
+                limit = int(configured)
+            except (TypeError, ValueError):
+                limit = 0
+            if limit >= 1:
+                return limit
+        base_url = str(getattr(channel, "base_url", "") or "")
+        if "chatgpt.com" in base_url or "codex" in base_url:
+            return max(1, int(settings.CODEX_MAX_IN_FLIGHT))
+        return max(1, int(settings.CHANNEL_MAX_IN_FLIGHT))
+
     def begin_attempt(self, model: str, channel: Channel) -> None:
         self.adaptive.begin(model, channel.id)
 
@@ -216,22 +244,27 @@ class RoutingEngine:
         return self._clock() if self._clock is not None else time.monotonic()
 
     def admit_attempt(self, model: str, channel: Channel) -> AttemptAdmission | None:
-        """Atomically admit normal traffic or one process-local recovery probe."""
+        """Admit traffic under a channel-wide cap once its cooldown expires."""
         with self._lock:
             if not channel.enabled:
                 return None
-            state = self._cooldowns.get((model, channel.id))
-            if state is not None and (state.probe is not None or state.deadline > self._now()):
+            cooldown_key = (model, channel.id)
+            state = self._cooldowns.get(cooldown_key)
+            if state is not None and state.deadline > self._now():
                 return None
+            key = channel.id
+            if self._in_flight.get(key, 0) >= self.max_in_flight_for(channel):
+                return None
+            if state is not None:
+                self._cooldowns.pop(cooldown_key)
             admission = AttemptAdmission(
                 engine=self,
                 model=model,
                 channel=channel,
-                generation=state.generation if state is not None else None,
-                is_probe=state is not None,
+                generation=None,
+                is_probe=False,
             )
-            if state is not None:
-                state.probe = admission
+            self._in_flight[key] = self._in_flight.get(key, 0) + 1
             self.adaptive.begin(model, channel.id)
             return admission
 
@@ -241,20 +274,14 @@ class RoutingEngine:
             if admission.released:
                 return
             admission.released = True
+            release_key = admission.channel.id
+            current = self._in_flight.get(release_key, 0)
+            if current <= 1:
+                self._in_flight.pop(release_key, None)
+            else:
+                self._in_flight[release_key] = current - 1
             if not admission.observed:
                 self.adaptive.end(admission.model, admission.channel.id)
-            key = (admission.model, admission.channel.id)
-            state = self._cooldowns.get(key)
-            if state is None or state.probe is not admission:
-                return
-            state.probe = None
-            if state.generation != admission.generation:
-                return
-            if admission.provider_succeeded:
-                self._cooldowns.pop(key)
-            else:
-                # A cancelled or locally aborted probe has not proved recovery.
-                self.mark_unavailable(admission.model, admission.channel)
 
     def routing_state(self) -> list[tuple[str, int, dict]]:
         """Snapshot process-local cooldown entries that still restrict routing."""
@@ -265,24 +292,24 @@ class RoutingEngine:
                     model,
                     channel_id,
                     {
-                        "phase": "probe" if state.probe is not None else "cooldown",
+                        "phase": "cooldown",
                         "remaining_seconds": max(0, math.ceil(state.deadline - now)),
                         "cooldown_seconds": round(state.cooldown_seconds, 3),
                     },
                 )
                 for (model, channel_id), state in self._cooldowns.items()
-                if state.probe is not None or state.deadline > now
+                if state.deadline > now
             ]
 
     def retry_after_seconds(self, model: str, channels: Iterable[Channel]) -> int:
-        """Return an advisory delay; a running probe has no expiry or timeout lease."""
+        """Return an advisory delay for active cooldowns."""
         with self._lock:
             now = self._now()
             delays = []
             for channel in channels:
                 state = self._cooldowns.get((model, channel.id))
                 if state is not None:
-                    delays.append(max(1.0 if state.probe is not None else 0.0, state.deadline - now))
+                    delays.append(max(0.0, state.deadline - now))
             return max(1, math.ceil(min(delays))) if delays else 1
 
     def cooldown_outlook(self, model: str, channels: Iterable[Channel]) -> tuple[int, bool]:
@@ -295,8 +322,8 @@ class RoutingEngine:
                 state = self._cooldowns.get((model, channel.id))
                 if state is None:
                     continue
-                delays.append(max(1.0 if state.probe is not None else 0.0, state.deadline - now))
-                if state.reason == "plan_limit":
+                delays.append(max(0.0, state.deadline - now))
+                if state.reason == "plan_limit" and state.deadline > now:
                     plan_limited = True
             wait = max(1, math.ceil(min(delays))) if delays else 1
             return wait, plan_limited
@@ -331,6 +358,8 @@ class RoutingEngine:
                 if admission.observed or admission.released:
                     return
                 admission.observed = True
+            if success:
+                self._connect_streaks.pop((model, channel.id), None)
             self.adaptive.observe(
                 model,
                 channel.id,
@@ -378,7 +407,6 @@ class RoutingEngine:
                     if deadline > state.deadline:
                         state.cooldown_seconds = cooldown_seconds
                     state.deadline = max(state.deadline, deadline)
-                    state.generation += 1
                     if reason == "plan_limit":
                         # A quota-driven mark upgrades a transient entry so a
                         # healthy snapshot can later lift the whole plan cooldown.
@@ -389,9 +417,13 @@ class RoutingEngine:
         fact = normalize_upstream_error(exc)
         cooldown = fact.retry_after_seconds
         if cooldown is None and is_connect_failure(exc):
-            # Connect blips are short-lived; a long exile would scatter the
-            # session's cache across accounts while the channel recovers.
-            cooldown = CONNECT_COOLDOWN_SECONDS
+            # A single connect blip cools briefly to preserve the session
+            # cache affinity; sustained failures back off exponentially so a
+            # dead upstream is not re-admitted every few seconds.
+            with self._lock:
+                streak = self._connect_streaks.get((model, channel.id), 0)
+                cooldown = connect_cooldown_for_streak(streak)
+                self._connect_streaks[(model, channel.id)] = streak + 1
         self.mark_unavailable(
             model,
             channel,
@@ -422,6 +454,7 @@ class RoutingEngine:
             ]
             for key in keys:
                 self._cooldowns.pop(key)
+                self._connect_streaks.pop(key, None)
             return sorted(key[0] for key in keys)
 
     def diagnose(
@@ -438,7 +471,9 @@ class RoutingEngine:
             with self._lock:
                 state = self._cooldowns.get((model, channel.id))
                 cooldown_seconds = max(0.0, state.deadline - now) if state else 0.0
-                probe_busy = state is not None and state.probe is not None
+                in_flight = self._in_flight.get(channel.id, 0)
+            in_flight_limit = self.max_in_flight_for(channel)
+            at_capacity = in_flight_limit > 0 and in_flight >= in_flight_limit
             capabilities_match = self._supports_capabilities(channel, required)
             reasons: list[str] = []
             if not channel.enabled:
@@ -447,8 +482,8 @@ class RoutingEngine:
                 reasons.append("capability_mismatch")
             if cooldown_seconds > 0:
                 reasons.append("cooldown")
-            if probe_busy:
-                reasons.append("recovery_probe_inflight")
+            if at_capacity:
+                reasons.append("concurrency_limit")
             adaptive_score = self.adaptive.score(model, channel)
             diagnostics.append({
                 "id": channel.id,
@@ -457,8 +492,10 @@ class RoutingEngine:
                 "configured_capabilities": (channel.extra or {}).get("capabilities"),
                 "capabilities_match": capabilities_match,
                 "cooldown_seconds": round(cooldown_seconds, 3),
-                "routable": channel.enabled and capabilities_match and cooldown_seconds == 0 and not probe_busy,
-                "recovery_probe_eligible": channel.enabled and capabilities_match and state is not None and cooldown_seconds == 0 and not probe_busy,
+                "routable": channel.enabled and capabilities_match and cooldown_seconds == 0 and not at_capacity,
+                "recovery_probe_eligible": False,
+                "in_flight": in_flight,
+                "in_flight_limit": in_flight_limit,
                 "reasons": reasons,
                 "adaptive": {
                     "score": round(adaptive_score.score, 6),
@@ -478,7 +515,7 @@ class RoutingEngine:
     def _is_cooling_down(self, model: str, channel_id: int) -> bool:
         with self._lock:
             state = self._cooldowns.get((model, channel_id))
-            return state is not None and (state.probe is not None or state.deadline > self._now())
+            return state is not None and state.deadline > self._now()
 
     def _affinity_order(
         self,

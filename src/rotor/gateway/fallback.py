@@ -3,16 +3,33 @@ import httpx
 
 from rotor.core.exceptions import normalize_upstream_error
 
-# A connect failure never left the machine, so retrying the same channel is
-# free of duplicate-billing risk and preserves the session's cache affinity.
+# TCP/TLS connection failures occur before the application request is sent;
+# bounded same-channel retries preserve the session's cache affinity.
 CONNECT_RETRY_DELAYS = (0.5, 2.0)
 # Once a channel is declared dead, let it back in quickly: plan-level cache
 # entries expire within minutes, so the exile must stay shorter than that.
 CONNECT_COOLDOWN_SECONDS = 10.0
+# Sustained connect failures back off exponentially: a single blip cools for
+# 10s, but a persistently dead upstream is kept out up to 5 minutes so
+# requests are not released every 10s just to crash into the same TLS error.
+CONNECT_COOLDOWN_BACKOFF = (10.0, 30.0, 60.0, 120.0, 300.0)
+
+
+def connect_cooldown_for_streak(streak: int) -> float:
+    """Cooldown for the Nth consecutive connect failure (0-based)."""
+    if streak < 0:
+        streak = 0
+    if streak >= len(CONNECT_COOLDOWN_BACKOFF):
+        streak = len(CONNECT_COOLDOWN_BACKOFF) - 1
+    return CONNECT_COOLDOWN_BACKOFF[streak]
 
 
 def is_connect_failure(exc: Exception) -> bool:
-    """True when the request never reached the provider (TCP never established)."""
+    """Whether connection establishment failed before sending the HTTP request.
+
+    A RemoteProtocolError can follow an accepted POST, even when no response
+    headers arrived, so it must not consume this safe connection-retry budget.
+    """
     return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
 
 

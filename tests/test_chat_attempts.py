@@ -238,6 +238,20 @@ class SequencedStreamingAdapter:
         return f"provider-{model}"
 
 
+class InterruptedStreamingAdapter(SequencedStreamingAdapter):
+    def __init__(self, responses, error) -> None:
+        super().__init__(responses)
+        self.error = error
+
+    async def stream_convert_response(self, response, request):
+        self.stream_calls.append(response)
+        if response.mode == "prelude":
+            yield {"choices": [{"delta": {"role": "assistant"}}]}
+        elif response.mode == "partial":
+            yield {"choices": [{"delta": {"content": "partial"}}]}
+        raise self.error
+
+
 class PayloadStreamingAdapter:
     def __init__(self, payload) -> None:
         self.payload = payload
@@ -1172,6 +1186,107 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
         assert usage.prompt_tokens == 120
         assert usage.cached_tokens == 80
         assert usage.uncached_input_tokens == 40
+
+    async def test_remote_protocol_error_never_replays_stream(self) -> None:
+        class FailureRecordingAccounting(RecordingAccounting):
+            def __init__(self) -> None:
+                super().__init__()
+                self.failures = []
+
+            async def record_failure(self, db, **kwargs) -> None:
+                self.failures.append(kwargs)
+
+        for protocol in ("openai_chat", "openai_responses"):
+            for mode in ("no_output", "prelude", "partial"):
+                with self.subTest(protocol=protocol, mode=mode):
+                    error_message = (
+                        "peer closed connection without sending complete "
+                        "message body (incomplete chunked read)"
+                    )
+                    error = httpx.RemoteProtocolError(
+                        error_message,
+                        request=httpx.Request("POST", "https://provider.example/v1/chat"),
+                    )
+                    # Preserve the existing RequestError formatting, including
+                    # its host context; do not change error passthrough here.
+                    formatted_error = f"RemoteProtocolError: host=provider.example; {error_message}"
+                    first = TrackingStreamResponse(mode)
+                    spare = TrackingStreamResponse("text", "must-not-replay")
+                    adapter = InterruptedStreamingAdapter([first, spare], error)
+                    accounting = FailureRecordingAccounting()
+                    store = FakeConversationStore()
+                    token = SimpleNamespace(id=1)
+                    request_db = FakeDatabase()
+                    client = FakeHttpClient()
+                    sessions = FakeSessionMaker(token)
+                    routing = FakeRoutingEngine([])
+                    chat_endpoint.accounting_service = accounting
+                    chat_endpoint.attempt_recorder = accounting
+                    chat_endpoint.conversation_store = store
+                    chat_endpoint.async_session_maker = sessions
+                    chat_endpoint.routing_engine = routing
+                    request = ChatCompletionRequest.model_validate({
+                        "model": "model-a",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": True,
+                    })
+                    http_request = Request({
+                        "type": "http",
+                        "method": "POST",
+                        "path": "/v1/chat/completions",
+                        "headers": [],
+                        "client": ("127.0.0.1", 1),
+                    })
+                    transform = (
+                        ResponsesStreamTransform("model-a")
+                        if protocol == "openai_responses" else None
+                    )
+                    response = await chat_endpoint._handle_streaming_request(
+                        request, adapter, SimpleNamespace(id=2, protocol="openai"),
+                        token, request_db, 0.0, http_request, client,
+                        "req-protocol-interruption",
+                        SimpleNamespace(conversation_id="conv-1"),
+                        request_protocol=protocol,
+                        stream_transform=transform,
+                        response=await adapter.make_request(request),
+                        attempt_context=AttemptContext.start(0),
+                    )
+                    chunks = [chunk async for chunk in response.body_iterator]
+                    events = [json.loads(chunk.removeprefix("data: ").strip()) for chunk in chunks]
+
+                    assert adapter.make_calls == 1
+                    assert adapter.stream_calls == [first]
+                    assert adapter.responses == [spare]
+                    assert first.closed is True
+                    assert spare.closed is False
+                    assert request_db.closed is True
+                    assert client.closed is True
+                    assert len(accounting.attempts) == 1
+                    assert accounting.attempts[0]["outcome"] == "failed"
+                    assert accounting.attempts[0]["error"].code == "upstream_connection_failed"
+                    assert accounting.attempts[0]["error"].phase == "provider_stream"
+                    assert accounting.successes == []
+                    assert len(accounting.failures) == 1
+                    assert accounting.failures[0]["error_code"] == "RemoteProtocolError"
+                    assert accounting.failures[0]["error_message"] == formatted_error
+                    assert len(sessions.sessions) == 1
+                    assert sessions.sessions[0].commits == 1
+                    assert store.errors == [("RemoteProtocolError", formatted_error)]
+                    assert [status for status, _ in store.finishes] == ["failed"]
+                    assert routing.unavailable == [2]
+                    if protocol == "openai_responses":
+                        assert events[-1]["type"] == "response.failed"
+                        assert events[-1]["response"]["error"]["message"] == formatted_error
+                        deltas = [event for event in events if event["type"] == "response.output_text.delta"]
+                        assert [event["delta"] for event in deltas] == (["partial"] if mode == "partial" else [])
+                        assert not any(event["type"] == "response.completed" for event in events)
+                    else:
+                        assert events[-1]["error"]["type"] == "stream_error"
+                        assert events[-1]["error"]["message"] == formatted_error
+                        assert events[:-1] == (
+                            [{"choices": [{"delta": {"content": "partial"}}]}]
+                            if mode == "partial" else []
+                        )
 
     async def test_stream_interruption_records_failed_attempt(self) -> None:
         accounting = RecordingAccounting()

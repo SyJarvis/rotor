@@ -58,16 +58,17 @@ def prepare(env, monkeypatch, upstream, *, cooling=0):
     return clients
 
 
-def assert_released(env, *, recovered=False, delay=30):
+def assert_released(env, *, cooldown_seconds=None):
     assert env.engine.adaptive._stats[("model", 1)].inflight == 0
+    assert env.engine._in_flight == {}
     decision = env.engine.route(env.channels, "model")
-    if recovered:
+    if cooldown_seconds is None:
         assert decision.candidates == env.channels
-        assert ("model", 1) not in env.engine._cooldowns
+        assert env.engine.routing_state() == []
     else:
         assert decision.candidates == []
-        assert decision.retry_after_seconds == delay
-        assert env.engine._cooldowns[("model", 1)].probe is None
+        assert decision.retry_after_seconds == cooldown_seconds
+        assert env.engine.routing_state()[0][2]["phase"] == "cooldown"
 
 
 def completed_response():
@@ -109,7 +110,7 @@ def test_cooling_and_stale_candidates_never_call_provider(environment, monkeypat
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_cancellation_during_provider_call_releases_single_probe(environment, monkeypatch, protocol):
+def test_cancellation_during_provider_call_releases_channel_capacity(environment, monkeypatch, protocol):
     env = environment
     entered = asyncio.Event()
 
@@ -118,16 +119,19 @@ def test_cancellation_during_provider_call_releases_single_probe(environment, mo
         await asyncio.Event().wait()
 
     clients = prepare(env, monkeypatch, upstream)
+    env.channels[0].extra["max_in_flight"] = 1
 
     async def exercise():
         task = asyncio.create_task(invoke(env, protocol))
-        await entered.wait()
-        with pytest.raises(ChannelsTemporarilyUnavailable) as caught:
-            await invoke(env, protocol)
-        assert caught.value.headers == {"Retry-After": "1"}
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            with pytest.raises(ChannelsTemporarilyUnavailable) as caught:
+                await asyncio.wait_for(invoke(env, protocol), timeout=5)
+            assert caught.value.headers == {"Retry-After": "1"}
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
     asyncio.run(exercise())
     assert_released(env)
@@ -136,7 +140,7 @@ def test_cancellation_during_provider_call_releases_single_probe(environment, mo
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 @pytest.mark.parametrize("provider_success", [False, True])
-def test_accounting_failure_cannot_leak_or_misclassify_probe(environment, monkeypatch, protocol, provider_success):
+def test_accounting_failure_cannot_leak_admission_or_change_cooldown(environment, monkeypatch, protocol, provider_success):
     env = environment
 
     async def upstream(request):
@@ -149,12 +153,12 @@ def test_accounting_failure_cannot_leak_or_misclassify_probe(environment, monkey
     monkeypatch.setattr(env.accounting, "record_failure", AsyncMock(side_effect=RuntimeError("database unavailable")))
     with pytest.raises(RuntimeError, match="database unavailable"):
         asyncio.run(invoke(env, protocol))
-    assert_released(env, recovered=provider_success, delay=120)
+    assert_released(env, cooldown_seconds=None if provider_success else 120)
     assert all(client.is_closed for client in clients)
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
-def test_adapter_or_request_creation_failure_releases_probe(environment, monkeypatch, protocol):
+def test_adapter_or_request_creation_failure_releases_admission(environment, monkeypatch, protocol):
     env = environment
     clients = prepare(env, monkeypatch, AsyncMock(side_effect=AssertionError("must not call provider")))
     endpoint = ENDPOINTS[PROTOCOLS.index(protocol)]
@@ -183,11 +187,13 @@ def test_stream_handoff_releases_on_send_failure_or_completion(environment, monk
         return response
 
     clients = prepare(env, monkeypatch, upstream)
+    env.channels[0].extra["max_in_flight"] = 1
 
     async def exercise():
         response = await invoke(env, protocol, stream=True)
         assert env.engine.adaptive._stats[("model", 1)].inflight == 1
-        assert env.engine.route(env.channels, "model").candidates == []
+        assert env.engine.admit_attempt("model", env.channels[0]) is None
+        assert "concurrency_limit" in env.engine.diagnose(env.channels, "model")[0]["reasons"]
         if started:
             assert [chunk async for chunk in response.body_iterator]
         else:
@@ -198,14 +204,14 @@ def test_stream_handoff_releases_on_send_failure_or_completion(environment, monk
                 await response({"type": "http", "asgi": {"spec_version": "2.4"}}, AsyncMock(), fail_send)
 
     asyncio.run(exercise())
-    assert_released(env, recovered=started)
+    assert_released(env)
     assert all(client.is_closed for client in clients)
     assert all(response.is_closed for response in responses)
 
 
 @pytest.mark.parametrize("operation", ["input_tokens", "compact"])
 @pytest.mark.parametrize("outcome", ["success", "retry", "cancel"])
-def test_native_collection_uses_same_recovery_admission(environment, monkeypatch, operation, outcome):
+def test_native_collection_releases_admission_and_preserves_explicit_cooldown(environment, monkeypatch, operation, outcome):
     env = environment
 
     async def upstream(request):
@@ -232,11 +238,11 @@ def test_native_collection_uses_same_recovery_admission(environment, monkeypatch
             assert response.status_code == (200 if outcome == "success" else 429)
 
     asyncio.run(exercise())
-    assert_released(env, recovered=outcome == "success", delay=120 if outcome == "retry" else 30)
+    assert_released(env, cooldown_seconds=120 if outcome == "retry" else None)
     assert all(client.is_closed for client in clients)
 
 
-def test_background_accepted_releases_probe_without_waiting_for_poll(environment, monkeypatch):
+def test_background_accepted_releases_admission_without_waiting_for_poll(environment, monkeypatch):
     env = environment
     payload = {"id": "resp_bg", "model": "model", "object": "response", "status": "queued", "output": [], "usage": None}
     clients = prepare(env, monkeypatch, AsyncMock(return_value=httpx.Response(200, json=payload)))
@@ -244,7 +250,7 @@ def test_background_accepted_releases_probe_without_waiting_for_poll(environment
     monkeypatch.setattr(responses_endpoint, "save_response_route", AsyncMock())
     result = asyncio.run(invoke(env, "responses", background=True))
     assert result["status"] == "queued"
-    assert_released(env, recovered=True)
+    assert_released(env)
     assert env.engine.adaptive._stats[("model", 1)].observations == 1
     assert all(client.is_closed for client in clients)
 

@@ -62,6 +62,7 @@ from rotor.models.channel import Channel
 from rotor.models.response_route import ResponseRoute
 from rotor.services.response_routes import get_response_route, save_response_route
 from httpx import AsyncClient, HTTPStatusError, RequestError
+from rotor.core.http_client import UPSTREAM_LIMITS
 
 
 router = APIRouter()
@@ -548,7 +549,7 @@ async def create_response(
             status_code=503,
         )
 
-    http_client = AsyncClient(timeout=120.0)
+    http_client = AsyncClient(timeout=120.0, limits=UPSTREAM_LIMITS)
     streaming_response_returned = False
     last_error = None
     conversation_handle = await conversation_store.start(
@@ -1005,7 +1006,7 @@ async def _native_collection_request(
         )
 
     last_error = None
-    async with AsyncClient(timeout=120.0) as http_client:
+    async with AsyncClient(timeout=120.0, limits=UPSTREAM_LIMITS) as http_client:
         for channel in candidates:
             admission = routing_engine.admit_attempt(model, channel)
             if admission is None:
@@ -1198,7 +1199,7 @@ async def delete_response(
 ):
     """Delete a stored response from its upstream and forget local routing."""
     route, channel = await _resolve_response_channel(db, response_id, token)
-    async with AsyncClient(timeout=120.0) as http_client:
+    async with AsyncClient(timeout=120.0, limits=UPSTREAM_LIMITS) as http_client:
         adapter = AdapterFactory.create_adapter(channel, http_client)
         if not isinstance(adapter, OpenAIResponsesAdapter):
             raise HTTPException(status_code=404, detail="Response not found")
@@ -1222,7 +1223,7 @@ async def cancel_response(
     """Cancel a background response on its original upstream."""
     started_at = time.time()
     route, channel = await _resolve_response_channel(db, response_id, token)
-    async with AsyncClient(timeout=120.0) as http_client:
+    async with AsyncClient(timeout=120.0, limits=UPSTREAM_LIMITS) as http_client:
         adapter = AdapterFactory.create_adapter(channel, http_client)
         if not isinstance(adapter, OpenAIResponsesAdapter):
             raise HTTPException(status_code=404, detail="Response not found")
@@ -1260,7 +1261,7 @@ async def list_response_input_items(
     """List the input items belonging to a stored response."""
     _, channel = await _resolve_response_channel(db, response_id, token)
     params = [(key, value) for key, value in http_request.query_params.multi_items()]
-    async with AsyncClient(timeout=120.0) as http_client:
+    async with AsyncClient(timeout=120.0, limits=UPSTREAM_LIMITS) as http_client:
         adapter = AdapterFactory.create_adapter(channel, http_client)
         if not isinstance(adapter, OpenAIResponsesAdapter):
             raise HTTPException(status_code=404, detail="Response not found")

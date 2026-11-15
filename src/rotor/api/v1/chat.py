@@ -51,6 +51,7 @@ from rotor.core.exceptions import (
     upstream_error_response,
 )
 from httpx import AsyncClient, HTTPStatusError, RequestError
+from rotor.core.http_client import UPSTREAM_LIMITS
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +178,7 @@ async def chat_completions(
     start_time = time.time()
 
     # Try to get a response from available channels
-    http_client = AsyncClient(timeout=120.0)
+    http_client = AsyncClient(timeout=120.0, limits=UPSTREAM_LIMITS)
     streaming_response_returned = False
     last_error = None
 

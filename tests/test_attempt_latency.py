@@ -214,10 +214,18 @@ def test_fallback_scores_only_the_current_attempt(environment, monkeypatch, prot
         if stream:
             chunks = [chunk async for chunk in result.body_iterator]
             assert chunks
+        else:
+            return result
 
     if fail and not stream:
-        with pytest.raises(ChannelException):
-            asyncio.run(exercise())
+        if protocol == "images":
+            with pytest.raises(ChannelException):
+                asyncio.run(exercise())
+        else:
+            # Official upstream replied 503: forwarded verbatim, not wrapped.
+            result = asyncio.run(exercise())
+            assert result.status_code == 503
+            assert b"unavailable" in result.body
     else:
         asyncio.run(exercise())
 
