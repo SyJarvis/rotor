@@ -21,6 +21,22 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
         "request_path": "/responses",
         "auth_type": "bearer",
     },
+    "opencode": {
+        "label": "OpenCode",
+        "protocol": "openai",
+        "base_url": "https://opencode.ai/zen/go/v1",
+        "models_path": "/models",
+        "request_path": "/chat/completions",
+        "auth_type": "bearer",
+    },
+    "command": {
+        "label": "Command Code",
+        "protocol": "openai",
+        "base_url": "https://api.commandcode.ai/provider/v1",
+        "models_path": "/models",
+        "request_path": "/chat/completions",
+        "auth_type": "bearer",
+    },
     "deepseek": {
         "label": "DeepSeek",
         "protocol": "openai",

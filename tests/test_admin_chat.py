@@ -253,6 +253,21 @@ def test_sdk_does_not_retry_and_preserves_sanitized_upstream_failure(monkeypatch
     assert sessions.opened == sessions.closed == 1
 
 
+def test_sdk_failure_message_uses_sanitized_structured_body_not_sdk_formatting():
+    request = endpoint.httpx2.Request("POST", "http://rotor.internal/v1/chat/completions")
+    response = endpoint.httpx2.Response(429, request=request)
+    body = {"message": "Upstream returned HTTP 429", "upstream": {"body": {
+        "error": {"message": "limit reached", "api_key": "secret"}
+    }}}
+    for sdk_message in ("short SDK message", "long SDK message with secret"):
+        exc = endpoint.APIStatusError(sdk_message, response=response, body=body)
+        message = endpoint._failure_message(exc)
+        assert "429" in message
+        assert "limit reached" in message
+        assert "secret" not in message
+        assert "api_key" not in message
+
+
 @pytest.mark.parametrize("mode", ["close", "cancel"])
 def test_stopping_stream_closes_iterator_callbacks_admission_and_db(monkeypatch, mode):
     sessions = Sessions()

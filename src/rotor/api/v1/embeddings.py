@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Request, Response
 from httpx import AsyncClient, HTTPStatusError, RequestError, Timeout
+from rotor.core.http_client import UPSTREAM_LIMITS
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -346,7 +347,7 @@ async def create_embeddings(
             original_error=f"Required capabilities: {sorted(required)}",
         )
 
-    http_client = AsyncClient(timeout=_timeout())
+    http_client = AsyncClient(timeout=_timeout(), limits=UPSTREAM_LIMITS)
     last_error: Exception | None = None
     fallback_reason: str | None = None
     try:

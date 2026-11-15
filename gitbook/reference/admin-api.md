@@ -79,7 +79,7 @@ curl -b "$ROTOR_ADMIN_COOKIE_JAR" \
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/admin/channels` | 列出渠道和统计 |
-| `GET` | `/api/admin/channels/routing-state` | 列出运行中的冷却/恢复探测状态 |
+| `GET` | `/api/admin/channels/routing-state` | 列出尚未到期的冷却状态 |
 | `GET` | `/api/admin/channels/presets` | 获取 provider 预设 |
 | `GET` | `/api/admin/channels/{id}` | 获取渠道 |
 | `POST` | `/api/admin/channels` | 创建渠道 |

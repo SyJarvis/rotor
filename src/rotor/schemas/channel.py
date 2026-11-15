@@ -158,7 +158,7 @@ class ChannelListItem(BaseModel):
 
 
 class ChannelUsageWindow(BaseModel):
-    """One ChatGPT plan usage window (5-hour primary or weekly secondary)."""
+    """One plan usage window (5-hour primary or weekly secondary)."""
 
     used_percent: Optional[float] = None
     window_seconds: Optional[int] = None
@@ -166,14 +166,121 @@ class ChannelUsageWindow(BaseModel):
     reset_at: Optional[float] = None
 
 
+class CommandGoatSubscription(BaseModel):
+    plan_id: str
+    status: str
+    current_period_start: Optional[str] = None
+    current_period_end: Optional[str] = None
+    cancel_at_period_end: Optional[bool] = None
+    canceled_at: Optional[str] = None
+    ended_at: Optional[str] = None
+
+
+class CommandGoatCredits(BaseModel):
+    monthly_remaining: float
+    purchased_remaining: float
+    free_remaining: float
+
+
+class CommandGoatWindow(BaseModel):
+    used: float
+    cap: float
+    exceeded: bool
+    reset_at: Optional[float] = None
+
+
+class CommandGoatSummary(BaseModel):
+    total_cost: float
+    total_monthly_credits: float
+    total_purchased_credits: float
+    total_free_credits: float
+    total_count: int
+    period_start: Optional[str] = None
+    period_basis: Optional[str] = None
+
+
+class CommandGoatUsage(BaseModel):
+    subscription: Optional[CommandGoatSubscription] = None
+    credits: CommandGoatCredits
+    window_limited: Optional[bool] = None
+    five_hour: Optional[CommandGoatWindow] = None
+    weekly: Optional[CommandGoatWindow] = None
+    summary: CommandGoatSummary
+
+
+class OpenCodeSources(BaseModel):
+    usage: Literal["ok", "unauthorized", "forbidden", "unavailable", "invalid_response", "error"]
+    subscription: Literal["ok", "unauthorized", "forbidden", "unavailable", "invalid_response", "error"]
+    billing: Literal["ok", "unauthorized", "forbidden", "unavailable", "invalid_response", "error"]
+
+
+class OpenCodeUsageWindow(BaseModel):
+    status: Literal["ok", "rate-limited"]
+    used_percent: float
+    reset_at: float
+
+
+class OpenCodeUsageWindows(BaseModel):
+    five_hour: OpenCodeUsageWindow
+    weekly: OpenCodeUsageWindow
+    monthly: OpenCodeUsageWindow
+
+
+class OpenCodeAllowanceWindow(BaseModel):
+    used_microcents: str
+    limit_microcents: str
+    starts_at: Optional[float] = None
+    reset_at: Optional[float] = None
+
+
+class OpenCodeAccess(BaseModel):
+    starts_at: float
+    ends_at: float
+    cancel_at_period_end: bool
+    five_hour: OpenCodeAllowanceWindow
+    weekly: OpenCodeAllowanceWindow
+    monthly: OpenCodeAllowanceWindow
+
+
+class OpenCodeSubscription(BaseModel):
+    product: str
+    renewal_product: str
+    use_balance: bool
+    cancel_at_period_end: bool
+    renewal_pending: bool
+    resumability: Optional[str] = None
+    access: Optional[OpenCodeAccess] = None
+
+
+class OpenCodeBilling(BaseModel):
+    billing_mode: str
+    mode: str
+    balance_microcents: str
+    available_microcents: str
+    credit_limit_microcents: Optional[str] = None
+    can_purchase_credits: bool
+    can_enable_auto_recharge: bool
+
+
+class OpenCodeUsage(BaseModel):
+    sources: OpenCodeSources
+    usage: Optional[OpenCodeUsageWindows] = None
+    subscription: Optional[OpenCodeSubscription] = None
+    billing: Optional[OpenCodeBilling] = None
+
+
 class ChannelUsageResponse(BaseModel):
-    """ChatGPT plan usage snapshot for an OAuth channel."""
+    """Subscription usage snapshot for a channel with a quota provider."""
 
     plan: Optional[str] = None
+    subscription_status: Optional[str] = None
+    channel_enabled: Optional[bool] = None
     allowed: Optional[bool] = None
     limit_reached: Optional[bool] = None
     primary: Optional[ChannelUsageWindow] = None
     secondary: Optional[ChannelUsageWindow] = None
+    command_goat: Optional[CommandGoatUsage] = None
+    opencode: Optional[OpenCodeUsage] = None
     fetched_at: float
 
 

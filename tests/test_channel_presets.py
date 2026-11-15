@@ -7,6 +7,7 @@ from rotor.api.admin.channels import _fetch_model_list, _probe_generation_capabi
 from rotor.channels.presets import (
     channel_option,
     join_api_url,
+    list_provider_presets,
     provider_defaults,
     provider_headers,
 )
@@ -195,3 +196,14 @@ def test_function_call_capability_probe_uses_configured_adapter(monkeypatch) -> 
     assert captured["request"].tools[0].function.name == "rotor_health_check"
     assert captured["request"].tool_choice["function"]["name"] == "rotor_health_check"
     assert captured["timeout"] == 30.0
+
+
+def test_command_provider_preset_exposes_selectable_api_key_defaults() -> None:
+    preset = next(item for item in list_provider_presets() if item["id"] == "command")
+    assert preset == {
+        "id": "command", "label": "Command Code", "protocol": "openai",
+        "base_url": "https://api.commandcode.ai/provider/v1", "models_path": "/models",
+        "request_path": "/chat/completions", "auth_type": "bearer",
+    }
+    assert provider_defaults("command", "openai")["request_path"] == "/chat/completions"
+    assert provider_defaults("command", "anthropic")["auth_type"] == "bearer"

@@ -96,7 +96,7 @@ POST /oauth/token
 
 ### GET /v1/usage —— 配额与上游计划窗口
 
-当前凭据的用量快照,agent 可据此做节流与"额度用尽"提示:
+当前凭据的用量快照,agent 可据此辅助节流与窗口提示。以下数据为合成示例,不是账户实测记录；假设查询时间为 2030-01-08 06:00 UTC:
 
 ```json
 {
@@ -104,17 +104,19 @@ POST /oauth/token
   "channels": [
     {"channel_id": 9, "channel": "openai-plus", "provider": "chatgpt", "plan": "plus",
      "rate_limit": {
-       "primary_window":  {"used_percent": 7.0, "window_seconds": 18000,  "reset_after_seconds": 300, "reset_at": 1800000300.0},
-       "secondary_window": {"used_percent": 15.0, "window_seconds": 604800, "reset_after_seconds": 400000, "reset_at": 1800400300.0}
+       "primary_window":  {"used_percent": 7.0, "window_seconds": 18000,  "reset_after_seconds": 300, "reset_at": 1894082700.0},
+       "secondary_window": {"used_percent": 15.0, "window_seconds": 604800, "reset_after_seconds": 400000, "reset_at": 1894482400.0}
      },
-     "limit_reached": false, "allowed": true, "fetched_at": 1792831349.0}
+     "limit_reached": false, "allowed": true, "subscription_status": null, "fetched_at": 1894082400.0}
   ]
 }
 ```
 
 - `quota`:Rotor 自身的令牌配额,`null` 表示不限量
-- `channels[].rate_limit`:ChatGPT(5h/周窗)与智谱 GLM Coding Plan(滚动 5h/周窗)的上游计划窗口,`primary_window` 为 5 小时窗、`secondary_window` 为周窗;`limit_reached=true` 表示窗口耗尽,应停止向该渠道模型发请求直到 `reset_at`
-- 窗口数据来自管理侧 90 秒缓存,该路径**不会**触发上游请求;`channels` 为空仅表示暂无新鲜快照,稍后重试即可
+- `channels[].rate_limit` 是通用窗口:ChatGPT、智谱、Command Goat、OpenCode 的 `primary_window` 为 5 小时窗、`secondary_window` 为周窗,字段可为 `null`;时间为 Unix 秒,`reset_after_seconds` 相对 `fetched_at`,不是读取缓存时的倒计时。
+- 仅输出当前凭据允许的且已启用的渠道；模型权限受限时,还须至少提供一个允许的模型名或映射别名。还须服务商条件有效、缓存与当前配置匹配。窗口数据来自 90 秒内的管理侧缓存,此接口**不会**触发上游请求;`channels` 为空也可能是权限、模型、渠道状态或缓存条件不符,不代表额度耗尽。
+- ChatGPT/智谱的 `limit_reached` 可反映窗口耗尽;`null` 表示未知。Goat/OpenCode 的通用 `limit_reached` 始终为 `null`,不能作为全部模型不可用的判定。Goat 专属详情仅保留窗口限制开关和各窗口 `exceeded`、`reset_at`;OpenCode 专属详情仅保留三个 usage 窗口的 `status`、`used_percent`、`reset_at`。窗口受限不保证免费模型或付费额度不可用。
+- 此客户端接口不暴露上游余额、成本、原始金额额度或专属订阅账务详情；管理员接口仍可查看完整类型化数据。
 
 ### Anthropic 面
 
@@ -131,6 +133,54 @@ POST /oauth/token
 | `POST /v1/images/generations` | OpenAI | 生图 |
 | `POST /anthropic/v1/messages` | Anthropic | Messages,支持流式 |
 | `POST /anthropic/v1/messages/count_tokens` | Anthropic | token 估算 |
+
+## 提示词缓存亲和
+
+上游的两种缓存模型不一样,agent 需要按渠道类型配合:
+
+| 渠道类型 | 缓存寻址方式 | 客户端要做的 |
+|---|---|---|
+| 标准 OpenAI 兼容(`/chat/completions`、`/messages`) | 前缀内容寻址 | 无。保持前缀稳定即可,首条也能命中 |
+| ChatGPT Codex(`openai_codex`) | 按 `session_id` 请求头分桶 | 每条会话发一个稳定的会话 id |
+
+Codex 端的规则(实测):同一前缀在 A 桶预热后,换桶仍然 0%;同一桶内第二轮起稳定 98%。
+缓存不跨桶共享,所以**渠道级静态 `session_id` 是错的** —— 所有会话挤进一个桶,既拿不到
+按会话的增长命中,又会互相淘汰。
+
+### 客户端怎么发会话 id
+
+Rotor 按以下顺序识别,命中即止(值只要求稳定且唯一,长度上限 100):
+
+1. `x-conversation-id` / `x-rotor-session-id` / `x-mindcode-session-id`
+2. 客户端专属头:`session_id` 或 `session-id`(Codex/pi)、`x-opencode-session`、
+   `x-claude-code-session-id`、`x-grok-conv-id`、`x-session-affinity`
+3. `x-session-id`
+4. 兜底序列:`conversation` → `metadata.user_id` / `session_id` → `prompt_cache_key` → `user`
+
+Rotor 匹配到之后派生成 `rotor_session_<hash>` 再发给 Codex 上游;派生值里带了令牌 id,
+不同租户的同名会话不会共用一个桶。客户端不需要知道这个格式,发自己的会话 id 即可。
+
+> `prompt_cache_key` 对 Codex 上游无效 —— 实测可以 200 返回但缓存毫无变化。
+> 它只作为第 4 级兜底来源参与会话识别,不要指望它单独起作用。
+
+### 不要做的事
+
+- 不要在渠道附加配置里写死 `extra.headers.session_id`。有真实会话时它会被覆盖,
+  只有完全无会话来源的请求才退回这个静态值。
+- 不要把请求 id / trace id 当会话 id 传:每轮都变,等于每轮冷启动。
+- 前缀要够长才有意义:3.2k token 上下不命中,9.6k 以上稳定命中。
+
+### 自检
+
+```bash
+# 同一会话连发两次,第二轮应有 cached_tokens;换个会话应回到 0
+curl -s $BASE/v1/responses -H "Authorization: Bearer $KEY" -H "session-id: conv-demo-1" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-6.1-sol","input":"<较长的稳定前缀>"}' | jq .usage
+```
+
+网关侧看 `request_logs` 的 `cached_tokens / prompt_tokens`:同一 `cache_scope` 下
+第二轮起应稳定在高位。
 
 ## 错误语义与重试建议
 

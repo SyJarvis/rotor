@@ -12,12 +12,17 @@ import logging
 import time
 
 import httpx
+from sqlalchemy import inspect, update
 
 from rotor.database import async_session_maker
 from rotor.models.channel import Channel
 from rotor.services import usage_cache
-from rotor.services.chatgpt_oauth import codex_usage_snapshot, fetch_codex_usage, resolve_oauth_credentials
-from rotor.services.zhipu_quota import fetch_zhipu_usage, is_zhipu_quota_channel
+from rotor.services.chatgpt_oauth import (
+    OAuthError, codex_usage_snapshot, fetch_codex_usage, resolve_oauth_credentials,
+)
+from rotor.services.command_goat_quota import fetch_command_goat_usage, is_command_goat_quota_channel
+from rotor.services.opencode_quota import fetch_opencode_usage, is_opencode_quota_channel
+from rotor.services.zhipu_quota import ZhipuQuotaError, fetch_zhipu_usage, is_zhipu_coding_channel, is_zhipu_quota_channel
 
 logger = logging.getLogger("rotor.quota_refresher")
 
@@ -46,12 +51,20 @@ def _limit_horizon(usage, now: float) -> float:
     return LIMITED_HORIZON_FALLBACK_SECONDS
 
 
-def apply_usage(channel, usage, *, now: float | None = None) -> None:
+def apply_usage(channel, usage, *, now: float | None = None, expected_generation: int | None = None) -> bool:
     """Publish a snapshot and reconcile channel-wide cooldowns with it."""
     from rotor.gateway.routing import routing_engine  # local import: routing imports this module
 
     moment = time.time() if now is None else now
-    usage_cache.store(channel.id, usage, now=moment)
+    if not usage_cache.store(channel.id, usage, channel=channel, now=moment,
+                             expected_generation=expected_generation):
+        return False
+    if usage.command_goat is not None or usage.opencode is not None:
+        # Paid credits and free models can remain usable beyond plan windows.
+        return True
+    if usage.subscription_status == "inactive":
+        # Missing a subscription proves neither quota exhaustion nor recovery.
+        return True
     if usage.limit_reached:
         horizon = _limit_horizon(usage, moment)
         for model in {*(channel.models or [])}:
@@ -68,16 +81,85 @@ def apply_usage(channel, usage, *, now: float | None = None) -> None:
                 channel.id, channel.name, len(cleared),
             )
 
+    return True
+
 
 async def fetch_usage(channel, client: httpx.AsyncClient):
     """Fetch the quota snapshot for a channel; None when it has no provider."""
     if channel.auth_type == "oauth":
         credential = await resolve_oauth_credentials(channel, client)
-        payload = await fetch_codex_usage(client, credential)
+        channel._quota_oauth_access_token = credential.access_token
+        channel._quota_oauth_account_id = credential.account_id
+        try:
+            payload = await fetch_codex_usage(client, credential)
+        except OAuthError as exc:
+            if exc.auth_status != "reauth_required":
+                raise
+            # A 401 here is the token being stale, not necessarily the account
+            # needing a new login. Refreshing with the rejected credential must
+            # be attempted first: marking the channel reauth_required would
+            # also lock the inference path out, since the resolver refuses to
+            # work on a channel in that state.
+            credential = await resolve_oauth_credentials(
+                channel, client, rejected_credential=credential,
+            )
+            channel._quota_oauth_access_token = credential.access_token
+            channel._quota_oauth_account_id = credential.account_id
+            payload = await fetch_codex_usage(client, credential)
         return codex_usage_snapshot(payload, fetched_at=time.time())
+    if is_command_goat_quota_channel(channel):
+        return await fetch_command_goat_usage(client, channel)
+    if is_opencode_quota_channel(channel):
+        return await fetch_opencode_usage(client, channel)
     if is_zhipu_quota_channel(channel):
         return await fetch_zhipu_usage(client, channel)
     return None
+
+
+async def verify_configuration(db, channel, expected_identity: str, expected_generation: int,
+                               *, oauth_fetched: bool = False) -> None:
+    """Re-read after I/O and reject work fetched using a superseded configuration."""
+    # Unit-level callers may use a plain stand-in rather than an ORM channel.
+    if inspect(channel, raiseerr=False) is not None:
+        try:
+            await db.refresh(channel)
+        except Exception as exc:
+            from sqlalchemy.exc import InvalidRequestError
+            if isinstance(exc, InvalidRequestError):
+                raise ZhipuQuotaError("Channel configuration changed; refresh usage again", 503) from exc
+            raise
+    if (usage_cache.changing(channel.id)
+            or usage_cache.generation(channel.id) != expected_generation
+            or usage_cache.identity(channel, include_oauth_tokens=not oauth_fetched) != expected_identity
+            or (oauth_fetched and (
+                getattr(channel, "_quota_oauth_access_token", None) != channel.oauth_access_token
+                or getattr(channel, "_quota_oauth_account_id", None) != channel.oauth_account_id
+            ))):
+        raise ZhipuQuotaError("Channel configuration changed; refresh usage again", 503)
+
+
+async def apply_subscription_status(db, channel, usage) -> None:
+    """Persist confirmed loss of a Coding Plan; renewal never enables a channel."""
+    if (usage.subscription_status == "inactive" and usage.opencode is None
+            and usage.command_goat is None and is_zhipu_coding_channel(channel) and channel.enabled):
+        result = await db.execute(
+            update(Channel).where(
+                Channel.id == channel.id,
+                Channel.type == channel.type,
+                Channel.base_url == channel.base_url,
+                Channel.key == channel.key,
+                Channel.auth_type == channel.auth_type,
+                Channel.extra == channel.extra,
+                Channel.protocol == channel.protocol,
+                Channel.enabled.is_(True),
+            ).values(enabled=False).execution_options(synchronize_session=False)
+        )
+        await db.commit()
+        if not result.rowcount:
+            raise ZhipuQuotaError("Channel configuration changed; refresh usage again", 503)
+        await db.refresh(channel)
+        logger.info("channel %s (%s) disabled: no Coding Plan subscription", channel.id, channel.name)
+    usage.channel_enabled = channel.enabled
 
 
 class QuotaRefresher:
@@ -140,14 +222,21 @@ class QuotaRefresher:
     async def _refresh(self, channel_id: int) -> None:
         async with async_session_maker() as db:
             channel = await db.get(Channel, channel_id)
-        if channel is None or not channel.enabled:
-            self._backoff.pop(channel_id, None)
-            return
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            usage = await fetch_usage(channel, client)
-        if usage is None:
-            return
-        apply_usage(channel, usage)
+            if channel is None or not channel.enabled:
+                self._backoff.pop(channel_id, None)
+                return
+            version = usage_cache.generation(channel_id)
+            oauth_fetched = getattr(channel, "auth_type", None) == "oauth"
+            identity = usage_cache.identity(channel, include_oauth_tokens=not oauth_fetched)
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                usage = await fetch_usage(channel, client)
+            if usage is None:
+                return
+            await verify_configuration(db, channel, identity, version, oauth_fetched=oauth_fetched)
+            await apply_subscription_status(db, channel, usage)
+            if usage_cache.changing(channel_id) or usage_cache.generation(channel_id) != version:
+                raise ZhipuQuotaError("Channel configuration changed; refresh usage again", 503)
+            apply_usage(channel, usage, expected_generation=version)
         if not usage.limit_reached:
             self._backoff.pop(channel_id, None)
             return

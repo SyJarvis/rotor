@@ -95,7 +95,7 @@ def test_normal_completion_closes_resources_and_releases_only_its_admission():
     asyncio.run(scenario())
 
 
-def test_cancelled_probe_restarts_cooldown_without_releasing_older_healthy_attempt():
+def test_cancelled_post_cooldown_attempt_releases_only_its_own_admission():
     async def scenario():
         env = await resources()
         now = [0.0]
@@ -104,7 +104,7 @@ def test_cancelled_probe_restarts_cooldown_without_releasing_older_healthy_attem
         env.engine.mark_unavailable("model", env.channel, 10)
         now[0] = 10.0
         probe = env.engine.admit_attempt("model", env.channel)
-        assert probe is not None and probe.is_probe
+        assert probe is not None and not probe.is_probe
         env.admission = probe
 
         async def send(message):
@@ -114,14 +114,10 @@ def test_cancelled_probe_restarts_cooldown_without_releasing_older_healthy_attem
             await AdmissionStreamingResponse(
                 env.body, admission=probe, close_callbacks=env.close_callbacks,
             )(SCOPE, receive, send)
-        state = env.engine._cooldowns[("model", env.channel.id)]
-        assert state.probe is None
-        assert state.deadline == 40.0
+        assert env.engine.routing_state() == []
         assert env.engine.adaptive._stats[("model", env.channel.id)].inflight == 1
-        assert env.engine.admit_attempt("model", env.channel) is None
-        now[0] = 40.0
         next_probe = env.engine.admit_attempt("model", env.channel)
-        assert next_probe is not None and next_probe.is_probe
+        assert next_probe is not None and not next_probe.is_probe
         assert env.engine.adaptive._stats[("model", env.channel.id)].inflight == 2
         env.engine.release_attempt(next_probe)
         assert_released_and_closed(env)

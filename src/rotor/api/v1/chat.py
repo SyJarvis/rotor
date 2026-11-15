@@ -7,15 +7,14 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.database import async_session_maker, get_db
-from rotor.core.client_session import resolve_client_session
+from rotor.core.client_session import (
+    build_responses_session_id,
+    resolve_client_session,
+)
 from rotor.core.header_forwarding import snapshot_inbound_headers
 from rotor.core.deps import get_current_token, get_available_channels
 from rotor.application_settings import application_settings
-from rotor.schemas.request import (
-    ChatMessage,
-    ChatCompletionRequest,
-    Role,
-)
+from rotor.schemas.request import ChatCompletionRequest
 from rotor.schemas.error import ErrorPhase
 from rotor.adapters.factory import AdapterFactory
 from rotor.adapters.protocol.openai_integrity import ChatStreamIntegrity, validate_chat_response
@@ -48,8 +47,10 @@ from rotor.core.exceptions import (
     format_error_message,
     normalize_upstream_error,
     upstream_error_payload,
+    upstream_error_response,
 )
 from httpx import AsyncClient, HTTPStatusError, RequestError
+from rotor.core.http_client import UPSTREAM_LIMITS
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,10 @@ async def chat_completions(
         legacy_user_id=request.user,
     )
     request.inbound_headers = snapshot_inbound_headers(http_request.headers)
+    request.responses_session_id = build_responses_session_id(
+        token_id=principal_scope_key(token),
+        session_id=client_session.session_id,
+    )
     conversation_id = client_session.session_id or f"conv_{uuid.uuid4().hex[:24]}"
     client_ip = http_request.client.host if http_request.client else "unknown"
     request_origin = getattr(http_request.state, "request_origin", "client")
@@ -176,7 +181,7 @@ async def chat_completions(
     start_time = time.time()
 
     # Try to get a response from available channels
-    http_client = AsyncClient(timeout=120.0)
+    http_client = AsyncClient(timeout=120.0, limits=UPSTREAM_LIMITS)
     streaming_response_returned = False
     last_error = None
 
@@ -385,6 +390,11 @@ async def chat_completions(
     if last_error is None:
         wait, plan_limited = routing_engine.cooldown_outlook(request.model, candidates)
         raise ChannelsTemporarilyUnavailable(request.model, wait, plan_limited=plan_limited)
+    # The official upstream answered: forward its reply verbatim instead of
+    # wrapping it in a gateway-made error.
+    reply = upstream_error_response(last_error)
+    if reply is not None:
+        return reply
     raise ChannelException(
         f"All channels failed for model '{request.model}'",
         status_code=classify_error_status(last_error),
@@ -1088,7 +1098,8 @@ async def _handle_streaming_request(
                 error_chunk = {
                     "error": {
                         "message": error_message,
-                        "type": "stream_error"
+                        "type": "stream_error",
+                        "code": normalize_upstream_error(e, phase=ErrorPhase.PROVIDER_STREAM).code,
                     }
                 }
                 yield f"data: {_json_dumps(error_chunk)}\n\n"
@@ -1117,37 +1128,3 @@ def _json_dumps(data: dict) -> str:
     """JSON dump with special handling."""
     import json
     return json.dumps(data, ensure_ascii=False)
-
-
-def responses_input_to_messages(input_data) -> list[ChatMessage]:
-    """Convert a minimal OpenAI Responses API input into chat messages."""
-    if isinstance(input_data, str):
-        return [ChatMessage(role=Role.USER, content=input_data)]
-
-    messages: list[ChatMessage] = []
-    if isinstance(input_data, list):
-        for item in input_data:
-            if isinstance(item, str):
-                messages.append(ChatMessage(role=Role.USER, content=item))
-                continue
-            if not isinstance(item, dict):
-                continue
-
-            role = item.get("role", "user")
-            # Responses API allows role="developer" (OpenAI reasoning models,
-            # equivalent to system). Normalize so downstream ChatMessage stays
-            # within the supported enum and provider chat APIs accept it.
-            if role == "developer":
-                role = "system"
-            content = item.get("content", "")
-            text_parts: list[str] = []
-            if isinstance(content, str):
-                text_parts.append(content)
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") in ("input_text", "text", "output_text"):
-                            text_parts.append(block.get("text", ""))
-            messages.append(ChatMessage(role=Role(role), content="".join(text_parts)))
-
-    return messages or [ChatMessage(role=Role.USER, content="")]

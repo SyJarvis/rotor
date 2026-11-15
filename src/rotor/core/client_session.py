@@ -120,6 +120,28 @@ def build_responses_prompt_cache_key(
     return f"rotor_{digest[:58]}"
 
 
+def build_responses_session_id(
+    *,
+    token_id: int | str,
+    session_id: str | None,
+) -> str | None:
+    """Build the upstream prompt-cache affinity id for one conversation.
+
+    ChatGPT Codex partitions its prompt cache by the ``session_id`` header
+    and serves no cross-session reuse, so this value must be stable for a
+    conversation and distinct between conversations. It is a routing hint
+    only: it carries no tenant identity beyond the hash, and the token scope
+    keeps tenants from sharing a bucket.
+    """
+    normalized_session = _normalize_identifier(session_id)
+    if normalized_session is None:
+        return None
+    digest = hashlib.sha256(
+        f"session\0{token_id}\0{normalized_session}".encode()
+    ).hexdigest()
+    return f"rotor_session_{digest[:40]}"
+
+
 def resolve_client_session(
     headers: Mapping[str, str],
     *,

@@ -9,36 +9,20 @@ rejected request needs for diagnosis.
 from typing import Any
 
 from fastapi.responses import JSONResponse
-from httpx import HTTPStatusError
 from starlette.exceptions import HTTPException
 
 from rotor.core.exceptions import (
-    UpstreamOverloaded,
+    ERROR_TYPES,
     classify_error_status,
     normalize_upstream_error,
+    upstream_retry_after,
 )
-
-_ERROR_TYPES = {
-    400: "invalid_request_error",
-    401: "authentication_error",
-    402: "billing_error",
-    403: "permission_error",
-    404: "not_found_error",
-    409: "conflict_error",
-    413: "request_too_large",
-    422: "invalid_request_error",
-    429: "rate_limit_error",
-    503: "overloaded_error",
-    504: "timeout_error",
-}
 
 
 def _status_code_for(exc: Exception) -> int:
     if isinstance(exc, HTTPException):
         return exc.status_code
-    if isinstance(exc, UpstreamOverloaded):
-        # Anthropic answers 529; OpenAI-compatible clients expect 503.
-        return 503
+    # UpstreamOverloaded maps to 503 here (Anthropic envelopes use 529).
     return classify_error_status(exc)
 
 
@@ -53,7 +37,7 @@ def openai_error_payload(exc: Exception) -> dict[str, Any]:
     status_code = _status_code_for(exc)
     error: dict[str, Any] = {
         "message": fact.message,
-        "type": _ERROR_TYPES.get(status_code, "api_error"),
+        "type": ERROR_TYPES.get(status_code, "api_error"),
         "code": fact.code,
     }
     upstream: dict[str, Any] = {}
@@ -71,8 +55,8 @@ def openai_error_payload(exc: Exception) -> dict[str, Any]:
 def openai_error_response(exc: Exception) -> JSONResponse:
     """Build the OpenAI-protocol response for a gateway failure."""
     headers: dict[str, str] = {}
-    if isinstance(exc, HTTPStatusError) and exc.response.headers.get("retry-after"):
-        headers["Retry-After"] = exc.response.headers["retry-after"]
+    if retry_after := upstream_retry_after(exc):
+        headers["Retry-After"] = retry_after
     return JSONResponse(
         status_code=_status_code_for(exc),
         content=openai_error_payload(exc),

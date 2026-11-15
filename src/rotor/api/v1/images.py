@@ -10,6 +10,7 @@ from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, Request, Response
 from httpx import AsyncClient, HTTPStatusError, RequestError, Timeout
+from rotor.core.http_client import UPSTREAM_LIMITS
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -438,7 +439,7 @@ async def generate_image(
             original_error=f"Required capabilities: {sorted(required)}",
         )
 
-    http_client = AsyncClient(timeout=_timeout())
+    http_client = AsyncClient(timeout=_timeout(), limits=UPSTREAM_LIMITS)
     streaming_response_returned = False
     last_error: Exception | None = None
     fallback_reason: str | None = None

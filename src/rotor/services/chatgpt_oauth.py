@@ -37,7 +37,7 @@ CODEX_CLI_UA = "codex_cli_rs/0.44.0 (Linux 6.12; arm64) unknown (unknown)"
 CATALOG_CLIENT_VERSION = "0.161.0"
 HTTP_TIMEOUT = 15.0
 LOGIN_LIFETIME = 900.0
-REFRESH_WINDOW = 300.0
+REFRESH_WINDOW = 1800.0
 LOCK_LIFETIME = 60.0
 _SESSION_SECRETS = dict(
     device_auth_id=None, user_code=None, access_token=None, refresh_token=None,

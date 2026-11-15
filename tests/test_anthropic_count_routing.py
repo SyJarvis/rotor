@@ -173,7 +173,7 @@ def test_native_cooldown_cannot_be_bypassed_by_estimation(state):
     assert state.seen == []
 
 
-def test_successful_count_does_not_recover_generation_probe_or_release_other_attempt(state):
+def test_successful_count_does_not_create_cooldown_or_release_other_attempt(state):
     state.channels[:] = state.channels[:1]
     candidate = state.channels[0]
     healthy = state.engine.admit_attempt("model", candidate)
@@ -182,17 +182,15 @@ def test_successful_count_does_not_recover_generation_probe_or_release_other_att
     assert response.status_code == 200
     score = state.engine.adaptive.score("model", candidate)
     assert score.observations == 0 and score.load_utility == 0.5
-    assert state.engine.admit_attempt("model", candidate) is None
-    assert state.engine.retry_after_seconds("model", [candidate]) == 30
-    state.now[0] += 30
+    assert state.engine.routing_state() == []
     probe = state.engine.admit_attempt("model", candidate)
-    assert probe.is_probe
+    assert probe is not None and not probe.is_probe
     state.engine.release_attempt(probe)
     state.engine.release_attempt(healthy)
     assert state.engine.adaptive.score("model", candidate).load_utility == 1
 
 
-def test_count_cancellation_releases_probe_and_http_client(state):
+def test_count_cancellation_releases_admission_without_new_cooldown(state):
     state.channels[:] = state.channels[:1]
     candidate = state.channels[0]
     state.engine.mark_unavailable("model", candidate, 0)
@@ -204,8 +202,10 @@ def test_count_cancellation_releases_probe_and_http_client(state):
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(state.call())
     assert state.engine.adaptive.score("model", candidate).load_utility == 1
-    assert state.engine.admit_attempt("model", candidate) is None
-    assert state.engine.retry_after_seconds("model", [candidate]) == 30
+    assert state.engine.routing_state() == []
+    permit = state.engine.admit_attempt("model", candidate)
+    assert permit is not None
+    state.engine.release_attempt(permit)
 
 
 def test_candidate_initialization_failure_does_not_block_other_native_count(state, monkeypatch):

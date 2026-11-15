@@ -85,6 +85,11 @@ class ChatCompletionRequest(BaseModel):
         exclude=True,
     )
     responses_prompt_cache_key: Optional[str] = Field(default=None, exclude=True)
+    # Cache-affinity identifier sent to Responses-compatible upstreams that
+    # partition their prompt cache by session. Stable per conversation and
+    # unique across conversations, so multi-turn traffic reuses one cache
+    # bucket while unrelated conversations never collide.
+    responses_session_id: Optional[str] = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def move_system_messages_to_prefix(self) -> "ChatCompletionRequest":

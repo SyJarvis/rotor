@@ -5,8 +5,7 @@ services:
     build: .
     container_name: rotor-new
     ports:
-      - "127.0.0.1:8001:8000"
-      - "192.168.4.1:8001:8000"
+      - "0.0.0.0:8001:8000"
     environment:
       - ROTOR_ADMIN_SESSION_IDLE_SECONDS=86400
       - ROTOR_ADMIN_SESSION_TTL_SECONDS=1296000

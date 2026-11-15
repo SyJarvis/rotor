@@ -112,10 +112,22 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:8000"]
 
     # Request Settings
-    REQUEST_TIMEOUT: float = 120.0
+    # Read timeout = max silence between upstream data chunks, not total
+    # request duration (hy4 has succeeded in 177s). Reasoning models can
+    # think for minutes before emitting the first token, so a short value
+    # aborts requests that are still alive upstream. 600s keeps long
+    # silences from being mistaken for a dead connection.
+    REQUEST_TIMEOUT: float = 600.0
     CONNECT_TIMEOUT: float = 10.0
     WRITE_TIMEOUT: float = 30.0
     POOL_TIMEOUT: float = 10.0
+
+    # Concurrency: process-local cap on simultaneous upstream requests per
+    # model+channel. ChatGPT Codex OAuth accounts drop a second concurrent
+    # /codex/responses stream (surfaced as RemoteProtocolError), so codex
+    # defaults to 1. Override per channel with extra.max_in_flight.
+    CHANNEL_MAX_IN_FLIGHT: int = 4
+    CODEX_MAX_IN_FLIGHT: int = 1
 
     # Logging
     LOG_LEVEL: str = "INFO"

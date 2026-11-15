@@ -200,9 +200,10 @@ async def health():
 
 
 @app.get("/")
+@app.get("/index.html", include_in_schema=False)
 async def frontend_index():
     """Serve the admin frontend index."""
-    return FileResponse(FRONTEND_DIR / "index.html")
+    return FileResponse(FRONTEND_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 # Include routers

@@ -392,6 +392,19 @@ class _GatewayTransport(httpx2.AsyncBaseTransport):
 
 
 def _failure_message(exc: Exception) -> str:
+    if isinstance(exc, APIStatusError) and isinstance(exc.body, dict):
+        # SDK versions differ in whether message includes upstream details.
+        # Include only the provider message, not arbitrary upstream fields.
+        body = exc.body
+        upstream = body.get("upstream")
+        upstream_body = upstream.get("body") if isinstance(upstream, dict) else None
+        error = upstream_body.get("error") if isinstance(upstream_body, dict) else None
+        detail = error.get("message") if isinstance(error, dict) else None
+        message = body.get("message")
+        message = message if isinstance(message, str) else "模型请求失败"
+        if isinstance(detail, str) and detail and detail != message:
+            message = f"{message}: {detail[:4000]}"
+        return f"Error code: {exc.status_code} - {message[:8000]}"
     if isinstance(exc, APIError):
         return exc.message
     return str(exc) or "模型请求失败"

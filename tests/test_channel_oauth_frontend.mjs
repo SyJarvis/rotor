@@ -24,8 +24,63 @@ const savedChannel = (overrides = {}) => ({
   base_url: 'https://chatgpt.com/backend-api/codex', models: ['gpt-5'],
   extra: { request_path: '/responses', auth_type: 'bearer' }, ...overrides,
 });
+const openCodeChannel = (overrides = {}) => savedChannel({
+  id: 4, name: 'opencode-go', type: 'opencode', auth_type: 'api_key', protocol: 'openai',
+  base_url: 'https://opencode.ai/zen/go/v1', enabled: true, ...overrides,
+});
+const commandGoatChannel = (overrides = {}) => savedChannel({
+  id: 6, name: 'command-goat', type: 'command', auth_type: 'api_key', protocol: 'openai',
+  base_url: 'https://api.commandcode.ai/provider/v1', enabled: true, ...overrides,
+});
+const seconds = (value) => Date.parse(value) / 1000;
+const commandGoatUsage = () => ({
+  plan: 'individual-goat', subscription_status: 'active', channel_enabled: true, allowed: null, limit_reached: false,
+  command_goat: {
+    subscription: {
+      plan_id: 'individual-goat', status: 'active', current_period_start: '2026-10-16T00:13:24.000Z',
+      current_period_end: '2026-11-16T00:13:24.000Z', cancel_at_period_end: false, canceled_at: null, ended_at: null,
+    },
+    credits: { monthly_remaining: 65.691274327, purchased_remaining: 0, free_remaining: 0 },
+    window_limited: true,
+    five_hour: { used: 0.0035141575, cap: 14, exceeded: false, reset_at: 1793358967.687 },
+    weekly: { used: 0.0035141575, cap: 35, exceeded: false, reset_at: 1793945767.687 },
+  },
+});
+const openCodeUsage = () => ({
+  plan: 'go', subscription_status: 'active', channel_enabled: true, allowed: null, limit_reached: false,
+  fetched_at: seconds('2026-10-30T06:03:18Z'),
+  opencode: {
+    sources: { usage: 'ok', subscription: 'ok', billing: 'forbidden' },
+    usage: {
+      five_hour: { status: 'ok', used_percent: 0, reset_at: seconds('2026-10-30T11:03:18.213Z') },
+      weekly: { status: 'ok', used_percent: 0, reset_at: seconds('2026-11-02T00:00:00Z') },
+      monthly: { status: 'ok', used_percent: 0, reset_at: seconds('2026-11-30T03:01:14Z') },
+    },
+    subscription: {
+      product: 'go', renewal_product: 'go', use_balance: false, cancel_at_period_end: false,
+      renewal_pending: false, resumability: 'renewing',
+      access: {
+        starts_at: seconds('2026-10-30T03:01:14Z'), ends_at: seconds('2026-11-30T03:01:14Z'), cancel_at_period_end: false,
+        five_hour: { starts_at: null, reset_at: null, limit_microcents: '1200000000', used_microcents: '0' },
+        weekly: { starts_at: seconds('2026-10-26T00:00:00Z'), reset_at: seconds('2026-11-02T00:00:00Z'), limit_microcents: '3000000000', used_microcents: '0' },
+        monthly: { starts_at: null, reset_at: seconds('2026-11-30T03:01:14Z'), limit_microcents: '6000000000', used_microcents: '0' },
+      },
+    },
+    billing: null,
+  },
+});
+const refreshQuota = (env, id = '4') => env.page.onClick({
+  dataset: {}, closest: (selector) => selector === '[data-channel-quota-refresh]' ? { dataset: { channelQuotaRefresh: id } } : null,
+});
+const loadCards = async (env) => { await env.page.load(); await new Promise(setImmediate); return env.getNode('channels').innerHTML; };
+const usagePanel = (html) => {
+  const start = html.indexOf('<div class="oauth-block');
+  const end = html.indexOf('<div class="chips">', start);
+  assert.ok(start >= 0 && end > start, 'rendered usage panel exists before model chips');
+  return html.slice(start, end);
+};
 
-async function environment({ language = 'en', start = session(), parses = [], completes = [], probes = [], confirmResult = true, failSave = 0, onSave = null, listed = [], check = {}, checks = [], details = [] } = {}) {
+async function environment({ language = 'en', start = session(), parses = [], completes = [], probes = [], confirmResult = true, failSave = 0, onSave = null, listed = [], check = {}, checks = [], details = [], usages = [], withoutObjectHasOwn = false } = {}) {
   const nodes = new Map();
   const timers = [];
   const calls = [];
@@ -90,11 +145,13 @@ async function environment({ language = 'en', start = session(), parses = [], co
       }
     },
   });
+  if (withoutObjectHasOwn) vm.runInContext('Object.hasOwn = undefined', context);
   const pendingParses = [...parses];
   const pendingCompletes = [...completes];
   const pendingProbes = [...probes];
   const pendingChecks = [...checks];
   const pendingDetails = [...details];
+  const pendingUsages = [...usages];
   const bindings = {
     api: async (url, options = {}) => {
       const body = options.body ? JSON.parse(options.body) : null;
@@ -130,6 +187,11 @@ async function environment({ language = 'en', start = session(), parses = [], co
         return typeof value === 'function' ? value() : value;
       }
       if (url.endsWith('/routing-state')) return { cooldowns: [] };
+      if (url.includes('/oauth/usage')) {
+        const value = pendingUsages.shift() ?? {};
+        if (value instanceof Error) throw value;
+        return value;
+      }
       if (options.method === 'POST' || options.method === 'PUT') {
         if (failSave-- > 0) throw new Error('Save temporarily failed');
         if (onSave) return onSave();
@@ -147,7 +209,7 @@ async function environment({ language = 'en', start = session(), parses = [], co
     parseJson: (text, fallback) => text?.trim() ? JSON.parse(text) : fallback,
     parseCsv: (text) => (text || '').split(',').map((part) => part.trim()).filter(Boolean),
     escapeHtml: (text) => String(text ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;'),
-    badge: (text) => `<span>${text}</span>`, statusBadge: () => '', toast: (...args) => toasts.push(args),
+    badge: (text) => `<span>${text}</span>`, statusBadge: (enabled) => `<span data-status="${enabled}">${locale[enabled ? 'enable' : 'disable']}</span>`, toast: (...args) => toasts.push(args),
   };
   const helper = new vm.SourceTextModule(helperSource, { context });
   const channels = new vm.SourceTextModule(channelsSource, { context });
@@ -206,6 +268,636 @@ async function environment({ language = 'en', start = session(), parses = [], co
     probes: () => calls.filter((entry) => entry.url.endsWith('/probe-models')),
   };
 }
+
+for (const language of ['zh-CN', 'en']) {
+  test(`Command Goat renders the actual normalized snapshot and refreshes credits and windows (${language})`, async () => {
+    const refreshed = commandGoatUsage();
+    refreshed.command_goat.credits.purchased_remaining = 8.5;
+    refreshed.command_goat.five_hour = { used: 16, cap: 14, exceeded: true, reset_at: 1793359000 };
+    const env = await environment({ language, listed: [commandGoatChannel()], usages: [commandGoatUsage(), refreshed] });
+    const html = await loadCards(env);
+    const panel = usagePanel(html);
+    assert.match(panel, /command-goat-block/);
+    assert.match(panel, /individual-goat/);
+    for (const key of ['commandGoatSubscription', 'commandGoatActive', 'commandGoatPeriodEnd', 'commandGoatMonthly', 'commandGoatPurchased', 'commandGoatFree', 'oauthQuota5h', 'oauthQuotaWeek']) assert.ok(panel.includes(env.locale[key]), key);
+    assert.match(panel, /65\.691274327 credits/);
+    assert.match(panel, /0\.0035141575 \/ 14 credits/);
+    assert.match(panel, /0\.0035141575 \/ 35 credits/);
+    assert.match(panel, /0\.03%/);
+    assert.match(panel, /0\.01%/);
+    assert.equal((panel.match(/class="quota-bar"/g) || []).length, 2);
+    assert.ok(panel.includes(new Date('2026-11-16T00:13:24Z').toLocaleString()));
+    assert.ok(panel.includes(new Date(1793358967.687 * 1000).toLocaleString()));
+    assert.ok(!panel.includes(env.locale.commandGoatLimitReached));
+    assert.ok(!panel.includes(env.locale.oauthLimitReached));
+    assert.doesNotMatch(panel, /\$|USD|oauth-quota-error|oauth-quota-retry/);
+    assert.equal(env.calls.filter(({ url }) => url.endsWith('/6/oauth/usage')).length, 1);
+    await refreshQuota(env, '6');
+    const updated = env.getNode('channels').innerHTML;
+    assert.match(updated, /8\.5 credits/);
+    assert.match(updated, /16 \/ 14 credits/);
+    assert.match(updated, /width:100%/);
+    assert.ok(updated.includes(env.locale.commandGoatLimitReached));
+    assert.ok(!updated.includes(env.locale.oauthLimitReached));
+    assert.match(updated, /data-status="true"/);
+    assert.equal(env.calls.filter(({ url }) => url.endsWith('/6/oauth/usage?refresh=1')).length, 1);
+    assert.equal(env.saves().length, 0);
+    env.page.unload();
+  });
+
+  test(`Command Goat null subscription retains known balances and windows (${language})`, async () => {
+    const usage = commandGoatUsage();
+    usage.plan = null; usage.subscription_status = 'inactive'; usage.command_goat.subscription = null;
+    const env = await environment({ language, listed: [commandGoatChannel()], usages: [usage] });
+    const html = await loadCards(env);
+    const panel = usagePanel(html);
+    assert.ok(panel.includes(env.locale.oauthNoSubscription));
+    assert.match(panel, /65\.691274327 credits/);
+    assert.equal((panel.match(/class="quota-bar"/g) || []).length, 2);
+    assert.ok(!panel.includes(env.locale.commandGoatPeriodEnd));
+    assert.doesNotMatch(panel, /oauth-quota-error|oauth-quota-retry/);
+    assert.match(html, /data-status="true"/);
+    env.page.unload();
+  });
+
+  for (const [status, key] of [['active', 'commandGoatActive'], ['trialing', 'commandGoatTrialing'], ['past_due', 'commandGoatPastDue'], ['canceled', 'commandGoatCanceled'], ['unpaid', 'commandGoatUnpaid'], ['inactive', 'oauthNoSubscription']]) {
+    test(`Command Goat preserves subscription ${status} independently from availability (${language})`, async () => {
+      const usage = commandGoatUsage();
+      usage.command_goat.subscription.status = status; usage.subscription_status = status;
+      const env = await environment({ language, listed: [commandGoatChannel()], usages: [usage] });
+      const html = await loadCards(env);
+      assert.ok(usagePanel(html).includes(env.locale[key]));
+      assert.match(html, /65\.691274327 credits/);
+      assert.match(html, /data-status="true"/);
+      assert.equal(env.saves().length, 0);
+      env.page.unload();
+    });
+  }
+
+  test(`Command Goat planned cancellation does not claim the channel is stopped (${language})`, async () => {
+    const usage = commandGoatUsage();
+    usage.command_goat.subscription.cancel_at_period_end = true;
+    const env = await environment({ language, listed: [commandGoatChannel()], usages: [usage] });
+    const html = await loadCards(env);
+    const panel = usagePanel(html);
+    assert.ok(panel.includes(env.locale.commandGoatCancellationScheduled));
+    assert.ok(panel.includes(env.locale.commandGoatActive));
+    assert.ok(!panel.includes(env.locale.commandGoatCanceled));
+    assert.ok(!panel.includes(env.locale.oauthLimitReached));
+    assert.match(html, /data-status="true"/);
+    env.page.unload();
+  });
+
+  test(`Command Goat errors support retry and failed refresh does not reuse stale success (${language})`, async () => {
+    const env = await environment({ language, listed: [commandGoatChannel()], usages: [new Error('private key and upstream body'), commandGoatUsage(), new Error('another secret')] });
+    const initial = usagePanel(await loadCards(env));
+    assert.ok(initial.includes(env.locale.commandGoatFetchFailed));
+    assert.match(initial, /oauth-quota-retry/);
+    assert.doesNotMatch(initial, /private key|upstream body|quota-bar|credits/);
+    assert.ok(!initial.includes(env.locale.oauthNoSubscription));
+    await refreshQuota(env, '6');
+    assert.match(usagePanel(env.getNode('channels').innerHTML), /65\.691274327 credits/);
+    await refreshQuota(env, '6');
+    const failed = usagePanel(env.getNode('channels').innerHTML);
+    assert.ok(failed.includes(env.locale.commandGoatFetchFailed));
+    assert.doesNotMatch(failed, /another secret|quota-bar|65\.691274327/);
+    assert.ok(!failed.includes(env.locale.oauthNoSubscription));
+    env.page.unload();
+  });
+
+  test(`Command Goat missing values do not become zero credits or epoch dates (${language})`, async () => {
+    const usage = commandGoatUsage();
+    usage.command_goat.subscription.current_period_end = null;
+    usage.command_goat.credits = { monthly_remaining: null, purchased_remaining: '0', free_remaining: false };
+    usage.command_goat.five_hour = null; usage.command_goat.weekly = {};
+    const env = await environment({ language, listed: [commandGoatChannel()], usages: [usage] });
+    const panel = usagePanel(await loadCards(env));
+    assert.ok(panel.includes(env.locale.commandGoatUnknown));
+    assert.ok(panel.includes(env.locale.commandGoatCapUnknown));
+    assert.doesNotMatch(panel, /0 credits|0%|quota-bar|1970|Invalid Date/);
+    assert.ok(!panel.includes(env.locale.commandGoatPeriodEnd));
+    assert.ok(!panel.includes(env.locale.commandGoatResetsAt));
+    env.page.unload();
+  });
+}
+
+for (const status of ['future-plan-state', 'constructor', '<img src=x onerror="steal()">']) {
+  test(`Command Goat unknown status is retained as escaped text: ${status}`, async () => {
+    const usage = commandGoatUsage();
+    usage.command_goat.subscription.status = status;
+    usage.command_goat.subscription.plan_id = '<script>private()</script>';
+    usage.command_goat.subscription.customer_id = 'private-id';
+    usage.command_goat.summary = { total_cost: 987654321 };
+    const env = await environment({ listed: [commandGoatChannel()], usages: [usage] });
+    const panel = usagePanel(await loadCards(env));
+    assert.ok(panel.includes(status.replaceAll('<', '&lt;').replaceAll('"', '&quot;')));
+    assert.match(panel, /&lt;script>private\(\)&lt;\/script>/);
+    assert.doesNotMatch(panel, /<script|<img|private-id|987654321|Active|No subscription/);
+    env.page.unload();
+  });
+}
+
+for (const cap of [0, -1, null, undefined, '14', false, NaN, Infinity]) {
+  test(`Command Goat invalid or nonpositive cap never invents a progress percentage: ${cap}`, async () => {
+    const usage = commandGoatUsage();
+    usage.command_goat.five_hour = { used: 3.5, cap, exceeded: false, reset_at: null };
+    usage.command_goat.weekly = null;
+    const env = await environment({ listed: [commandGoatChannel()], usages: [usage] });
+    const panel = usagePanel(await loadCards(env));
+    assert.match(panel, /3\.5 credits/);
+    assert.ok(panel.includes(env.locale.commandGoatCapUnknown));
+    assert.doesNotMatch(panel, /quota-bar|0%|NaN|Infinity|\/ 14 credits/);
+    env.page.unload();
+  });
+}
+
+for (const reset_at of [null, 0, undefined, false, '1793358967', NaN, Infinity]) {
+  test(`Command Goat unknown reset does not produce a date: ${reset_at}`, async () => {
+    const usage = commandGoatUsage();
+    usage.command_goat.five_hour.reset_at = reset_at;
+    usage.command_goat.weekly.reset_at = reset_at;
+    const env = await environment({ listed: [commandGoatChannel()], usages: [usage] });
+    const panel = usagePanel(await loadCards(env));
+    assert.ok(!panel.includes(env.locale.commandGoatResetsAt));
+    assert.doesNotMatch(panel, /1970|Invalid Date/);
+    assert.equal((panel.match(/class="quota-bar"/g) || []).length, 2);
+    env.page.unload();
+  });
+}
+
+for (const [limited, fiveExceeded, weekExceeded, expected] of [[false, false, false, false], [true, false, false, true], [false, true, false, true], [false, false, true, true], ['true', 'true', 'true', false]]) {
+  test(`Command Goat exhaustion uses explicit flags: ${limited}/${fiveExceeded}/${weekExceeded}`, async () => {
+    const usage = commandGoatUsage();
+    usage.limit_reached = limited;
+    usage.command_goat.five_hour.exceeded = fiveExceeded;
+    usage.command_goat.weekly.exceeded = weekExceeded;
+    const env = await environment({ listed: [commandGoatChannel()], usages: [usage] });
+    const html = await loadCards(env);
+    assert.equal(usagePanel(html).includes(env.locale.commandGoatLimitReached), expected);
+    assert.ok(!html.includes(env.locale.oauthLimitReached));
+    assert.match(html, /data-status="true"/);
+    assert.equal(env.saves().length, 0);
+    env.page.unload();
+  });
+}
+
+for (const [overrides, shouldQuery] of [
+  [{}, true], [{ base_url: 'https://API.COMMANDCODE.AI:443/provider/v1/' }, true],
+  [{ base_url: 'https://api.commandcode.ai' }, true], [{ base_url: 'https://api.commandcode.ai:00443/' }, true],
+  [{ base_url: 'https://api.commandcode.ai:/any/path?provider=zhipu#usage' }, true],
+  [{ base_url: 'https://api.commandcode.ai?target=opencode.ai/zen/go/v1' }, true],
+  [{ base_url: 'https://api.commandcode.ai#fragment' }, true], [{ protocol: 'openai_responses' }, true],
+  ...['openai', 'anthropic', 'opencode', 'unknown'].map((type) => [{ type }, false]),
+  [{ auth_type: null }, false],
+  ...[
+    'http://api.commandcode.ai/provider/v1', 'https://api.commandcode.ai:8443/provider/v1',
+    'https://api.commandcode.ai.evil.test/provider/v1', 'https://api.commandcode.ai./provider/v1',
+    'https://user@api.commandcode.ai/provider/v1', 'https://@api.commandcode.ai/provider/v1',
+    'https://api.commandcode.ai@evil.test', 'https://evil.test/api.commandcode.ai',
+    'https://%61pi.commandcode.ai/provider/v1', 'https://api.commandcode.ai:invalid/',
+    'https://api.commandcode.ai\\evil/path', 'https://[invalid', '', 'not a URL', null,
+  ].map((base_url) => [{ base_url }, false]),
+]) {
+  test(`Command Goat queries require the selected provider and exact HTTPS origin: ${JSON.stringify(overrides)}`, async () => {
+    const env = await environment({ listed: [commandGoatChannel(overrides)], usages: [commandGoatUsage()] });
+    const html = await loadCards(env);
+    assert.equal(env.calls.filter(({ url }) => url.includes('/oauth/usage')).length, shouldQuery ? 1 : 0);
+    if (!shouldQuery) {
+      assert.doesNotMatch(html, /command-goat-block|data-channel-quota-refresh/);
+      await refreshQuota(env, '6');
+      assert.equal(env.calls.filter(({ url }) => url.includes('/oauth/usage')).length, 0);
+    }
+    env.page.unload();
+  });
+}
+
+test('Command Goat cached usage is discarded when provider selection changes', async () => {
+  const channel = commandGoatChannel();
+  const env = await environment({ listed: [channel], usages: [commandGoatUsage()] });
+  assert.match(await loadCards(env), /command-goat-block/);
+  channel.type = 'openai';
+  assert.doesNotMatch(await loadCards(env), /command-goat-block|data-channel-quota-refresh/);
+  assert.equal(env.calls.filter(({ url }) => url.includes('/oauth/usage')).length, 1);
+  env.page.unload();
+});
+
+for (const language of ['zh-CN', 'en']) {
+  test(`OpenCode renders actual partial snapshot and refreshes monthly usage (${language})`, async () => {
+    const refreshed = openCodeUsage();
+    refreshed.opencode.usage.monthly = { ...refreshed.opencode.usage.monthly, used_percent: 100, status: 'rate-limited' };
+    refreshed.limit_reached = true;
+    refreshed.opencode.subscription.use_balance = true;
+    const env = await environment({ language, listed: [openCodeChannel()], usages: [openCodeUsage(), refreshed] });
+    const html = await loadCards(env);
+    assert.match(html, /opencode-block/);
+    for (const key of ['openCodeSubscription', 'openCodeActive', 'openCodePaidUntil', 'openCodeExtraUsage', 'openCodeOff', 'oauthQuota5h', 'oauthQuotaWeek', 'openCodeMonthly', 'openCodeBalance', 'openCodeForbidden']) {
+      assert.ok(html.includes(env.locale[key]), key);
+    }
+    assert.equal((html.match(/class="quota-bar"/g) || []).length, 3);
+    assert.ok(html.includes(new Date(seconds('2026-11-30T03:01:14Z') * 1000).toLocaleString()));
+    assert.doesNotMatch(usagePanel(html), /oauth-quota-error|oauth-quota-retry|undefined|forbidden/);
+    assert.equal(env.calls.filter(({ url }) => url.endsWith('/4/oauth/usage')).length, 1);
+    await refreshQuota(env);
+    const updated = env.getNode('channels').innerHTML;
+    assert.match(updated, /width:100%/);
+    assert.ok(updated.includes(env.locale.openCodeLimitReached));
+    assert.ok(updated.includes(env.locale.openCodeOn));
+    assert.ok(!updated.includes(env.locale.oauthLimitReached));
+    assert.match(updated, /data-status="true"/);
+    assert.equal(env.calls.filter(({ url }) => url.endsWith('/4/oauth/usage?refresh=1')).length, 1);
+    assert.equal(env.saves().length, 0);
+    env.page.unload();
+  });
+
+  test(`OpenCode whole-query errors and failed refresh never show stale success (${language})`, async () => {
+    const env = await environment({ language, listed: [openCodeChannel()], usages: [new Error('secret upstream body'), openCodeUsage(), new Error('second secret')] });
+    const html = await loadCards(env);
+    assert.ok(html.includes(env.locale.openCodeFetchFailed));
+    assert.match(html, /oauth-quota-retry/);
+    assert.doesNotMatch(html, /secret|quota-bar/);
+    await refreshQuota(env);
+    assert.match(env.getNode('channels').innerHTML, /quota-bar/);
+    await refreshQuota(env);
+    const failed = env.getNode('channels').innerHTML;
+    assert.ok(failed.includes(env.locale.openCodeFetchFailed));
+    assert.doesNotMatch(failed, /quota-bar|second secret/);
+    assert.match(failed, /data-status="true"/);
+    env.page.unload();
+  });
+
+  for (const [state, key] of [['active', 'openCodeActive'], ['pending', 'openCodePending'], ['expired', 'openCodeExpired'], ['inactive', 'oauthNoSubscription'], [null, 'openCodeUnknown']]) {
+    test(`OpenCode subscription state ${state} is independent from channel enabled (${language})`, async () => {
+      const usage = openCodeUsage();
+      usage.subscription_status = state;
+      if (state === 'inactive') { usage.opencode.subscription = null; usage.opencode.sources.usage = 'forbidden'; usage.opencode.usage = null; }
+      const env = await environment({ language, listed: [openCodeChannel()], usages: [usage] });
+      const html = await loadCards(env);
+      assert.ok(html.includes(env.locale[key]));
+      assert.match(html, /data-status="true"/);
+      if (state === 'inactive') assert.doesNotMatch(html, /quota-bar|Paid access ends|付费期截止/);
+      assert.equal(env.saves().length, 0);
+      env.page.unload();
+    });
+  }
+
+  test(`OpenCode distinguishes no subscription from a record without paid access (${language})`, async () => {
+    const noAccess = openCodeUsage();
+    noAccess.subscription_status = 'inactive';
+    noAccess.opencode.subscription.access = null;
+    const noSubscription = openCodeUsage();
+    noSubscription.subscription_status = 'inactive';
+    noSubscription.opencode.subscription = null;
+    const env = await environment({ language, listed: [openCodeChannel()], usages: [noAccess, noSubscription] });
+    let panel = usagePanel(await loadCards(env));
+    assert.ok(panel.includes(env.locale.openCodeNoPaidAccess));
+    assert.ok(panel.includes('go'));
+    assert.ok(panel.includes(env.locale.openCodeOff));
+    assert.ok(!panel.includes(env.locale.oauthNoSubscription));
+    assert.equal((panel.match(/class="quota-bar"/g) || []).length, 3);
+    await refreshQuota(env);
+    panel = usagePanel(env.getNode('channels').innerHTML);
+    assert.ok(panel.includes(env.locale.oauthNoSubscription));
+    assert.ok(!panel.includes(env.locale.openCodeNoPaidAccess));
+    env.page.unload();
+  });
+
+  for (const source of ['unauthorized', 'forbidden', 'unavailable', 'invalid_response', 'error']) {
+    test(`OpenCode ${source} subscription preserves successful windows (${language})`, async () => {
+      const usage = openCodeUsage();
+      usage.subscription_status = null;
+      usage.opencode.sources.subscription = source;
+      usage.opencode.subscription = null;
+      const env = await environment({ language, listed: [openCodeChannel()], usages: [usage] });
+      const html = await loadCards(env);
+      const key = source === 'unauthorized' ? 'openCodeUnauthorized' : source === 'forbidden' ? 'openCodeForbidden' : 'openCodeUnavailable';
+      assert.ok(html.includes(env.locale[key]));
+      assert.ok(!html.includes(env.locale.oauthNoSubscription));
+      assert.ok(!html.includes(env.locale.openCodeActive));
+      assert.equal((html.match(/class="quota-bar"/g) || []).length, 3);
+      assert.doesNotMatch(html, /oauth-quota-error|oauth-quota-retry/);
+      env.page.unload();
+    });
+  }
+
+  test(`OpenCode unavailable usage preserves subscription amounts without invented progress (${language})`, async () => {
+    const usage = openCodeUsage();
+    usage.opencode.sources.usage = 'unavailable'; usage.opencode.usage = null;
+    const env = await environment({ language, listed: [openCodeChannel()], usages: [usage] });
+    const html = await loadCards(env);
+    assert.ok(html.includes(env.locale.openCodeUnavailable));
+    assert.ok(html.includes(env.locale.openCodeActive));
+    assert.match(html, /\$0\.00 \/ \$12\.00/);
+    assert.match(html, /\$0\.00 \/ \$30\.00/);
+    assert.match(html, /\$0\.00 \/ \$60\.00/);
+    assert.doesNotMatch(usagePanel(html), /quota-bar|0%|Invalid Date/);
+    assert.equal((html.match(new RegExp(env.locale.openCodeResetsAt, 'g')) || []).length, 2);
+    env.page.unload();
+  });
+
+  test(`OpenCode missing windows and dates stay unknown (${language})`, async () => {
+    const usage = openCodeUsage();
+    usage.opencode.usage = { five_hour: { used_percent: null, reset_at: null }, weekly: {}, monthly: { used_percent: '0', reset_at: 0 } };
+    usage.opencode.subscription.access = null;
+    const env = await environment({ language, listed: [openCodeChannel()], usages: [usage] });
+    const html = await loadCards(env);
+    assert.ok(html.includes(env.locale.openCodeUnknown));
+    assert.doesNotMatch(usagePanel(html), /quota-bar|0%|1970|Invalid Date/);
+    assert.ok(!html.includes(env.locale.openCodePaidUntil));
+    assert.ok(!html.includes(env.locale.openCodeResetsAt));
+    env.page.unload();
+  });
+
+  test(`missing subscription is a normal status and refresh can restore plan windows (${language})`, async () => {
+    const env = await environment({
+      language,
+      listed: [savedChannel({ enabled: true, auth_type: 'api_key', type: 'zhipu', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
+      usages: [
+        { subscription_status: 'inactive', channel_enabled: false, plan: null, allowed: false, limit_reached: null, primary: null, secondary: null },
+        { channel_enabled: false, plan: 'pro', primary: { used_percent: 12 }, secondary: { used_percent: 34 } },
+      ],
+    });
+    await env.page.load();
+    await new Promise(setImmediate);
+    const html = env.getNode('channels').innerHTML;
+    assert.match(html, language === 'zh-CN' ? /未订阅/ : /No subscription/);
+    assert.doesNotMatch(html, /quota-bar|oauth-quota-error|oauth-quota-retry/);
+    assert.match(html, /data-channel-quota-refresh="7"/);
+    assert.match(html, /data-status="false"/);
+    await env.page.onClick({ dataset: {}, closest: (selector) => selector === '[data-channel-menu]' ? { dataset: { channelMenu: '7' } } : null });
+    assert.match(env.getNode('channels').innerHTML, /data-channel-toggle="7" data-enabled="false"/);
+    await env.page.onClick({ dataset: {}, closest: (selector) => selector === '[data-channel-quota-refresh]' ? { dataset: { channelQuotaRefresh: '7' } } : null });
+    assert.ok(env.calls.some(({ url }) => url.endsWith('/oauth/usage?refresh=1')));
+    const renewed = env.getNode('channels').innerHTML;
+    assert.match(renewed, /quota-bar/);
+    assert.match(renewed, /12%/);
+    assert.match(renewed, /34%/);
+    assert.doesNotMatch(renewed, /未订阅|No subscription/);
+    assert.match(renewed, /data-status="false"/);
+    env.page.unload();
+  });
+
+  test(`quota fetch errors still offer retry (${language})`, async () => {
+    const env = await environment({
+      language,
+      listed: [savedChannel({ auth_type: 'api_key', type: 'zhipu', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
+      usages: [new Error('authentication failed')],
+    });
+    await env.page.load();
+    await new Promise(setImmediate);
+    const html = env.getNode('channels').innerHTML;
+    assert.match(html, language === 'zh-CN' ? /额度获取失败/ : /Usage fetch failed/);
+    assert.match(html, /oauth-quota-retry/);
+    assert.doesNotMatch(html, /未订阅|No subscription/);
+    env.page.unload();
+  });
+}
+
+for (const [overrides, shouldQuery] of [
+  [{}, true],
+  [{ base_url: 'https://OPENCODE.AI:443/zen/go/v1/' }, true],
+  [{ base_url: 'https://opencode.ai:00443/zen/go/v1' }, true],
+  [{ base_url: 'https://opencode.ai:/zen/go/v1' }, true],
+  [{ protocol: 'openai_responses' }, true],
+  ...['openai', 'deepseek', 'command', 'unknown'].map((type) => [{ type }, false]),
+  [{ auth_type: null }, false],
+  ...[
+    'http://opencode.ai/zen/go/v1', 'https://opencode.ai:8443/zen/go/v1',
+    'https://opencode.ai.evil.test/zen/go/v1', 'https://opencode.ai./zen/go/v1',
+    'https://user@opencode.ai/zen/go/v1', 'https://@opencode.ai/zen/go/v1',
+    'https://opencode.ai/zen/v1', 'https://opencode.ai/inference/v1',
+    'https://opencode.ai/zen/go/v1/models', 'https://opencode.ai/ZEN/go/v1',
+    'https://opencode.ai/zen/go/v1?', 'https://opencode.ai/zen/go/v1#',
+    ' https://opencode.ai/zen/go/v1', 'https://opencode.ai/zen/go/v1\n',
+    'https://open\tcode.ai/zen/go/v1', 'https://opencode.ai/zen/go/./v1',
+    'https://%6fpencode.ai/zen/go/v1', 'https://opencode.ai\\zen/go/v1',
+    '', 'not a URL',
+  ].map((base_url) => [{ base_url }, false]),
+]) {
+  test(`OpenCode queries only the selected provider and exact official Go base: ${JSON.stringify(overrides)}`, async () => {
+    const env = await environment({ listed: [openCodeChannel(overrides)], usages: [openCodeUsage()] });
+    const html = await loadCards(env);
+    assert.equal(env.calls.filter(({ url }) => url.includes('/oauth/usage')).length, shouldQuery ? 1 : 0);
+    if (!shouldQuery) {
+      assert.doesNotMatch(html, /opencode-block|data-channel-quota-refresh/);
+      await refreshQuota(env);
+      assert.equal(env.calls.filter(({ url }) => url.includes('/oauth/usage')).length, 0);
+    }
+    env.page.unload();
+  });
+}
+
+for (const [amount, expected] of [
+  ['90071992547409931234567890', '$900719925474099312.3456789'],
+  ['-123456789', '-$1.23456789'], ['000000001', '$0.00000001'], ['0', '$0.00'],
+  ['-000000000', '$0.00'], [null, 'Unknown'], ['1e8', 'Unknown'], [100000000, 'Unknown'],
+]) {
+  test(`OpenCode available balance keeps decimal-string precision: ${amount}`, async () => {
+    const usage = openCodeUsage();
+    usage.opencode.sources.billing = 'ok'; usage.opencode.billing = { available_microcents: amount };
+    const env = await environment({ listed: [openCodeChannel()], usages: [usage] });
+    const html = await loadCards(env);
+    assert.ok(html.includes(`<span class="muted">Available balance:</span> ${expected}`));
+    assert.doesNotMatch(html, /Permission denied|NaN|Infinity/);
+    env.page.unload();
+  });
+}
+
+test('OpenCode unknown product is escaped and unrecognized upstream fields are not rendered', async () => {
+  const usage = openCodeUsage();
+  usage.opencode.subscription.product = '<img src=x onerror="leak()">';
+  usage.opencode.subscription.resumability = 'secret-resumability';
+  usage.opencode.subscription.customer_id = 'private-customer';
+  const env = await environment({ listed: [openCodeChannel()], usages: [usage] });
+  const html = await loadCards(env);
+  assert.match(html, /&lt;img src=x onerror=&quot;leak\(\)&quot;/);
+  assert.doesNotMatch(html, /<img|secret-resumability|private-customer/);
+  env.page.unload();
+});
+
+test('OpenCode paid access date is distinct from the monthly window reset', async () => {
+  const usage = openCodeUsage();
+  usage.opencode.subscription.access.ends_at = seconds('2026-12-15T12:34:56Z');
+  const env = await environment({ listed: [openCodeChannel()], usages: [usage] });
+  const html = await loadCards(env);
+  assert.ok(html.includes(`Paid access ends:</span> ${new Date('2026-12-15T12:34:56Z').toLocaleString()}`));
+  assert.ok(html.includes(`Resets at: ${new Date('2026-11-30T03:01:14Z').toLocaleString()}`));
+  env.page.unload();
+});
+
+test('Channel usage assets have a complete updated cache version chain', async () => {
+  const auth = await readFile(new URL('auth.js', root), 'utf8');
+  assert.equal((appSource.match(/pages\/channels\.js\?v=17/g) || []).length, 2);
+  assert.match(auth, /app\.js\?v=73/);
+  assert.match(html, /auth\.js\?v=54/);
+  assert.match(html, /config\.js\?v=62/);
+  assert.match(html, /styles\.css\?v=52/);
+});
+
+for (const [type, base_url, shouldQuery] of [
+  ['zhipu', 'https://open.bigmodel.cn/api/coding/paas/v4', true],
+  ['zhipu', 'https://api.z.ai:443/api/anthropic', true],
+  ['openai', 'https://open.bigmodel.cn/api/coding/paas/v4', false],
+  ['anthropic', 'https://api.z.ai/api/anthropic', false],
+  ['command', 'https://open.bigmodel.cn/api/coding/paas/v4', false],
+  ['unknown', 'https://open.bigmodel.cn/api/coding/paas/v4', false],
+  ['zhipu', 'https://open.bigmodel.cn.evil.test/api/coding/paas/v4', false],
+  ['zhipu', 'http://open.bigmodel.cn/api/coding/paas/v4', false],
+  ['zhipu', 'https://api.z.ai:8443/api/anthropic', false],
+  ['zhipu', 'https://secret@api.z.ai/api/anthropic', false],
+  ['zhipu', 'https://elsewhere.test/?host=open.bigmodel.cn', false],
+  ['zhipu', 'not a URL', false],
+]) {
+  test(`quota panel requires selected zhipu provider and official HTTPS origin: ${type} ${base_url}`, async () => {
+    const env = await environment({
+      listed: [savedChannel({ type, auth_type: 'api_key', base_url })],
+      usages: [{ plan: 'pro', primary: { used_percent: 12 } }],
+    });
+    await env.page.load();
+    await new Promise(setImmediate);
+    assert.equal(env.calls.filter(({ url }) => url.includes('/oauth/usage')).length, shouldQuery ? 1 : 0);
+    if (!shouldQuery) assert.doesNotMatch(env.getNode('channels').innerHTML, /quota-bar|data-channel-quota-refresh/);
+    env.page.unload();
+  });
+}
+
+test('OAuth usage remains available independently of API-key provider matching', async () => {
+  const env = await environment({ listed: [savedChannel()] });
+  await env.page.load();
+  await new Promise(setImmediate);
+  assert.equal(env.calls.filter(({ url }) => url.includes('/oauth/usage')).length, 1);
+  env.page.unload();
+});
+
+test('quota panels settle independently and a slow channel does not block refresh', async () => {
+  let finishSlow;
+  const slow = new Promise((resolve) => { finishSlow = resolve; });
+  const updated = openCodeUsage();
+  updated.opencode.usage.monthly.used_percent = 79;
+  const env = await environment({
+    listed: [commandGoatChannel(), openCodeChannel()],
+    usages: [slow, openCodeUsage(), updated],
+  });
+  await env.page.load();
+  await new Promise(setImmediate);
+  let html = env.getNode('channels').innerHTML;
+  assert.match(html, /opencode-block/);
+  assert.ok(html.includes(env.locale.oauthQuotaLoading));
+  assert.doesNotMatch(html, /command-goat-block/);
+  // A second request for the loading channel is suppressed.
+  await refreshQuota(env, '6');
+  assert.equal(env.calls.filter(({ url }) => url.includes('/6/oauth/usage')).length, 1);
+  await refreshQuota(env);
+  html = env.getNode('channels').innerHTML;
+  assert.match(html, /79%/);
+  assert.ok(html.includes(env.locale.oauthQuotaLoading));
+  finishSlow(commandGoatUsage());
+  await new Promise(setImmediate);
+  html = env.getNode('channels').innerHTML;
+  assert.match(html, /command-goat-block/);
+  assert.match(html, /79%/);
+  assert.ok(!html.includes(env.locale.oauthQuotaLoading));
+  env.page.unload();
+});
+
+test('late quota failure from an earlier generation cannot overwrite or rerender the new page', async () => {
+  let failOld;
+  const old = new Promise((_, reject) => { failOld = reject; });
+  const env = await environment({
+    listed: [commandGoatChannel(), openCodeChannel()],
+    usages: [old, openCodeUsage(), commandGoatUsage(), openCodeUsage()],
+  });
+  await env.page.load();
+  await new Promise(setImmediate);
+  await env.page.load();
+  await new Promise(setImmediate);
+  const current = env.getNode('channels').innerHTML;
+  assert.match(current, /command-goat-block/);
+  assert.match(current, /opencode-block/);
+  failOld(new Error('old secret'));
+  await new Promise(setImmediate);
+  assert.equal(env.getNode('channels').innerHTML, current);
+  env.page.unload();
+});
+
+test('late quota success from an earlier generation cannot overwrite the latest data', async () => {
+  let finishOld;
+  const old = new Promise((resolve) => { finishOld = resolve; });
+  const latest = openCodeUsage();
+  latest.opencode.usage.monthly.used_percent = 79;
+  const env = await environment({ listed: [openCodeChannel()], usages: [old, latest] });
+  await env.page.load();
+  await env.page.load();
+  await new Promise(setImmediate);
+  const current = env.getNode('channels').innerHTML;
+  assert.match(current, /79%/);
+  finishOld(openCodeUsage());
+  await new Promise(setImmediate);
+  assert.equal(env.getNode('channels').innerHTML, current);
+  env.page.unload();
+});
+
+test('Command Goat status renders without Object.hasOwn support', async () => {
+  const usage = commandGoatUsage();
+  usage.command_goat.subscription.status = 'constructor';
+  const env = await environment({ withoutObjectHasOwn: true, listed: [commandGoatChannel()], usages: [usage] });
+  const panel = usagePanel(await loadCards(env));
+  assert.match(panel, /constructor/);
+  assert.match(panel, /65\.691274327 credits/);
+  env.page.unload();
+});
+
+test('quota completion after unload does not rerender the inactive page', async () => {
+  let finish;
+  const pending = new Promise((resolve) => { finish = resolve; });
+  const env = await environment({ listed: [openCodeChannel()], usages: [pending] });
+  await env.page.load();
+  assert.ok(env.getNode('channels').innerHTML.includes(env.locale.oauthQuotaLoading));
+  env.page.unload();
+  const current = env.getNode('channels').innerHTML;
+  finish(openCodeUsage());
+  await new Promise(setImmediate);
+  assert.equal(env.getNode('channels').innerHTML, current);
+});
+
+test('reloading channels discards a cached missing subscription after configuration changes', async () => {
+  const env = await environment({
+    listed: [savedChannel({ enabled: false, auth_type: 'api_key', type: 'zhipu', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
+    usages: [
+      { subscription_status: 'inactive', channel_enabled: false },
+      { channel_enabled: false, plan: 'pro', primary: { used_percent: 12 } },
+    ],
+  });
+  await env.page.load();
+  await new Promise(setImmediate);
+  assert.match(env.getNode('channels').innerHTML, /No subscription/);
+  await env.page.load();
+  await new Promise(setImmediate);
+  assert.equal(env.calls.filter(({ url }) => url.includes('/oauth/usage')).length, 2);
+  assert.doesNotMatch(env.getNode('channels').innerHTML, /No subscription/);
+  assert.match(env.getNode('channels').innerHTML, /12%/);
+  assert.match(env.getNode('channels').innerHTML, /data-status="false"/);
+  env.page.unload();
+});
+
+test('an old missing-subscription response cannot overwrite usage from a newer page load', async () => {
+  let finishOld;
+  const pending = new Promise((resolve) => { finishOld = resolve; });
+  const env = await environment({
+    listed: [savedChannel({ enabled: true, auth_type: 'api_key', type: 'zhipu', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' })],
+    usages: [pending, { channel_enabled: true, plan: 'pro', primary: { used_percent: 12 } }],
+  });
+  await env.page.load();
+  await env.page.load();
+  await new Promise(setImmediate);
+  const current = env.getNode('channels').innerHTML;
+  finishOld({ subscription_status: 'inactive', channel_enabled: false });
+  await new Promise(setImmediate);
+  assert.equal(env.getNode('channels').innerHTML, current);
+  assert.match(current, /data-status="true"/);
+  assert.match(current, /12%/);
+  assert.doesNotMatch(current, /No subscription/);
+  env.page.unload();
+});
 
 test('API key creation remains the default; OAuth fixes the connection and gates probing on authorization', async () => {
   const env = await environment();
@@ -833,6 +1525,7 @@ for (const action of ['unload', 'reload']) {
     const checking = env.check(); await ready;
     assert.equal(typeof finish, 'function');
     if (action === 'unload') env.page.unload(); else await env.page.load();
+    await new Promise(setImmediate);
     const current = env.getNode('channels').innerHTML;
     finish(savedChannel({ auth_status: 'reauth_required' })); await checking;
     assert.equal(env.getNode('channels').innerHTML, current);

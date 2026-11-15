@@ -7,7 +7,7 @@ from typing import Any, AsyncIterator
 from httpx import HTTPStatusError, Response
 
 from rotor.adapters.protocol.responses import OpenAIResponsesAdapter, _content_text, extract_responses_usage
-from rotor.core.exceptions import UpstreamProtocolError
+from rotor.core.exceptions import UpstreamProtocolError, _sanitize_provider_value
 from rotor.schemas.request import ChatCompletionRequest
 
 
@@ -24,6 +24,13 @@ class OpenAICodexAdapter(OpenAIResponsesAdapter):
         return self.responses_url()
 
     def build_request_headers(self) -> dict[str, str]:
+        return self._headers_for_session(None)
+
+    def setup_request_headers(self, request: ChatCompletionRequest) -> dict[str, str]:
+        """Attach the conversation cache-affinity id when one was resolved."""
+        return self._headers_for_session(request.responses_session_id)
+
+    def _headers_for_session(self, session_id: str | None) -> dict[str, str]:
         if not self._access_token or not self._account_id:
             raise UpstreamProtocolError("ChatGPT OAuth credentials are unavailable", status_code=401)
         reserved = {
@@ -34,6 +41,8 @@ class OpenAICodexAdapter(OpenAIResponsesAdapter):
             name: value for name, value in ((self.channel.extra or {}).get("headers") or {}).items()
             if name.lower() not in reserved
         }
+        if session_id:
+            headers["session_id"] = session_id
         headers.update({
             "Authorization": f"Bearer {self._access_token}",
             "chatgpt-account-id": self._account_id,
@@ -49,30 +58,52 @@ class OpenAICodexAdapter(OpenAIResponsesAdapter):
         request: ChatCompletionRequest,
         timeout: float | None = None,
     ) -> Response:
-        from rotor.services.chatgpt_oauth import resolve_oauth_credentials
+        from rotor.services.chatgpt_oauth import OAuthError, resolve_oauth_credentials
 
         credentials = await resolve_oauth_credentials(self.channel, self.http_client)
-        self._access_token = credentials.access_token
-        self._account_id = credentials.account_id
         # Only the provider transport streams; the original client preference
         # still controls gateway conversion and delivery.
         upstream_request = request.model_copy(update={"stream": True})
-        try:
-            return await super().make_request(upstream_request, timeout)
-        except HTTPStatusError as exc:
-            safe_headers = {name: self._redact(value) for name, value in exc.response.headers.items()}
+        for attempt in range(2):
+            self._access_token = credentials.access_token
+            self._account_id = credentials.account_id
             try:
-                body = self._sanitize_error(exc.response.json())
-                sanitized = Response(exc.response.status_code, headers=safe_headers, json=body, request=exc.request)
-            except ValueError:
-                sanitized = Response(
-                    exc.response.status_code, headers=safe_headers,
-                    text=self._redact(exc.response.text), request=exc.request,
-                )
-            raise HTTPStatusError(
-                f"ChatGPT Codex returned HTTP {exc.response.status_code}",
-                request=exc.request, response=sanitized,
-            ) from None
+                return await super().make_request(upstream_request, timeout)
+            except HTTPStatusError as exc:
+                if attempt == 0 and exc.response.status_code == 401:
+                    # The stored token was rejected mid-life (revoked upstream,
+                    # or it lapsed between the lease read and this call).
+                    # Refresh it with the rejected credential: without it the
+                    # resolver short-circuits on the still-unexpired row and
+                    # hands the same rejected token straight back.
+                    try:
+                        credentials = await resolve_oauth_credentials(
+                            self.channel, self.http_client,
+                            rejected_credential=credentials,
+                        )
+                    except OAuthError:
+                        # Re-authentication is genuinely required; surface the
+                        # upstream rejection rather than a refresh failure.
+                        raise self._upstream_error(exc) from None
+                    await exc.response.aclose()
+                    continue
+                raise self._upstream_error(exc) from None
+
+    def _upstream_error(self, exc: HTTPStatusError) -> HTTPStatusError:
+        """Redact an upstream error body before it leaves the adapter."""
+        safe_headers = {name: self._redact(value) for name, value in exc.response.headers.items()}
+        try:
+            body = self._sanitize_error(exc.response.json())
+            sanitized = Response(exc.response.status_code, headers=safe_headers, json=body, request=exc.request)
+        except ValueError:
+            sanitized = Response(
+                exc.response.status_code, headers=safe_headers,
+                text=self._redact(exc.response.text), request=exc.request,
+            )
+        return HTTPStatusError(
+            f"ChatGPT Codex returned HTTP {exc.response.status_code}",
+            request=exc.request, response=sanitized,
+        )
 
     async def convert_request(self, request: ChatCompletionRequest) -> dict[str, Any]:
         body = await super().convert_request(request)
@@ -162,18 +193,15 @@ class OpenAICodexAdapter(OpenAIResponsesAdapter):
         return message
 
     def _sanitize_error(self, value: Any) -> Any:
+        # Shared key-based redaction, plus this channel's own token values
+        # (which may appear as bare strings rather than under a keyed field).
+        return self._redact_value(_sanitize_provider_value(value))
+
+    def _redact_value(self, value: Any) -> Any:
         if isinstance(value, dict):
-            sensitive = {
-                "access_token", "refresh_token", "id_token", "authorization", "token", "account_id",
-                "chatgpt_account_id", "chatgpt-account-id", "api-key", "api_key", "apikey", "key",
-                "cookie", "set-cookie", "x-api-key", "password", "client_secret",
-            }
-            return {
-                name: "[redacted]" if str(name).lower() in sensitive else self._sanitize_error(item)
-                for name, item in value.items()
-            }
+            return {name: self._redact_value(item) for name, item in value.items()}
         if isinstance(value, list):
-            return [self._sanitize_error(item) for item in value]
+            return [self._redact_value(item) for item in value]
         return self._redact(value) if isinstance(value, str) else value
 
     def _stream_error_details(self, event: dict[str, Any], event_type: str) -> tuple[str, str | None]:

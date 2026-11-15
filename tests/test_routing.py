@@ -148,7 +148,7 @@ def test_affinity_keeps_same_conversation_on_same_channel() -> None:
     ]
 
 
-def test_routing_state_snapshots_cooldown_and_probe_phase() -> None:
+def test_routing_state_only_reports_active_cooldowns() -> None:
     now = [100.0]
     engine = RoutingEngine(clock=lambda: now[0])
     channel = _channel(1)
@@ -166,10 +166,8 @@ def test_routing_state_snapshots_cooldown_and_probe_phase() -> None:
     assert engine.routing_state() == [], "expired cooldown without a probe is routable"
 
     admission = engine.admit_attempt("model", channel)
-    assert admission is not None and admission.is_probe
-    _, _, probing = engine.routing_state()[0]
-    assert probing["phase"] == "probe"
-    assert probing["remaining_seconds"] == 0
+    assert admission is not None and not admission.is_probe
+    assert engine.routing_state() == []
 
     admission.provider_succeeded = True
     engine.release_attempt(admission)
@@ -206,18 +204,19 @@ def test_clear_cooldown_releases_one_model_or_the_whole_channel() -> None:
     assert engine.clear_cooldown(None, 999) == []
 
 
-def test_clear_cooldown_detaches_an_inflight_probe_so_it_cannot_retrip() -> None:
+def test_clear_cooldown_cannot_be_retripped_by_inflight_release() -> None:
     engine = RoutingEngine()
     channel = _channel(1)
 
     engine.mark_unavailable("model", channel, cooldown_seconds=0)
     admission = engine.admit_attempt("model", channel)
-    assert admission is not None and admission.is_probe
+    assert admission is not None and not admission.is_probe
+    engine.mark_unavailable("model", channel, cooldown_seconds=60)
 
     assert engine.clear_cooldown("model", 1) == ["model"]
     assert engine.routing_state() == []
 
-    # The detached probe failing must not re-arm the cooldown an operator cleared.
+    # Releasing an unsuccessful attempt must not re-arm an operator-cleared cooldown.
     admission.provider_succeeded = False
     engine.release_attempt(admission)
     assert engine.routing_state() == []

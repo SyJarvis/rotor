@@ -663,6 +663,7 @@ export async function load() {
     ]);
     if (!active || generation !== loadGeneration) return;
     state.channels = channels;
+    state.quota = {};
     state.authSyncError = {};
     state.routingState = indexRoutingState(routingState);
     state.routingError = routingError;
@@ -679,33 +680,60 @@ export async function load() {
 
 const QUOTA_FRESH_MS = 90_000;
 
+function isOpenCodeUsageChannel(c) {
+  if (c.type !== "opencode" || c.auth_type !== "api_key" || typeof c.base_url !== "string") return false;
+  if (/[\s\u001c-\u001f?#]/u.test(c.base_url)) return false;
+  const parts = c.base_url.match(/^https:\/\/([^/]+)(\/.*)$/i);
+  return !!parts && /^opencode\.ai(?::(?:0*443)?)?$/i.test(parts[1]) &&
+    ["/zen/go/v1", "/zen/go/v1/"].includes(parts[2]);
+}
+
+function isCommandGoatUsageChannel(c) {
+  if (c.type !== "command" || c.auth_type !== "api_key" || typeof c.base_url !== "string") return false;
+  const normalized = c.base_url.replace(/^[\u0000-\u0020]+/, "").replace(/[\t\n\r]/g, "");
+  const origin = normalized.match(/^https:\/\/([^/?#]*)(?:[/?#]|$)/i);
+  return !!origin && /^api\.commandcode\.ai(?::(?:0*443)?)?$/i.test(origin[1]);
+}
+
 function hasUsagePanel(c) {
   if (c.auth_type === "oauth") return true;
-  // Zhipu GLM Coding Plan channels are generic openai/anthropic types; their
-  // base URL is the discriminator the backend uses too.
-  return /bigmodel\.cn|z\.ai/.test(c.base_url || "");
+  if (isOpenCodeUsageChannel(c)) return true;
+  if (isCommandGoatUsageChannel(c)) return true;
+  if (c.type !== "zhipu" || c.auth_type !== "api_key") return false;
+  try {
+    const url = new URL(c.base_url);
+    return url.protocol === "https:" &&
+      ["open.bigmodel.cn", "api.z.ai"].includes(url.hostname) &&
+      (!url.port || url.port === "443") && !url.username && !url.password;
+  } catch {
+    return false;
+  }
 }
 
 async function loadQuota(forceId = null) {
-  const targets = state.channels.filter(
-    (c) => hasUsagePanel(c) && (!forceId || String(c.id) === String(forceId)),
-  );
-  let changed = false;
-  await Promise.all(targets.map(async (c) => {
+  const generation = loadGeneration;
+  const targets = state.channels.filter((c) => {
+    if (!hasUsagePanel(c) || (forceId && String(c.id) !== String(forceId))) return false;
     const cached = state.quota[c.id];
-    if (!forceId && cached?.fetchedAt && Date.now() - cached.fetchedAt < QUOTA_FRESH_MS) return;
-    if (cached?.loading) return;
-    state.quota[c.id] = { ...cached, loading: true };
-    changed = true;
+    return !cached?.loading && (forceId || !cached?.fetchedAt || Date.now() - cached.fetchedAt >= QUOTA_FRESH_MS);
+  });
+  if (!active || !targets.length) return;
+  for (const c of targets) state.quota[c.id] = { ...state.quota[c.id], loading: true };
+  render();
+  await Promise.all(targets.map(async (c) => {
     try {
       const data = await api(`/api/admin/channels/${c.id}/oauth/usage${forceId ? "?refresh=1" : ""}`);
+      if (!active || generation !== loadGeneration) return;
+      if (typeof data.channel_enabled === "boolean") c.enabled = data.channel_enabled;
       state.quota[c.id] = { loading: false, data, fetchedAt: Date.now() };
     } catch (error) {
+      if (!active || generation !== loadGeneration) return;
       // 404 = this server build predates quota reporting; hide the block instead of nagging.
       state.quota[c.id] = { loading: false, error, unsupported: error?.status === 404 };
     }
+    // Render each settled channel independently; a slow request must not block its peers.
+    if (active && generation === loadGeneration) render();
   }));
-  if (changed) render();
 }
 
 function quotaTone(percent) {
@@ -725,7 +753,136 @@ function fmtDuration(ms) {
   return `${Math.round(hours / 24)}${t("oauthUnitD")}`;
 }
 
+function openCodeUsd(value) {
+  if (typeof value !== "string" || !/^-?[0-9]+$/.test(value)) return null;
+  const negative = value.startsWith("-");
+  const digits = value.replace(/^-/, "").replace(/^0+(?=\d)/, "").padStart(9, "0");
+  const whole = digits.slice(0, -8);
+  const fraction = digits.slice(-8).replace(/0+$/, "").padEnd(2, "0");
+  const sign = negative && /[1-9]/.test(digits) ? "-" : "";
+  return `${sign}$${whole}.${fraction}`;
+}
+
+function openCodeDate(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) return null;
+  const date = new Date(seconds * 1000);
+  return Number.isNaN(date.getTime()) ? null : date.toLocaleString();
+}
+
+function renderOpenCodeBlock(c) {
+  const q = state.quota[c.id];
+  if (q?.unsupported || !q) return "";
+  if (q.loading) return `<div class="oauth-block"><span class="muted text-sm">${t("oauthQuotaLoading")}</span></div>`;
+  if (q.error) return `<div class="oauth-block"><span class="oauth-quota-error">${t("openCodeFetchFailed")}</span>
+    <button class="oauth-quota-retry" data-channel-quota-refresh="${c.id}">${t("oauthRetry")}</button></div>`;
+  const d = q.data;
+  const info = d?.opencode;
+  if (!info) return "";
+  const meta = (label, value) => `<div class="opencode-meta"><span class="muted">${escapeHtml(label)}:</span> ${escapeHtml(value)}</div>`;
+  const sourceState = (source) => t({
+    unauthorized: "openCodeUnauthorized", forbidden: "openCodeForbidden",
+    unavailable: "openCodeUnavailable", invalid_response: "openCodeUnavailable", error: "openCodeUnavailable",
+  }[source] || "openCodeUnknown");
+  const subscription = info.sources?.subscription === "ok" ? info.subscription : null;
+  let subscriptionHtml;
+  if (info.sources?.subscription !== "ok") {
+    subscriptionHtml = meta(t("openCodeSubscription"), sourceState(info.sources?.subscription));
+  } else {
+    const inactiveStatus = subscription === null ? "oauthNoSubscription"
+      : subscription?.access === null ? "openCodeNoPaidAccess" : "openCodeUnknown";
+    const status = t({ active: "openCodeActive", pending: "openCodePending", expired: "openCodeExpired", inactive: inactiveStatus }[d.subscription_status] || "openCodeUnknown");
+    subscriptionHtml = meta(t("openCodeSubscription"), `${subscription?.product || "Go"} · ${status}`);
+    const endsAt = openCodeDate(subscription?.access?.ends_at);
+    if (endsAt) subscriptionHtml += meta(t("openCodePaidUntil"), endsAt);
+    if (typeof subscription?.use_balance === "boolean") {
+      subscriptionHtml += meta(t("openCodeExtraUsage"), t(subscription.use_balance ? "openCodeOn" : "openCodeOff"));
+    }
+  }
+  const usageOk = info.sources?.usage === "ok";
+  const windows = [["five_hour", "oauthQuota5h"], ["weekly", "oauthQuotaWeek"], ["monthly", "openCodeMonthly"]];
+  const windowHtml = windows.map(([key, label]) => {
+    const win = usageOk ? info.usage?.[key] : null;
+    const allowance = subscription?.access?.[key];
+    const percent = win?.used_percent;
+    const knownPercent = typeof percent === "number" && Number.isFinite(percent) && percent >= 0 && percent <= 100;
+    const reset = openCodeDate(usageOk ? win?.reset_at : allowance?.reset_at);
+    let row;
+    if (knownPercent) {
+      row = `<div class="quota-row"><span class="quota-label">${t(label)}</span>
+        <div class="quota-bar"><div class="quota-fill ${quotaTone(percent)}" style="width:${percent}%"></div></div>
+        <span class="quota-val">${Math.round(percent)}%</span></div>`;
+    } else {
+      const used = openCodeUsd(allowance?.used_microcents);
+      const limit = openCodeUsd(allowance?.limit_microcents);
+      row = meta(t(label), used !== null && limit !== null ? `${used} / ${limit}` : t("openCodeUnknown"));
+    }
+    if (reset) row += `<div class="opencode-meta muted">${t("openCodeResetsAt")}: ${escapeHtml(reset)}</div>`;
+    return row;
+  }).join("");
+  const usageState = usageOk ? "" : meta(t("openCodeUsage"), sourceState(info.sources?.usage));
+  const available = info.sources?.billing === "ok" ? openCodeUsd(info.billing?.available_microcents) : null;
+  const billingHtml = meta(t("openCodeBalance"), info.sources?.billing === "ok" ? available ?? t("openCodeUnknown") : sourceState(info.sources?.billing));
+  return `<div class="oauth-block opencode-block">${subscriptionHtml}${usageState}
+    <div class="quota-rows">${windowHtml}</div>${billingHtml}
+    <div class="quota-foot">${d.limit_reached === true ? `<span class="quota-limited">${t("openCodeLimitReached")}</span>` : ""}
+      <button class="icon-btn" data-channel-quota-refresh="${c.id}" title="${t("oauthQuotaRefresh")}" aria-label="${t("oauthQuotaRefresh")}"><i data-lucide="refresh-cw"></i></button>
+    </div></div>`;
+}
+
+function renderCommandGoatBlock(c) {
+  const q = state.quota[c.id];
+  if (q?.unsupported || !q) return "";
+  if (q.loading) return `<div class="oauth-block"><span class="muted text-sm">${t("oauthQuotaLoading")}</span></div>`;
+  if (q.error) return `<div class="oauth-block"><span class="oauth-quota-error">${t("commandGoatFetchFailed")}</span>
+    <button class="oauth-quota-retry" data-channel-quota-refresh="${c.id}">${t("oauthRetry")}</button></div>`;
+  const d = q.data;
+  const info = d?.command_goat;
+  if (!info) return "";
+  const meta = (label, value) => `<div class="command-goat-meta"><span class="muted">${escapeHtml(label)}:</span> ${escapeHtml(value)}</div>`;
+  const number = (value) => typeof value === "number" && Number.isFinite(value) ? value : null;
+  const credits = (value) => number(value) === null ? t("commandGoatUnknown") : `${value} credits`;
+  const subscription = info.subscription;
+  const rawStatus = subscription?.status ?? d.subscription_status;
+  const statuses = {
+    active: "commandGoatActive", trialing: "commandGoatTrialing", past_due: "commandGoatPastDue",
+    canceled: "commandGoatCanceled", unpaid: "commandGoatUnpaid", inactive: "oauthNoSubscription",
+  };
+  const status = Object.prototype.hasOwnProperty.call(statuses, rawStatus) ? t(statuses[rawStatus])
+    : typeof rawStatus === "string" && rawStatus ? rawStatus : t("commandGoatUnknown");
+  let subscriptionHtml = meta(t("commandGoatSubscription"), subscription?.plan_id ? `${subscription.plan_id} · ${status}` : status);
+  const end = typeof subscription?.current_period_end === "string" ? Date.parse(subscription.current_period_end) : NaN;
+  if (Number.isFinite(end) && end > 0) subscriptionHtml += meta(t("commandGoatPeriodEnd"), new Date(end).toLocaleString());
+  if (subscription?.cancel_at_period_end === true) subscriptionHtml += `<div class="command-goat-meta muted">${t("commandGoatCancellationScheduled")}</div>`;
+  const balances = [["monthly_remaining", "commandGoatMonthly"], ["purchased_remaining", "commandGoatPurchased"], ["free_remaining", "commandGoatFree"]]
+    .map(([key, label]) => meta(t(label), credits(info.credits?.[key]))).join("");
+  const windows = [["five_hour", "oauthQuota5h"], ["weekly", "oauthQuotaWeek"]].map(([key, label]) => {
+    const win = info[key];
+    const used = number(win?.used);
+    const cap = number(win?.cap);
+    let row = meta(t(label), cap !== null && cap > 0
+      ? `${used ?? t("commandGoatUnknown")} / ${cap} credits` : `${credits(win?.used)} · ${t("commandGoatCapUnknown")}`);
+    if (used !== null && used >= 0 && cap !== null && cap > 0) {
+      const percent = Math.min(used / cap, 1) * 100;
+      row += `<div class="quota-row"><span class="quota-label">${t("commandGoatUsed")}</span>
+        <div class="quota-bar"><div class="quota-fill ${quotaTone(percent)}" style="width:${percent}%"></div></div>
+        <span class="quota-val">${Math.round(percent * 100) / 100}%</span></div>`;
+    }
+    const reset = number(win?.reset_at);
+    const date = reset !== null && reset > 0 ? new Date(reset * 1000) : null;
+    if (date && !Number.isNaN(date.getTime())) row += meta(t("commandGoatResetsAt"), date.toLocaleString());
+    return row;
+  }).join("");
+  const limited = d.limit_reached === true || info.five_hour?.exceeded === true || info.weekly?.exceeded === true;
+  return `<div class="oauth-block command-goat-block">${subscriptionHtml}${balances}
+    <div class="quota-rows">${windows}</div>
+    <div class="quota-foot">${limited ? `<span class="quota-limited">${t("commandGoatLimitReached")}</span>` : ""}
+      <button class="icon-btn" data-channel-quota-refresh="${c.id}" title="${t("oauthQuotaRefresh")}" aria-label="${t("oauthQuotaRefresh")}"><i data-lucide="refresh-cw"></i></button>
+    </div></div>`;
+}
+
 function renderOAuthBlock(c) {
+  if (isOpenCodeUsageChannel(c)) return renderOpenCodeBlock(c);
+  if (isCommandGoatUsageChannel(c)) return renderCommandGoatBlock(c);
   const expiry = Number(c.auth_expires_at);
   let head = "";
   if (c.auth_type === "oauth" && expiry > 0 && Number.isFinite(expiry)) {
@@ -744,6 +901,13 @@ function renderOAuthBlock(c) {
   } else if (q?.error) {
     quotaHtml = `<span class="oauth-quota-error">${t("oauthQuotaFailed")}</span>
       <button class="oauth-quota-retry" data-channel-quota-refresh="${c.id}">${t("oauthRetry")}</button>`;
+  } else if (q?.data?.subscription_status === "inactive") {
+    quotaHtml = `<div class="quota-foot">
+      <span class="muted text-sm">${t("oauthNoSubscription")}</span>
+      <button class="icon-btn" data-channel-quota-refresh="${c.id}" title="${t("oauthQuotaRefresh")}" aria-label="${t("oauthQuotaRefresh")}">
+        <i data-lucide="refresh-cw"></i>
+      </button>
+    </div>`;
   } else if (q?.data) {
     const d = q.data;
     const row = (label, win) => {

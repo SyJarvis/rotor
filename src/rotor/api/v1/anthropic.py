@@ -5,7 +5,7 @@ import logging
 import json
 from typing import Optional
 from fastapi import APIRouter, Depends, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.database import async_session_maker, get_db
@@ -58,9 +58,12 @@ from rotor.core.exceptions import (
     format_error_message,
     normalize_upstream_error,
     upstream_error_payload,
+    upstream_error_reply,
+    upstream_message_text,
 )
 from rotor.schemas.error import ErrorPhase
 from httpx import AsyncClient, HTTPStatusError, RequestError
+from rotor.core.http_client import UPSTREAM_LIMITS
 
 logger = logging.getLogger(__name__)
 
@@ -496,7 +499,7 @@ async def count_message_tokens(
 ):
     """Count Anthropic input tokens, proxying native channels when possible."""
     channels = await get_available_channels(request.model, token, db)
-    async with AsyncClient(timeout=120.0) as http_client:
+    async with AsyncClient(timeout=120.0, limits=UPSTREAM_LIMITS) as http_client:
         adapters = {}
         native_channels = []
         selection_failed = False
@@ -817,7 +820,7 @@ async def messages(
     )
 
     # Try to get a response from available channels
-    http_client = AsyncClient(timeout=120.0)
+    http_client = AsyncClient(timeout=120.0, limits=UPSTREAM_LIMITS)
     streaming_response_returned = False
     last_error = None
 
@@ -992,6 +995,20 @@ async def messages(
     if last_error is None:
         wait, plan_limited = routing_engine.cooldown_outlook(request.model, routing_decision.candidates)
         raise ChannelsTemporarilyUnavailable(request.model, wait, plan_limited=plan_limited)
+    reply = upstream_error_reply(last_error)
+    if reply is not None:
+        # The official upstream answered: keep the Anthropic envelope shape
+        # but disclose the provider's own message and body.
+        status_code, _, _, retry_after = reply
+        payload = anthropic_error_payload(last_error, request_id=request_id)
+        message = upstream_message_text(last_error)
+        if message:
+            payload["error"]["message"] = message
+        upstream = upstream_error_payload(last_error)
+        if upstream:
+            payload["error"]["upstream"] = upstream
+        headers = {"Retry-After": retry_after} if retry_after else None
+        return JSONResponse(status_code=status_code, content=payload, headers=headers)
     error = ChannelException(
         f"All channels failed for model '{request.model}'",
         status_code=classify_error_status(last_error),

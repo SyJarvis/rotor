@@ -13,6 +13,7 @@ must be tried on both; ordering by reset time is wrong because near the end of
 a cycle the weekly window resets before the 5-hour one.
 """
 import time
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -33,18 +34,41 @@ class ZhipuQuotaError(Exception):
 
 
 def zhipu_quota_host(base_url: str | None) -> str | None:
-    """Resolve the quota host from a channel's data-plane base URL."""
-    host = (base_url or "").lower()
-    if "bigmodel.cn" in host:
-        return "https://open.bigmodel.cn"
-    if "z.ai" in host:
-        return "https://api.z.ai"
+    """Resolve only an exact official HTTPS origin."""
+    try:
+        url = urlsplit(base_url or "")
+        if (
+            url.scheme == "https"
+            and url.hostname in {"open.bigmodel.cn", "api.z.ai"}
+            and url.port in (None, 443)
+            and url.username is None
+            and url.password is None
+        ):
+            return f"https://{url.hostname}"
+    except ValueError:
+        pass
     return None
 
 
 def is_zhipu_quota_channel(channel) -> bool:
-    """True when the channel's base URL points at Zhipu's API hosts."""
-    return channel.auth_type != "oauth" and zhipu_quota_host(getattr(channel, "base_url", None)) is not None
+    """Require the selected Zhipu provider and an official API-key origin."""
+    return (
+        getattr(channel, "type", None) == "zhipu"
+        and getattr(channel, "auth_type", None) == "api_key"
+        and zhipu_quota_host(getattr(channel, "base_url", None)) is not None
+    )
+
+
+def is_zhipu_coding_channel(channel) -> bool:
+    """Coding Plan endpoints, excluding the same hosts' pay-as-you-go APIs."""
+    if not is_zhipu_quota_channel(channel):
+        return False
+    url = urlsplit(channel.base_url or "")
+    return url.hostname in {"open.bigmodel.cn", "api.z.ai"} and (
+        url.path.startswith("/api/coding/")
+        or url.path.rstrip("/") == "/api/anthropic"
+        or url.path.startswith("/api/anthropic/")
+    )
 
 
 def _window(item: dict, now: float) -> ChannelUsageWindow:
@@ -93,6 +117,8 @@ def parse_zhipu_usage(payload: dict, *, fetched_at: float) -> ChannelUsageRespon
 
 async def fetch_zhipu_usage(client: httpx.AsyncClient, channel) -> ChannelUsageResponse:
     """Fetch the Coding Plan rolling-window usage for an API-key Zhipu channel."""
+    if not is_zhipu_quota_channel(channel):
+        raise ZhipuQuotaError("Channel is not a Zhipu API-key channel")
     host = zhipu_quota_host(channel.base_url)
     headers = {"Authorization": channel.key, "Accept": "application/json"}
     for name, value in ((channel.extra or {}).get("headers") or {}).items():
@@ -114,6 +140,14 @@ async def fetch_zhipu_usage(client: httpx.AsyncClient, channel) -> ChannelUsageR
         payload = response.json()
     except (ValueError, UnicodeDecodeError):
         raise ZhipuQuotaError("Zhipu returned an invalid quota payload", 502) from None
+    if not isinstance(payload, dict):
+        raise ZhipuQuotaError("Zhipu returned an invalid quota payload", 502)
     if payload.get("success") is False:
+        if payload.get("code") == 500 and payload.get("msg") == "当前用户不存在coding plan":
+            return ChannelUsageResponse(
+                subscription_status="inactive",
+                allowed=False,
+                fetched_at=time.time(),
+            )
         raise ZhipuQuotaError(f"Zhipu quota error: {payload.get('msg') or 'unknown'}", 502)
     return parse_zhipu_usage(payload, fetched_at=time.time())

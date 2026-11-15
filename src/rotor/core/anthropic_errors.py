@@ -9,8 +9,10 @@ from httpx import HTTPStatusError
 from starlette.exceptions import HTTPException
 
 from rotor.core.exceptions import (
+    ERROR_TYPES,
     UpstreamOverloaded, UpstreamProtocolError,
     classify_error_status,
+    upstream_retry_after,
 )
 from rotor.core.openai_errors import openai_error_response
 
@@ -22,12 +24,7 @@ def is_anthropic_request(request) -> bool:
 
 def anthropic_error_payload(exc, *, request_id=None, secret=None):
     status_code = exc.status_code if isinstance(exc, HTTPException) else classify_error_status(exc)
-    error_type = {
-        400: "invalid_request_error", 401: "authentication_error", 402: "billing_error", 403: "permission_error",
-        404: "not_found_error", 413: "request_too_large", 422: "invalid_request_error",
-        409: "conflict_error", 429: "rate_limit_error", 503: "overloaded_error",
-        504: "timeout_error", 529: "overloaded_error",
-    }.get(status_code, "api_error")
+    error_type = ERROR_TYPES.get(status_code, "api_error")
     message = "Internal server error"
     if isinstance(exc, UpstreamProtocolError):
         error_type = exc.error_type
@@ -65,8 +62,8 @@ def anthropic_error_response(request, exc):
     else:
         status_code = classify_error_status(exc)
     headers = dict(getattr(exc, "headers", None) or {})
-    if isinstance(exc, HTTPStatusError) and exc.response.headers.get("retry-after"):
-        headers["Retry-After"] = exc.response.headers["retry-after"]
+    if retry_after := upstream_retry_after(exc):
+        headers["Retry-After"] = retry_after
     request_id = getattr(request.state, "request_id", None) or request.headers.get("x-request-id")
     return JSONResponse(status_code=status_code, headers=headers,
                         content=anthropic_error_payload(exc, request_id=request_id))

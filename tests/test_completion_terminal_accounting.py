@@ -127,7 +127,10 @@ def assert_accounting(harness, *, success, tokens=10):
     stats = env.engine.adaptive._stats[("model", 1)]
     assert stats.inflight == 0
     assert stats.successes == int(success)
-    assert (("model", 1) not in env.engine._cooldowns) is success
+    # These results do not request fallback; releasing a failed ordinary
+    # attempt after cooldown expiry must not implicitly start another cooldown.
+    assert env.engine.routing_state() == []
+    assert env.engine._in_flight == {}
     assert len(harness.state.requests) == 1
     assert all(response.is_closed for response in harness.state.responses)
     assert all(client.is_closed for client in harness.state.clients)
@@ -181,6 +184,9 @@ def test_http_200_overload_keeps_nonstream_fallback(harness, client_protocol, pr
     assert harness.lease.await_count == harness.counters.await_count == 1
     assert len(harness.state.requests) == 2
     assert all(stats.inflight == 0 for stats in harness.env.engine.adaptive._stats.values())
+    assert harness.env.engine._is_cooling_down("model", first.id)
+    assert not harness.env.engine._is_cooling_down("model", 2)
+    assert harness.env.engine._in_flight == {}
 
 
 @pytest.mark.parametrize("client_protocol", ["chat", "responses"])

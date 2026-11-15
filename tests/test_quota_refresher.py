@@ -121,6 +121,24 @@ def test_limit_horizon_prefers_reset_at_with_clamp():
     assert quota_refresher._limit_horizon(_usage(limit_reached=True), time()) == 30.0
 
 
+def test_missing_subscription_is_cached_without_changing_cooldowns():
+    from rotor.gateway.routing import routing_engine as engine
+
+    channel = _channel(["glm-6", "glm-6-flash", "glm-6-plus"])
+    usage = ChannelUsageResponse(subscription_status="inactive", allowed=False, fetched_at=time())
+    try:
+        engine.mark_unavailable("glm-6", channel, 300, reason="plan_limit")
+        engine.mark_unavailable("glm-6-flash", channel, 30)
+        quota_refresher.apply_usage(channel, usage)
+        assert usage_cache.fresh(channel.id) == usage
+        assert _cooling_models(engine, channel, channel.models) == ["glm-6", "glm-6-flash"]
+        quota_refresher.apply_usage(channel, _usage(limit_reached=False))
+        assert _cooling_models(engine, channel, channel.models) == ["glm-6-flash"]
+    finally:
+        engine.clear_cooldown(None, channel.id)
+        usage_cache._entries.clear()
+
+
 def test_mark_failure_schedules_refresh_for_plan_limits():
     engine = RoutingEngine()
     channel = _channel(["glm-6"], channel_id=11)
