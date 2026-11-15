@@ -14,11 +14,7 @@ from rotor.core.client_session import (
 from rotor.core.header_forwarding import snapshot_inbound_headers
 from rotor.core.deps import get_current_token, get_available_channels
 from rotor.application_settings import application_settings
-from rotor.schemas.request import (
-    ChatMessage,
-    ChatCompletionRequest,
-    Role,
-)
+from rotor.schemas.request import ChatCompletionRequest
 from rotor.schemas.error import ErrorPhase
 from rotor.adapters.factory import AdapterFactory
 from rotor.adapters.protocol.openai_integrity import ChatStreamIntegrity, validate_chat_response
@@ -1132,37 +1128,3 @@ def _json_dumps(data: dict) -> str:
     """JSON dump with special handling."""
     import json
     return json.dumps(data, ensure_ascii=False)
-
-
-def responses_input_to_messages(input_data) -> list[ChatMessage]:
-    """Convert a minimal OpenAI Responses API input into chat messages."""
-    if isinstance(input_data, str):
-        return [ChatMessage(role=Role.USER, content=input_data)]
-
-    messages: list[ChatMessage] = []
-    if isinstance(input_data, list):
-        for item in input_data:
-            if isinstance(item, str):
-                messages.append(ChatMessage(role=Role.USER, content=item))
-                continue
-            if not isinstance(item, dict):
-                continue
-
-            role = item.get("role", "user")
-            # Responses API allows role="developer" (OpenAI reasoning models,
-            # equivalent to system). Normalize so downstream ChatMessage stays
-            # within the supported enum and provider chat APIs accept it.
-            if role == "developer":
-                role = "system"
-            content = item.get("content", "")
-            text_parts: list[str] = []
-            if isinstance(content, str):
-                text_parts.append(content)
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") in ("input_text", "text", "output_text"):
-                            text_parts.append(block.get("text", ""))
-            messages.append(ChatMessage(role=Role(role), content="".join(text_parts)))
-
-    return messages or [ChatMessage(role=Role.USER, content="")]

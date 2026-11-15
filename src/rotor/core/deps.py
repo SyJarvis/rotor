@@ -1,4 +1,4 @@
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -126,38 +126,3 @@ async def get_available_channels(
         raise ModelNotFoundException(model)
 
     return channels
-
-
-async def get_channel_by_id(
-    channel_id: int,
-    db: AsyncSession = Depends(get_db)
-) -> Channel:
-    """Get a channel by ID."""
-    result = await db.execute(
-        select(Channel).where(Channel.id == channel_id)
-    )
-    channel = result.scalar_one_or_none()
-
-    if not channel:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Channel {channel_id} not found"
-        )
-
-    return channel
-
-
-def get_client_ip(
-    x_forwarded_for: Optional[str] = Header(None, alias="X-Forwarded-For"),
-    x_real_ip: Optional[str] = Header(None, alias="X-Real-IP")
-) -> str:
-    """Get client IP from headers."""
-    if x_forwarded_for:
-        return x_forwarded_for.split(",")[0].strip()
-    if x_real_ip:
-        return x_real_ip
-    return "unknown"
-
-
-async def get_account_channel_scope(token, db):
-    return (await effective_permissions(token, db))[0]
