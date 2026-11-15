@@ -3,10 +3,11 @@ import time
 import uuid
 import json
 import logging
+import sys
 from typing import Any
 
+import anyio
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,6 +53,7 @@ from rotor.gateway.provider_facts import (
     extract_capacity_snapshot_from_error,
 )
 from rotor.gateway.routing import routing_engine, session_lease_success_reason
+from rotor.gateway.streaming import AdmissionStreamingResponse
 from rotor.services.session_leases import get_session_lease_preference
 from rotor.gateway.attempts import AttemptContext, attempt_recorder
 from rotor.gateway.fallback import (
@@ -1085,99 +1087,141 @@ async def retrieve_response(
     """Retrieve or resume-stream a response from its original upstream."""
     started_at = time.time()
     route, channel = await _resolve_response_channel(db, response_id, token)
-    params = [(key, value) for key, value in http_request.query_params.multi_items()]
-    stream = str(http_request.query_params.get("stream", "false")).lower() == "true"
-    if stream:
-        # The relay may outlive this request handler for an arbitrary amount
-        # of time. Route/channel have already been resolved, and all
-        # persistence is performed with a fresh session in relay(), so release
-        # the dependency session before waiting on the upstream stream.
-        await db.close()
-    http_client = AsyncClient(timeout=120.0)
-    adapter = AdapterFactory.create_adapter(channel, http_client)
-    if not isinstance(adapter, OpenAIResponsesAdapter):
-        await http_client.aclose()
-        raise HTTPException(status_code=404, detail="Response not found")
-    try:
-        upstream = await adapter.retrieve_response(
-            response_id, params=params, stream=stream
+    admission = routing_engine.admit_attempt(route.model, channel)
+    if admission is None:
+        raise ChannelsTemporarilyUnavailable(
+            route.model, routing_engine.retry_after_seconds(route.model, [channel])
         )
-    except HTTPStatusError as exc:
-        await http_client.aclose()
-        return _upstream_error(exc)
-    except Exception:
-        await http_client.aclose()
-        raise
+    http_client = None
+    upstream = None
+    streaming_response_returned = False
+    cleanup_task = None
 
-    if stream:
-        client_ip = http_request.client.host if http_request.client else "unknown"
+    async def close_resources(*, preserve_error=False):
+        nonlocal cleanup_task
 
-        async def relay():
-            buffer = b""
-            terminal_response: dict[str, Any] | None = None
-            try:
-                async for chunk in upstream.aiter_raw():
-                    buffer += chunk
-                    normalized = buffer.replace(b"\r\n", b"\n")
-                    while b"\n\n" in normalized:
-                        block, normalized = normalized.split(b"\n\n", 1)
-                        data = b"\n".join(
-                            line[5:].lstrip()
-                            for line in block.split(b"\n")
-                            if line.startswith(b"data:")
-                        )
-                        if data and data != b"[DONE]":
-                            try:
-                                event = json.loads(data)
-                            except (UnicodeDecodeError, json.JSONDecodeError):
-                                event = None
-                            if isinstance(event, dict) and event.get("type") in {
-                                "response.completed",
-                                "response.failed",
-                                "response.cancelled",
-                                "response.incomplete",
-                            }:
-                                terminal_response = event.get("response") or None
-                    buffer = normalized
-                    yield chunk
-            finally:
-                await upstream.aclose()
-                await http_client.aclose()
-                if terminal_response and terminal_response.get("id") == response_id:
+        async def cleanup():
+            for resource in (upstream, http_client):
+                if resource is not None:
                     try:
-                        async with async_session_maker() as stream_db:
-                            stream_route = await get_response_route(
-                                stream_db, response_id, token.id,
-                                owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
-                            )
-                            stream_channel = await stream_db.get(Channel, channel.id)
-                            stream_token = await reload_principal(stream_db, token)
-                            if stream_route and stream_channel and stream_token:
-                                stream_route.status = (
-                                    terminal_response.get("status") or stream_route.status
-                                )
-                                await _account_deferred_response_usage(
-                                    stream_db,
-                                    route=stream_route,
-                                    channel=stream_channel,
-                                    token=stream_token,
-                                    payload=terminal_response,
-                                    client_ip=client_ip,
-                                    latency_ms=int((time.time() - started_at) * 1000),
-                                    capacity_snapshot=extract_capacity_snapshot(
-                                        upstream.headers
-                                    ),
-                                )
-                                await stream_db.commit()
-                    except Exception:
-                        logger.exception(
-                            "Failed to persist streamed response retrieval for %s",
-                            response_id,
-                        )
+                        await resource.aclose()
+                    except (Exception, asyncio.CancelledError):
+                        logger.exception("Failed to close retrieve resource for %s", response_id)
 
-        return StreamingResponse(relay(), media_type="text/event-stream")
+        # Release synchronously, before any cancellation checkpoint. Cleanup is
+        # shared by direct iteration and the ASGI wrapper and runs only once.
+        admission.engine.release_attempt(admission)
+        cancelled = None
+        with anyio.CancelScope(shield=True):
+            if cleanup_task is None:
+                cleanup_task = asyncio.create_task(cleanup())
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError as exc:
+                    cancelled = cancelled or exc
+            cleanup_task.result()
+        if cancelled is not None and not preserve_error:
+            raise cancelled
 
     try:
+        params = list(http_request.query_params.multi_items())
+        stream = str(http_request.query_params.get("stream", "false")).lower() == "true"
+        if stream:
+            # Persistence in relay() uses a fresh session; release this one
+            # before waiting on an upstream stream of arbitrary duration.
+            await db.close()
+        http_client = AsyncClient(timeout=120.0, limits=UPSTREAM_LIMITS)
+        adapter = AdapterFactory.create_adapter(channel, http_client)
+        if not isinstance(adapter, OpenAIResponsesAdapter):
+            raise HTTPException(status_code=404, detail="Response not found")
+        try:
+            upstream = await adapter.retrieve_response(response_id, params=params, stream=stream)
+        except (HTTPStatusError, RequestError) as exc:
+            if should_fallback(exc):
+                routing_engine.mark_failure(route.model, channel, exc)
+            if isinstance(exc, HTTPStatusError):
+                return _upstream_error(exc)
+            raise ChannelException(
+                "Upstream connection failed while retrieving response",
+                status_code=classify_error_status(exc),
+                original_error=format_error_message(exc),
+            )
+
+        if stream:
+            client_ip = http_request.client.host if http_request.client else "unknown"
+
+            async def relay():
+                buffer = b""
+                terminal_response: dict[str, Any] | None = None
+                try:
+                    async for chunk in upstream.aiter_raw():
+                        buffer += chunk
+                        normalized = buffer.replace(b"\r\n", b"\n")
+                        while b"\n\n" in normalized:
+                            block, normalized = normalized.split(b"\n\n", 1)
+                            data = b"\n".join(
+                                line[5:].lstrip()
+                                for line in block.split(b"\n")
+                                if line.startswith(b"data:")
+                            )
+                            if data and data != b"[DONE]":
+                                try:
+                                    event = json.loads(data)
+                                except (UnicodeDecodeError, json.JSONDecodeError):
+                                    event = None
+                                if isinstance(event, dict) and event.get("type") in {
+                                    "response.completed",
+                                    "response.failed",
+                                    "response.cancelled",
+                                    "response.incomplete",
+                                }:
+                                    terminal_response = event.get("response") or None
+                        buffer = normalized
+                        yield chunk
+                    admission.provider_succeeded = True
+                except Exception as exc:
+                    if should_fallback(exc):
+                        routing_engine.mark_failure(route.model, channel, exc)
+                    raise
+                finally:
+                    await close_resources(preserve_error=sys.exc_info()[0] is not None)
+                    if terminal_response and terminal_response.get("id") == response_id:
+                        try:
+                            async with async_session_maker() as stream_db:
+                                stream_route = await get_response_route(
+                                    stream_db, response_id, token.id,
+                                    owner_id=token.owner_id if isinstance(token, AccountPrincipal) else None,
+                                )
+                                stream_channel = await stream_db.get(Channel, channel.id)
+                                stream_token = await reload_principal(stream_db, token)
+                                if stream_route and stream_channel and stream_token:
+                                    stream_route.status = (
+                                        terminal_response.get("status") or stream_route.status
+                                    )
+                                    await _account_deferred_response_usage(
+                                        stream_db,
+                                        route=stream_route,
+                                        channel=stream_channel,
+                                        token=stream_token,
+                                        payload=terminal_response,
+                                        client_ip=client_ip,
+                                        latency_ms=int((time.time() - started_at) * 1000),
+                                        capacity_snapshot=extract_capacity_snapshot(upstream.headers),
+                                    )
+                                    await stream_db.commit()
+                        except Exception:
+                            logger.exception(
+                                "Failed to persist streamed response retrieval for %s", response_id,
+                            )
+
+            result = AdmissionStreamingResponse(
+                relay(), media_type="text/event-stream", admission=admission,
+                close_callbacks=(close_resources,),
+            )
+            streaming_response_returned = True
+            return result
+
         payload = upstream.json()
         if isinstance(payload, dict):
             route.status = payload.get("status") or route.status
@@ -1192,10 +1236,11 @@ async def retrieve_response(
                 capacity_snapshot=extract_capacity_snapshot(upstream.headers),
             )
             await db.commit()
+        admission.provider_succeeded = True
         return _upstream_response(upstream)
     finally:
-        await upstream.aclose()
-        await http_client.aclose()
+        if not streaming_response_returned:
+            await close_resources(preserve_error=sys.exc_info()[0] is not None)
 
 
 @router.delete("/responses/{response_id}", response_model=None)
