@@ -22,6 +22,7 @@ class AdapterFactory:
         "openai_codex": OpenAICodexAdapter,
         "deepseek": OpenAIAdapter,
         "command": OpenAIAdapter,
+        "opencode": OpenAIAdapter,
         "azure": AzureOpenAIAdapter,
         "anthropic": AnthropicAdapter,
         "moonshot": MoonshotAdapter,

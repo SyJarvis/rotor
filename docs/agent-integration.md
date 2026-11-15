@@ -96,7 +96,7 @@ POST /oauth/token
 
 ### GET /v1/usage —— 配额与上游计划窗口
 
-当前凭据的用量快照,agent 可据此做节流与"额度用尽"提示:
+当前凭据的用量快照,agent 可据此辅助节流与窗口提示。以下数据为合成示例,不是账户实测记录；假设查询时间为 2030-01-08 06:00 UTC:
 
 ```json
 {
@@ -104,17 +104,19 @@ POST /oauth/token
   "channels": [
     {"channel_id": 9, "channel": "openai-plus", "provider": "chatgpt", "plan": "plus",
      "rate_limit": {
-       "primary_window":  {"used_percent": 7.0, "window_seconds": 18000,  "reset_after_seconds": 300, "reset_at": 1800000300.0},
-       "secondary_window": {"used_percent": 15.0, "window_seconds": 604800, "reset_after_seconds": 400000, "reset_at": 1800400300.0}
+       "primary_window":  {"used_percent": 7.0, "window_seconds": 18000,  "reset_after_seconds": 300, "reset_at": 1894082700.0},
+       "secondary_window": {"used_percent": 15.0, "window_seconds": 604800, "reset_after_seconds": 400000, "reset_at": 1894482400.0}
      },
-     "limit_reached": false, "allowed": true, "fetched_at": 1792831349.0}
+     "limit_reached": false, "allowed": true, "subscription_status": null, "fetched_at": 1894082400.0}
   ]
 }
 ```
 
 - `quota`:Rotor 自身的令牌配额,`null` 表示不限量
-- `channels[].rate_limit`:ChatGPT(5h/周窗)与智谱 GLM Coding Plan(滚动 5h/周窗)的上游计划窗口,`primary_window` 为 5 小时窗、`secondary_window` 为周窗;`limit_reached=true` 表示窗口耗尽,应停止向该渠道模型发请求直到 `reset_at`
-- 窗口数据来自管理侧 90 秒缓存,该路径**不会**触发上游请求;`channels` 为空仅表示暂无新鲜快照,稍后重试即可
+- `channels[].rate_limit` 是通用窗口:ChatGPT、智谱、Command Goat、OpenCode 的 `primary_window` 为 5 小时窗、`secondary_window` 为周窗,字段可为 `null`;时间为 Unix 秒,`reset_after_seconds` 相对 `fetched_at`,不是读取缓存时的倒计时。
+- 仅输出当前凭据允许的且已启用的渠道；模型权限受限时,还须至少提供一个允许的模型名或映射别名。还须服务商条件有效、缓存与当前配置匹配。窗口数据来自 90 秒内的管理侧缓存,此接口**不会**触发上游请求;`channels` 为空也可能是权限、模型、渠道状态或缓存条件不符,不代表额度耗尽。
+- ChatGPT/智谱的 `limit_reached` 可反映窗口耗尽;`null` 表示未知。Goat/OpenCode 的通用 `limit_reached` 始终为 `null`,不能作为全部模型不可用的判定。Goat 专属详情仅保留窗口限制开关和各窗口 `exceeded`、`reset_at`;OpenCode 专属详情仅保留三个 usage 窗口的 `status`、`used_percent`、`reset_at`。窗口受限不保证免费模型或付费额度不可用。
+- 此客户端接口不暴露上游余额、成本、原始金额额度或专属订阅账务详情；管理员接口仍可查看完整类型化数据。
 
 ### Anthropic 面
 

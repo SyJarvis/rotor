@@ -27,6 +27,7 @@ from rotor.services.chatgpt_oauth import (
 )
 from rotor.services.zhipu_quota import ZhipuQuotaError, is_zhipu_coding_channel, is_zhipu_quota_channel
 from rotor.services.command_goat_quota import CommandGoatQuotaError, is_command_goat_quota_channel
+from rotor.services.opencode_quota import OpenCodeQuotaError, is_opencode_quota_channel
 from rotor.schemas.channel import (
     ChannelCooldownResetRequest,
     ChannelCooldownResetResponse,
@@ -409,9 +410,9 @@ async def get_channel_oauth_usage(
 ):
     """Current subscription usage for a channel with a quota provider.
 
-    Covers ChatGPT OAuth, Zhipu Coding Plan, and Command Goat API-key channels.
+    Covers ChatGPT OAuth, Zhipu Coding Plan, Command Goat and OpenCode Go.
     ChatGPT and Zhipu snapshots reconcile channel-wide plan cooldowns.
-    Command Goat snapshots only report usage: paid credits and free models
+    Command Goat and OpenCode snapshots only report usage: paid credits and free models
     can remain available when a subscription window is exhausted.
     """
     now = time.time()
@@ -424,37 +425,48 @@ async def get_channel_oauth_usage(
         )
     if channel.auth_type != "oauth" and not (
         is_zhipu_quota_channel(channel) or is_command_goat_quota_channel(channel)
+        or is_opencode_quota_channel(channel)
     ):
         usage_cache.invalidate(channel_id)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Channel has no quota provider (OAuth, Zhipu or Command Goat required)",
+            detail="Channel has no quota provider (OAuth, Zhipu, Command Goat or OpenCode required)",
         )
-    cached = usage_cache.fresh(channel_id, now=now)
+    version = usage_cache.generation(channel_id)
+    identity = usage_cache.identity(channel)
+    cached = usage_cache.fresh(channel_id, channel=channel, now=now)
     if cached and not refresh:
         try:
+            await quota_refresher.verify_configuration(db, channel, identity, version)
+            cached = cached.model_copy(deep=True)
             await quota_refresher.apply_subscription_status(db, channel, cached)
+            if usage_cache.generation(channel_id) != version:
+                raise ZhipuQuotaError("Channel configuration changed; refresh usage again", 503)
         except ZhipuQuotaError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
         return cached
     try:
+        oauth_fetched = channel.auth_type == "oauth"
+        fetch_identity = usage_cache.identity(channel, include_oauth_tokens=not oauth_fetched)
         async with httpx.AsyncClient(timeout=15.0) as client:
             usage = await quota_refresher.fetch_usage(channel, client)
         if usage is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Channel has no quota provider (OAuth, Zhipu or Command Goat required)",
+                detail="Channel has no quota provider (OAuth, Zhipu, Command Goat or OpenCode required)",
             )
+        await quota_refresher.verify_configuration(db, channel, fetch_identity, version, oauth_fetched=oauth_fetched)
         await quota_refresher.apply_subscription_status(db, channel, usage)
+        if not quota_refresher.apply_usage(channel, usage, now=now, expected_generation=version):
+            raise ZhipuQuotaError("Channel configuration changed; refresh usage again", 503)
     except OAuthError as exc:
         raise HTTPException(
             status_code=exc.status_code if exc.status_code >= 500 else status.HTTP_502_BAD_REQUEST,
             detail=str(exc),
         ) from exc
-    except (ZhipuQuotaError, CommandGoatQuotaError) as exc:
+    except (ZhipuQuotaError, CommandGoatQuotaError, OpenCodeQuotaError) as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
-    quota_refresher.apply_usage(channel, usage, now=now)
     return usage
 
 
@@ -623,12 +635,16 @@ async def _validate_coding_subscription(channel, db: AsyncSession | None = None)
     """Validate explicit enable requests against the current or proposed credentials."""
     if not is_zhipu_coding_channel(channel):
         return
+    version = usage_cache.generation(channel.id) if db is not None else None
+    identity = usage_cache.identity(channel) if db is not None else None
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             usage = await quota_refresher.fetch_usage(channel, client)
         if db is not None:
+            await quota_refresher.verify_configuration(db, channel, identity, version)
             await quota_refresher.apply_subscription_status(db, channel, usage)
-            quota_refresher.apply_usage(channel, usage)
+            if not quota_refresher.apply_usage(channel, usage, expected_generation=version):
+                raise ZhipuQuotaError("Channel configuration changed; refresh usage again", 503)
     except ZhipuQuotaError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     if usage.subscription_status == "inactive":
@@ -713,11 +729,10 @@ async def update_channel(
         ))
     # Explicit values also clear a refresh lease claimed after the ORM read.
     # ORM dirty tracking would omit an unchanged None and leave that lease live.
-    if update_data:
-        await db.execute(sql_update(Channel).where(Channel.id == channel_id).values(**update_data))
-
-    await db.commit()
-    usage_cache.invalidate(channel_id)
+    with usage_cache.mutation(channel_id):
+        if update_data:
+            await db.execute(sql_update(Channel).where(Channel.id == channel_id).values(**update_data))
+        await db.commit()
     await db.refresh(channel)
 
     stats = await _channel_stats(db, [channel.id])
@@ -871,8 +886,9 @@ async def delete_channel(
             detail=f"Channel {channel_id} not found"
         )
 
-    await db.delete(channel)
-    await db.commit()
+    with usage_cache.mutation(channel_id):
+        await db.delete(channel)
+        await db.commit()
 
     return None
 
@@ -894,9 +910,9 @@ async def disable_channel(
             detail=f"Channel {channel_id} not found"
         )
 
-    channel.enabled = False
-    await db.commit()
-    usage_cache.invalidate(channel_id)
+    with usage_cache.mutation(channel_id):
+        channel.enabled = False
+        await db.commit()
     await db.refresh(channel)
 
     stats = await _channel_stats(db, [channel.id])
@@ -921,9 +937,9 @@ async def enable_channel(
         )
 
     await _validate_coding_subscription(channel, db)
-    channel.enabled = True
-    await db.commit()
-    usage_cache.invalidate(channel_id)
+    with usage_cache.mutation(channel_id):
+        channel.enabled = True
+        await db.commit()
     await db.refresh(channel)
 
     stats = await _channel_stats(db, [channel.id])

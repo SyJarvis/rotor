@@ -414,7 +414,14 @@ def test_admin_cache_refresh_and_gateway_permission_filtering(monkeypatch):
             entries = gateway.json()["channels"]
             assert [entry["channel_id"] for entry in entries] == [501]
             assert entries[0]["provider"] == "command-goat"
-            assert entries[0]["command_goat"] == refreshed.json()["command_goat"]
+            details = refreshed.json()["command_goat"]
+            assert entries[0]["command_goat"] == {
+                "window_limited": details["window_limited"],
+                "five_hour": {key: details["five_hour"][key] for key in ("exceeded", "reset_at")},
+                "weekly": {key: details["weekly"][key] for key in ("exceeded", "reset_at")},
+            }
+            assert entries[0]["limit_reached"] is None
+            assert all(field not in gateway.text for field in ("monthly_remaining", "total_cost", "purchased_remaining", "cap"))
             assert entries[0]["allowed"] is None
             assert (await client.get("/v1/usage")).status_code == 401
             replies[WHO] = httpx.Response(401, json={"error": "provider-private-key"})
@@ -518,4 +525,26 @@ def test_command_url_query_does_not_change_selected_provider():
             usage = await quota_refresher.fetch_usage(channel, client)
         assert usage.plan == "individual-goat"
         assert _provider(channel) == "command-goat"
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("window", ["fiveHour", "weekly"])
+def test_gateway_window_limit_is_not_global_exhaustion_and_billing_is_private(monkeypatch, window):
+    replies, requests = _payloads(), []
+    replies[CREDITS]["windowLimits"][window].update(exceeded=True, used=9, resetAt=1_800_000_100_000)
+
+    async def exercise():
+        async with _api_client(monkeypatch, replies, requests, allowed_channels=[501]) as (client, sessions):
+            admin = await client.get("/api/admin/channels/501/oauth/usage")
+            assert admin.status_code == 200 and admin.json()["limit_reached"] is True
+            assert admin.json()["command_goat"]["credits"]["monthly_remaining"] == 65.6947884845
+            gateway = await client.get("/v1/usage", headers={"Authorization": f"Bearer {KEY}"})
+            assert gateway.status_code == 200 and len(requests) == 4
+            entry = gateway.json()["channels"][0]
+            detail = entry["command_goat"]["five_hour" if window == "fiveHour" else "weekly"]
+            assert entry["limit_reached"] is None and entry["allowed"] is None
+            assert detail == {"exceeded": True, "reset_at": 1_800_000_100.0}
+            assert all(secret not in gateway.text for secret in (
+                "provider-private-key", "65.6947884845", "monthly_remaining", "total_cost", "purchased_remaining", "cap",
+            ))
     asyncio.run(exercise())

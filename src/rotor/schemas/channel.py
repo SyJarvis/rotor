@@ -208,6 +208,67 @@ class CommandGoatUsage(BaseModel):
     summary: CommandGoatSummary
 
 
+class OpenCodeSources(BaseModel):
+    usage: Literal["ok", "unauthorized", "forbidden", "unavailable", "invalid_response", "error"]
+    subscription: Literal["ok", "unauthorized", "forbidden", "unavailable", "invalid_response", "error"]
+    billing: Literal["ok", "unauthorized", "forbidden", "unavailable", "invalid_response", "error"]
+
+
+class OpenCodeUsageWindow(BaseModel):
+    status: Literal["ok", "rate-limited"]
+    used_percent: float
+    reset_at: float
+
+
+class OpenCodeUsageWindows(BaseModel):
+    five_hour: OpenCodeUsageWindow
+    weekly: OpenCodeUsageWindow
+    monthly: OpenCodeUsageWindow
+
+
+class OpenCodeAllowanceWindow(BaseModel):
+    used_microcents: str
+    limit_microcents: str
+    starts_at: Optional[float] = None
+    reset_at: Optional[float] = None
+
+
+class OpenCodeAccess(BaseModel):
+    starts_at: float
+    ends_at: float
+    cancel_at_period_end: bool
+    five_hour: OpenCodeAllowanceWindow
+    weekly: OpenCodeAllowanceWindow
+    monthly: OpenCodeAllowanceWindow
+
+
+class OpenCodeSubscription(BaseModel):
+    product: str
+    renewal_product: str
+    use_balance: bool
+    cancel_at_period_end: bool
+    renewal_pending: bool
+    resumability: Optional[str] = None
+    access: Optional[OpenCodeAccess] = None
+
+
+class OpenCodeBilling(BaseModel):
+    billing_mode: str
+    mode: str
+    balance_microcents: str
+    available_microcents: str
+    credit_limit_microcents: Optional[str] = None
+    can_purchase_credits: bool
+    can_enable_auto_recharge: bool
+
+
+class OpenCodeUsage(BaseModel):
+    sources: OpenCodeSources
+    usage: Optional[OpenCodeUsageWindows] = None
+    subscription: Optional[OpenCodeSubscription] = None
+    billing: Optional[OpenCodeBilling] = None
+
+
 class ChannelUsageResponse(BaseModel):
     """Subscription usage snapshot for a channel with a quota provider."""
 
@@ -219,6 +280,7 @@ class ChannelUsageResponse(BaseModel):
     primary: Optional[ChannelUsageWindow] = None
     secondary: Optional[ChannelUsageWindow] = None
     command_goat: Optional[CommandGoatUsage] = None
+    opencode: Optional[OpenCodeUsage] = None
     fetched_at: float
 
 
