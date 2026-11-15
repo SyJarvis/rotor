@@ -375,6 +375,15 @@ More documentation:
 - [Logs, usage, and storage](gitbook/operations/observability.md)
 - [Database migrations](gitbook/development/database-migrations.md)
 
+The documentation site lives in `site/` and renders `gitbook/` directly:
+
+```bash
+cd site
+npm install
+npm run dev      # local preview
+npm run build    # output in site/dist
+```
+
 ## License
 
 [MIT](LICENSE)

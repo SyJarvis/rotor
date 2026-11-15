@@ -82,4 +82,5 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 会发起真实模型请求。个人资料在“设置 → 账户”中修改，密码在“设置 → 登录与安全”
 中修改；该页面的“设备管理”用于查看和撤销客户端 OAuth 授权记录。
 
-接下来可以[配置更多渠道](../guides/channels.md)，或[接入常用客户端](../guides/client-integrations.md)。
+接下来可以[配置更多渠道](../guides/channels.md)、[使用网页对话](../guides/chat.md)，
+或[接入常用客户端](../guides/client-integrations.md)。

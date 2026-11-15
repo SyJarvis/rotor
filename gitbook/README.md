@@ -1,4 +1,4 @@
-# Rotor
+# 概览
 
 Rotor 是一个自托管的 LLM API 网关，提供网页对话与管理页面。它把多个上游模型渠道统一暴露为
 OpenAI Chat Completions、OpenAI Responses、OpenAI Images 和 Anthropic

@@ -247,14 +247,14 @@ thinking.type=adaptive        ≠ effort level
 
 实现和测试入口：
 
-- [`ResponsesRequest`](../../src/rotor/schemas/responses.py)
-- [`ChatCompletionRequest`](../../src/rotor/schemas/request.py)
-- [`AnthropicMessageRequest`](../../src/rotor/schemas/request.py)
-- [`Responses adapter`](../../src/rotor/adapters/protocol/responses.py)
-- [`Anthropic adapter`](../../src/rotor/adapters/protocol/anthropic.py)
-- [`request capabilities`](../../src/rotor/gateway/capabilities.py)
-- [`Responses protocol tests`](../../tests/test_responses_protocol.py)
-- [`Anthropic protocol tests`](../../tests/test_anthropic_protocol.py)
+- [`ResponsesRequest`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/schemas/responses.py)
+- [`ChatCompletionRequest`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/schemas/request.py)
+- [`AnthropicMessageRequest`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/schemas/request.py)
+- [`Responses adapter`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py)
+- [`Anthropic adapter`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/anthropic.py)
+- [`request capabilities`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/gateway/capabilities.py)
+- [`Responses protocol tests`](https://github.com/SyJarvis/rotor/blob/main/tests/test_responses_protocol.py)
+- [`Anthropic protocol tests`](https://github.com/SyJarvis/rotor/blob/main/tests/test_anthropic_protocol.py)
 
 ## 6. 相关资料
 

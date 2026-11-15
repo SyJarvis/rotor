@@ -15,6 +15,7 @@ Bearer 支持两者，`x-api-key` 仅支持 API Key；授权码和 refresh token
 | `GET` | `/health` | 无 | 进程健康与协议列表 |
 | `GET` | `/api` | 无 | 服务元数据和主要入口 |
 | `GET` | `/v1/models` | 可选 | 无凭证列出启用渠道模型及映射键；有效推理凭证应用渠道和模型权限 |
+| `GET` | `/v1/usage` | 推理凭证 | 当前调用方的额度与上游套餐窗口快照 |
 
 ## OpenAI Chat 和 Images
 
@@ -75,6 +76,41 @@ Bearer 可携带 API Key 或 OAuth access token，`x-api-key` 仅用于 API Key�
 `GET /anthropic/v1/models` 也需要推理凭证，并按实际渠道、模型权限过滤。
 Anthropic SDK 的 Base URL 应设置为
 `http://host:port/anthropic`，由 SDK 追加 `/v1/messages`。
+
+## 用量快照
+
+`GET /v1/usage` 使用推理凭证，返回当前调用方自身的额度和可见渠道的上游套餐窗口：
+
+```bash
+curl http://127.0.0.1:8000/v1/usage \
+  -H "Authorization: Bearer $ROTOR_API_KEY"
+```
+
+```json
+{
+  "quota": {"used": 120000, "limit": 1000000, "unit": "tokens"},
+  "channels": [
+    {
+      "channel_id": 1,
+      "channel": "openai-pro",
+      "provider": "chatgpt",
+      "plan": "plus",
+      "subscription_status": "active",
+      "rate_limit": {"primary_window": null, "secondary_window": null},
+      "limit_reached": false,
+      "allowed": true,
+      "fetched_at": "2026-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+`quota` 对无所属账户的旧 Key 返回该 Key 自身的额度；`limit` 为 `null` 表示不限制。
+`channels` 只包含当前变量有权访问的启用渠道，并且只返回管理页近期刷新过的缓存窗口，
+这个接口不会主动请求上游。缓存有效期 90 秒；空列表表示“暂无缓存快照”，不代表额度
+耗尽。
+
+供应商账单金额和原始货币额度只对管理员可见，不在客户端响应中返回。
 
 ## 通用请求头
 

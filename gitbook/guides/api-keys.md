@@ -88,4 +88,4 @@ MCP Control Key 使用当前 Control API 的只读 scope。可以在管理页停
 聊天记录中。
 
 接口路径见[管理 API](../reference/admin-api.md)；MCP Server 的安装和客户端配置见
-仓库中的 `mcp/README.md`。
+[MCP 诊断适配器](mcp.md)。
