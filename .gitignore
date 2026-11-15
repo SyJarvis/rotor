@@ -134,3 +134,8 @@ Thumbs.db
 
 # Local compose overrides
 docker-compose.override.yml
+
+# Documentation site build output and caches
+/site/node_modules/
+/site/dist/
+/site/.cache/
