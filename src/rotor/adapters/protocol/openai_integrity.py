@@ -2,8 +2,11 @@
 
 from copy import deepcopy
 import json
+import logging
 
 from rotor.core.exceptions import UpstreamOverloaded, UpstreamProtocolError, is_overload_error_signal
+
+logger = logging.getLogger(__name__)
 
 
 _TOKEN_FIELDS = {
@@ -146,6 +149,38 @@ def _carries_stream_content(delta):
     )
 
 
+def _describe_error_finish(choice: dict) -> str:
+    """Extract human-readable detail from an error-finish choice."""
+    parts: list[str] = []
+    for key in ("error", "message"):
+        value = choice.get(key)
+        if isinstance(value, dict):
+            for sub in ("message", "msg", "code", "type"):
+                sub_value = value.get(sub)
+                if isinstance(sub_value, str) and sub_value.strip():
+                    parts.append(sub_value.strip())
+        elif isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        for sub in ("content", "reasoning_content", "reasoning", "text"):
+            sub_value = delta.get(sub)
+            if isinstance(sub_value, str) and sub_value.strip():
+                parts.append(sub_value.strip())
+        message = delta.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                parts.append(content.strip())
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for part in parts:
+        if part not in seen:
+            seen.add(part)
+            ordered.append(part)
+    return " | ".join(ordered)[:1000]
+
+
 class ChatStreamIntegrity:
     def __init__(self, *, expected_choices=None, upstream_status=None, secret=None):
         self.expected_choices = expected_choices
@@ -200,6 +235,41 @@ class ChatStreamIntegrity:
                     if isinstance(finish_reason, str) else None
                 )
                 if canonical is None:
+                    raw = finish_reason.strip().lower() if isinstance(finish_reason, str) else ""
+                    if raw == "error":
+                        # Some gateways (e.g. commandcode.ai) encode a provider
+                        # failure as finish_reason="error" with HTTP 200 instead
+                        # of an SSE error event. Surface the embedded detail and
+                        # mark it retryable so routing can fail over instead of
+                        # returning an opaque 502 with no fallback.
+                        detail = _describe_error_finish(choice)
+                        if self.secret:
+                            try:
+                                detail = detail.replace(self.secret, "[redacted]")
+                            except Exception:
+                                pass
+                        try:
+                            chunk_preview = json.dumps(chunk, ensure_ascii=False)[:2000]
+                            if self.secret:
+                                chunk_preview = chunk_preview.replace(self.secret, "[redacted]")
+                        except Exception:
+                            chunk_preview = repr(choice)[:2000]
+                        logger.warning(
+                            "Upstream returned error finish reason detail=%r chunk=%s",
+                            detail[:500],
+                            chunk_preview,
+                        )
+                        error = UpstreamProtocolError(
+                            f"Invalid Chat stream finish reason 'error': {detail[:500] or 'unknown provider error'}"
+                        )
+                        error.upstream_status = self.upstream_status
+                        if self.provider_usage is not None:
+                            error.provider_usage = deepcopy(self.provider_usage)
+                        # Transient provider failure: allow failover to the
+                        # next channel instead of failing the request outright.
+                        error.fallback_allowed = True
+                        error.retry_same_channel = False
+                        raise error
                     self._fail(f"Invalid Chat stream finish reason: {finish_reason!r}")
                 # Native stop reasons must not leak to Chat clients.
                 choice["finish_reason"] = canonical

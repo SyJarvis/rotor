@@ -1480,18 +1480,21 @@ class ChatAttemptIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
 
-            with self.assertRaises(ChannelException):
-                await chat_endpoint.chat_completions(
-                    request,
-                    http_request,
-                    Response(),
-                    FakeDatabase(),
-                    SimpleNamespace(id=1),
-                )
+            result = await chat_endpoint.chat_completions(
+                request,
+                http_request,
+                Response(),
+                FakeDatabase(),
+                SimpleNamespace(id=1),
+            )
         finally:
             chat_endpoint.AsyncClient = original_async_client
 
-        # The streaming generator never started, so the endpoint must have
+        # No upstream stream ever opened, so the official upstream error is
+        # forwarded verbatim instead of a gateway-made ChannelException. The
+        # streaming generator never started, so the endpoint must have
         # closed the client itself instead of leaking it.
+        assert result.status_code == 503
+        assert "unavailable" in result.body.decode()
         assert http_client.closed is True
         assert routing.unavailable == [1]

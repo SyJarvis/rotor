@@ -5,19 +5,30 @@ from datetime import timezone
 from email.utils import parsedate_to_datetime
 from time import time
 from typing import Any, Optional
-from fastapi import HTTPException, Request, status
+
+import httpx
+from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
+
 from rotor.schemas.error import ErrorCategory, ErrorPhase, UpstreamErrorFact
 
 logger = logging.getLogger(__name__)
 
 _SENSITIVE_KEYS = {
-    "authorization",
+    "access_token",
+    "account_id",
     "api-key",
     "api_key",
     "apikey",
+    "authorization",
+    "chatgpt-account-id",
+    "chatgpt_account_id",
+    "client_secret",
     "cookie",
+    "id_token",
     "key",
+    "password",
+    "refresh_token",
     "set-cookie",
     "token",
     "x-api-key",
@@ -45,8 +56,6 @@ def _sanitize_provider_value(value: Any, *, depth: int = 0) -> Any:
 
 def upstream_error_payload(exc: Exception) -> dict[str, Any] | None:
     """Extract a bounded, sanitized upstream HTTP error for diagnostics."""
-    import httpx
-
     if not isinstance(exc, httpx.HTTPStatusError):
         return None
     response = exc.response
@@ -64,7 +73,7 @@ def upstream_error_payload(exc: Exception) -> dict[str, Any] | None:
         body: Any = response.json()
     except (httpx.ResponseNotRead, httpx.StreamClosed):
         body = "[upstream response body was not read]"
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError):  # json.JSONDecodeError is a ValueError
         try:
             body = response.text
         except (httpx.ResponseNotRead, httpx.StreamClosed):
@@ -74,6 +83,24 @@ def upstream_error_payload(exc: Exception) -> dict[str, Any] | None:
         "request_ids": request_ids,
         "body": _sanitize_provider_value(body),
     }
+
+
+# Canonical protocol error types shared by the OpenAI and Anthropic envelopes.
+# 529 is Anthropic's "overloaded" status; OpenAI clients see 503 instead.
+ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    402: "billing_error",
+    403: "permission_error",
+    404: "not_found_error",
+    409: "conflict_error",
+    413: "request_too_large",
+    422: "invalid_request_error",
+    429: "rate_limit_error",
+    503: "overloaded_error",
+    504: "timeout_error",
+    529: "overloaded_error",
+}
 
 
 _OVERLOAD_ERROR_TYPES = {
@@ -224,8 +251,6 @@ def normalize_upstream_error(
     phase: ErrorPhase = ErrorPhase.PROVIDER_REQUEST,
 ) -> UpstreamErrorFact:
     """Return a stable, sanitized diagnostic fact for an upstream failure."""
-    import httpx
-
     provider_error = upstream_error_payload(exc)
     upstream_status = None
     sanitized_body = None
@@ -306,8 +331,11 @@ def normalize_upstream_error(
         upstream_status = exc.upstream_status
         code = "upstream_invalid_response"
         category = ErrorCategory.PROTOCOL_OR_PARAMETER_ERROR
-        retry_same_channel = False
-        fallback_allowed = False
+        # Most protocol violations are deterministic (do not retry). A
+        # provider error encoded as finish_reason="error" is transient and
+        # explicitly marked retryable by the integrity checker instead.
+        retry_same_channel = bool(getattr(exc, "retry_same_channel", False))
+        fallback_allowed = bool(getattr(exc, "fallback_allowed", False))
         message = str(exc)
     elif isinstance(exc, UpstreamOverloaded):
         upstream_status = exc.upstream_status
@@ -353,9 +381,112 @@ def format_error_message(exc: Exception) -> str:
     if provider_error is not None:
         body = json.dumps(provider_error, ensure_ascii=False, separators=(",", ":"))
         return f"{type(exc).__name__}: {msg}; upstream={body}"
+    if isinstance(exc, httpx.RequestError):
+        # Connection errors often carry an empty message (notably timeouts),
+        # which makes "ConnectError" unactionable in logs. Attach the target
+        # host (never path/query, which may echo credentials) plus the cause
+        # chain (DNS/TLS/errno from httpcore), each truncated.
+        details: list[str] = []
+        try:
+            request = exc.request
+        except RuntimeError:
+            # httpx raises RuntimeError (not AttributeError) when no request
+            # was attached, so getattr's default does not apply.
+            request = None
+        host = getattr(getattr(request, "url", None), "host", None)
+        if host:
+            details.append(f"host={host}")
+        seen: set[int] = set()
+        cause = exc.__cause__ or exc.__context__
+        while cause is not None and len(details) < 4 and id(cause) not in seen:
+            seen.add(id(cause))
+            first_line = str(cause).strip().splitlines()
+            text = first_line[0][:200] if first_line and first_line[0] else ""
+            if text and all(text != part for part in details):
+                details.append(text)
+            cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+        if msg and all(msg[:200] != part for part in details):
+            details.append(msg[:200])
+        if details:
+            return f"{type(exc).__name__}: {'; '.join(details)}"
+        return type(exc).__name__
     if msg:
         return f"{type(exc).__name__}: {msg}"
     return type(exc).__name__
+
+
+def upstream_error_reply(exc: Exception) -> tuple[int, bytes, str, str | None] | None:
+    """Return the official upstream error reply for transparent forwarding.
+
+    The gateway is a forwarder: when the provider itself answered with an
+    error status, the client should see that reply instead of a gateway-made
+    message. Returns ``(status_code, content, media_type, retry_after)`` or
+    ``None`` when there is no readable upstream response (connection errors,
+    timeouts, mid-stream truncations) and the gateway must synthesize one.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return None
+    response = exc.response
+    try:
+        content = response.content
+    except (httpx.ResponseNotRead, httpx.StreamClosed, RuntimeError):
+        return None
+    if not isinstance(content, (bytes, bytearray)) or not content:
+        return None
+    media_type = (response.headers.get("content-type") or "application/json").split(";", 1)[0].strip() or "application/json"
+    return response.status_code, bytes(content), media_type, response.headers.get("retry-after")
+
+
+def upstream_retry_after(exc: Exception) -> str | None:
+    """Return the provider's Retry-After header, if the failure carried one."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.headers.get("retry-after")
+    return None
+
+
+def upstream_message_text(exc: Exception, *, default: str | None = None) -> str | None:
+    """Extract the provider's own error message for protocol envelopes."""
+    provider_error = upstream_error_payload(exc)
+    if provider_error is None:
+        return default
+    body = provider_error["body"]
+    if isinstance(body, str):
+        text = body.strip()
+        if not text or text.startswith("[upstream response body was not read]"):
+            return default
+        return text[:500]
+    if not isinstance(body, dict):
+        return default
+    for key in ("error", "message", "msg", "detail"):
+        value = body.get(key)
+        if isinstance(value, dict):
+            for sub in ("message", "msg", "text"):
+                sub_value = value.get(sub)
+                if isinstance(sub_value, str) and sub_value.strip():
+                    return sub_value.strip()[:500]
+            continue
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:500]
+    return default
+
+
+def upstream_error_response(exc: Exception) -> Response | None:
+    """Build a verbatim response from the official upstream error, if any.
+
+    Returns ``None`` when the provider never answered (connect/timeout/stream
+    cut), leaving callers free to synthesize a gateway error instead.
+    """
+    reply = upstream_error_reply(exc)
+    if reply is None:
+        return None
+    status_code, content, media_type, retry_after = reply
+    headers = {"Retry-After": retry_after} if retry_after else None
+    return Response(
+        content=content,
+        status_code=status_code,
+        media_type=media_type,
+        headers=headers,
+    )
 
 
 def classify_error_status(exc: Exception) -> int:
@@ -364,10 +495,9 @@ def classify_error_status(exc: Exception) -> int:
     - Timeout  -> 504 Gateway Timeout
     - Upstream 4xx (bad key, bad request, ...) -> pass through
     - Upstream 5xx or connection error -> 502 Bad Gateway
+    - Upstream overloaded -> 503 Service Unavailable
     - Anything else -> 500 Internal Server Error
     """
-    import httpx
-
     if isinstance(exc, httpx.TimeoutException):
         return 504
     if isinstance(exc, httpx.HTTPStatusError):
@@ -377,6 +507,8 @@ def classify_error_status(exc: Exception) -> int:
         return 502
     if isinstance(exc, UpstreamProtocolError):
         return exc.status_code
+    if isinstance(exc, UpstreamOverloaded):
+        return 503
     return 500
 
 
@@ -494,18 +626,27 @@ class ChannelException(APIRouterException):
 
 
 class RateLimitException(APIRouterException):
-    """Rate limit exception."""
+    """Gateway-side client rate limit.
 
-    def __init__(self, detail: str = "Rate limit exceeded") -> None:
+    Carries ``Retry-After`` (header and body) so coding agents back off to
+    a concrete deadline instead of retry-spinning.
+    """
+
+    def __init__(self, detail: str = "Rate limit exceeded", retry_after_seconds: int | None = None) -> None:
+        error: dict = {
+            "message": detail,
+            "type": "rate_limit_error",
+            "code": "rate_limit_exceeded",
+        }
+        headers = None
+        if retry_after_seconds is not None:
+            wait = max(1, int(retry_after_seconds))
+            error["retry_after_seconds"] = wait
+            headers = {"Retry-After": str(wait)}
         super().__init__(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={
-                "error": {
-                    "message": detail,
-                    "type": "rate_limit_error",
-                    "code": "rate_limit_exceeded"
-                }
-            }
+            detail={"error": error},
+            headers=headers,
         )
 
 

@@ -320,8 +320,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Check rate limit
         if len(self.request_counts[client_id]) >= self.requests_per_minute:
             from rotor.core.exceptions import RateLimitException
+            oldest = self.request_counts[client_id][0] if self.request_counts[client_id] else current_time
             raise RateLimitException(
-                f"Rate limit exceeded: {self.requests_per_minute} requests per minute"
+                f"Rate limit exceeded: {self.requests_per_minute} requests per minute",
+                retry_after_seconds=max(1, int(oldest + 60 - current_time)),
             )
 
         # Add current request

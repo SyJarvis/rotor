@@ -41,6 +41,7 @@ from rotor.core.exceptions import (
     format_error_message,
     normalize_upstream_error,
     upstream_error_payload,
+    upstream_error_response,
 )
 from rotor.database import async_session_maker, get_db
 from rotor.gateway.provider_facts import (
@@ -847,6 +848,9 @@ async def create_response(
     if last_error is None:
         wait, plan_limited = routing_engine.cooldown_outlook(chat_request.model, routing_candidates)
         raise ChannelsTemporarilyUnavailable(chat_request.model, wait, plan_limited=plan_limited)
+    reply = upstream_error_response(last_error)
+    if reply is not None:
+        return reply
     raise ChannelException(
         f"All channels failed for model '{chat_request.model}'",
         status_code=classify_error_status(last_error),
@@ -889,7 +893,9 @@ def _upstream_response(response) -> Response:
 
 
 def _upstream_error(exc: HTTPStatusError) -> Response:
-    return _upstream_response(exc.response)
+    # Reuse the shared forwarder so Retry-After survives on this path too.
+    reply = upstream_error_response(exc)
+    return reply if reply is not None else Response(status_code=exc.response.status_code)
 
 
 async def _account_deferred_response_usage(

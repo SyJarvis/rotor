@@ -48,6 +48,7 @@ from rotor.core.exceptions import (
     format_error_message,
     normalize_upstream_error,
     upstream_error_payload,
+    upstream_error_response,
 )
 from httpx import AsyncClient, HTTPStatusError, RequestError
 
@@ -385,6 +386,11 @@ async def chat_completions(
     if last_error is None:
         wait, plan_limited = routing_engine.cooldown_outlook(request.model, candidates)
         raise ChannelsTemporarilyUnavailable(request.model, wait, plan_limited=plan_limited)
+    # The official upstream answered: forward its reply verbatim instead of
+    # wrapping it in a gateway-made error.
+    reply = upstream_error_response(last_error)
+    if reply is not None:
+        return reply
     raise ChannelException(
         f"All channels failed for model '{request.model}'",
         status_code=classify_error_status(last_error),
@@ -1088,7 +1094,8 @@ async def _handle_streaming_request(
                 error_chunk = {
                     "error": {
                         "message": error_message,
-                        "type": "stream_error"
+                        "type": "stream_error",
+                        "code": normalize_upstream_error(e, phase=ErrorPhase.PROVIDER_STREAM).code,
                     }
                 }
                 yield f"data: {_json_dumps(error_chunk)}\n\n"
