@@ -24,6 +24,13 @@ class OpenAICodexAdapter(OpenAIResponsesAdapter):
         return self.responses_url()
 
     def build_request_headers(self) -> dict[str, str]:
+        return self._headers_for_session(None)
+
+    def setup_request_headers(self, request: ChatCompletionRequest) -> dict[str, str]:
+        """Attach the conversation cache-affinity id when one was resolved."""
+        return self._headers_for_session(request.responses_session_id)
+
+    def _headers_for_session(self, session_id: str | None) -> dict[str, str]:
         if not self._access_token or not self._account_id:
             raise UpstreamProtocolError("ChatGPT OAuth credentials are unavailable", status_code=401)
         reserved = {
@@ -34,6 +41,8 @@ class OpenAICodexAdapter(OpenAIResponsesAdapter):
             name: value for name, value in ((self.channel.extra or {}).get("headers") or {}).items()
             if name.lower() not in reserved
         }
+        if session_id:
+            headers["session_id"] = session_id
         headers.update({
             "Authorization": f"Bearer {self._access_token}",
             "chatgpt-account-id": self._account_id,

@@ -134,6 +134,54 @@ POST /oauth/token
 | `POST /anthropic/v1/messages` | Anthropic | Messages,支持流式 |
 | `POST /anthropic/v1/messages/count_tokens` | Anthropic | token 估算 |
 
+## 提示词缓存亲和
+
+上游的两种缓存模型不一样,agent 需要按渠道类型配合:
+
+| 渠道类型 | 缓存寻址方式 | 客户端要做的 |
+|---|---|---|
+| 标准 OpenAI 兼容(`/chat/completions`、`/messages`) | 前缀内容寻址 | 无。保持前缀稳定即可,首条也能命中 |
+| ChatGPT Codex(`openai_codex`) | 按 `session_id` 请求头分桶 | 每条会话发一个稳定的会话 id |
+
+Codex 端的规则(实测):同一前缀在 A 桶预热后,换桶仍然 0%;同一桶内第二轮起稳定 98%。
+缓存不跨桶共享,所以**渠道级静态 `session_id` 是错的** —— 所有会话挤进一个桶,既拿不到
+按会话的增长命中,又会互相淘汰。
+
+### 客户端怎么发会话 id
+
+Rotor 按以下顺序识别,命中即止(值只要求稳定且唯一,长度上限 100):
+
+1. `x-conversation-id` / `x-rotor-session-id` / `x-mindcode-session-id`
+2. 客户端专属头:`session_id` 或 `session-id`(Codex/pi)、`x-opencode-session`、
+   `x-claude-code-session-id`、`x-grok-conv-id`、`x-session-affinity`
+3. `x-session-id`
+4. 兜底序列:`conversation` → `metadata.user_id` / `session_id` → `prompt_cache_key` → `user`
+
+Rotor 匹配到之后派生成 `rotor_session_<hash>` 再发给 Codex 上游;派生值里带了令牌 id,
+不同租户的同名会话不会共用一个桶。客户端不需要知道这个格式,发自己的会话 id 即可。
+
+> `prompt_cache_key` 对 Codex 上游无效 —— 实测可以 200 返回但缓存毫无变化。
+> 它只作为第 4 级兜底来源参与会话识别,不要指望它单独起作用。
+
+### 不要做的事
+
+- 不要在渠道附加配置里写死 `extra.headers.session_id`。有真实会话时它会被覆盖,
+  只有完全无会话来源的请求才退回这个静态值。
+- 不要把请求 id / trace id 当会话 id 传:每轮都变,等于每轮冷启动。
+- 前缀要够长才有意义:3.2k token 上下不命中,9.6k 以上稳定命中。
+
+### 自检
+
+```bash
+# 同一会话连发两次,第二轮应有 cached_tokens;换个会话应回到 0
+curl -s $BASE/v1/responses -H "Authorization: Bearer $KEY" -H "session-id: conv-demo-1" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-6.1-sol","input":"<较长的稳定前缀>"}' | jq .usage
+```
+
+网关侧看 `request_logs` 的 `cached_tokens / prompt_tokens`:同一 `cache_scope` 下
+第二轮起应稳定在高位。
+
 ## 错误语义与重试建议
 
 | 状态 | 含义 | agent 行为 |

@@ -29,7 +29,10 @@ from rotor.adapters.protocol.responses import (
 )
 from rotor.core.deps import get_available_channels, get_current_token
 from rotor.core.user_access import AccountPrincipal, principal_scope_key, reload_principal, effective_permissions
-from rotor.core.client_session import resolve_client_session
+from rotor.core.client_session import (
+    build_responses_session_id,
+    resolve_client_session,
+)
 from rotor.core.header_forwarding import snapshot_inbound_headers
 from rotor.application_settings import application_settings
 from rotor.core.exceptions import (
@@ -443,6 +446,10 @@ async def create_response(
         ),
     )
     chat_request.inbound_headers = snapshot_inbound_headers(http_request.headers)
+    chat_request.responses_session_id = build_responses_session_id(
+        token_id=principal_scope_key(token),
+        session_id=client_session.session_id,
+    )
     conversation_id = client_session.session_id or f"conv_{uuid.uuid4().hex[:24]}"
     client_ip = http_request.client.host if http_request.client else "unknown"
     request_origin = getattr(http_request.state, "request_origin", "client")

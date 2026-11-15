@@ -7,7 +7,10 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rotor.database import async_session_maker, get_db
-from rotor.core.client_session import resolve_client_session
+from rotor.core.client_session import (
+    build_responses_session_id,
+    resolve_client_session,
+)
 from rotor.core.header_forwarding import snapshot_inbound_headers
 from rotor.core.deps import get_current_token, get_available_channels
 from rotor.application_settings import application_settings
@@ -95,6 +98,10 @@ async def chat_completions(
         legacy_user_id=request.user,
     )
     request.inbound_headers = snapshot_inbound_headers(http_request.headers)
+    request.responses_session_id = build_responses_session_id(
+        token_id=principal_scope_key(token),
+        session_id=client_session.session_id,
+    )
     conversation_id = client_session.session_id or f"conv_{uuid.uuid4().hex[:24]}"
     client_ip = http_request.client.host if http_request.client else "unknown"
     request_origin = getattr(http_request.state, "request_origin", "client")
