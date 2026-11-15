@@ -131,8 +131,8 @@ access token；`x-api-key` 仅用于 API Key。授权码和 refresh token 不能
 
 ### 2.2 非流式响应
 
-成功响应是 `chat.completion` 子集，模型定义见
-[`ChatCompletionResponse`](../../src/rotor/schemas/request.py)：
+成功响应是 `chat.completion` 子集，由适配器和转换器直接构造 dict，见
+[`responses_response_to_chat`](../../src/rotor/adapters/protocol/responses.py)：
 
 ```json
 {
@@ -255,8 +255,9 @@ Responses，上述别名会在发送前转换。
 
 ### 3.2 非流式响应
 
-Responses 响应模型是宽松 envelope（`extra="allow"`），见
-[`ResponsesResponse`](../../src/rotor/schemas/responses.py)：
+Responses 响应是宽松 envelope（`extra="allow"`），由
+[`chat_response_to_response`](../../src/rotor/api/v1/responses.py) 和
+[`chat_response_to_responses`](../../src/rotor/adapters/protocol/responses.py) 构造：
 
 ```json
 {
