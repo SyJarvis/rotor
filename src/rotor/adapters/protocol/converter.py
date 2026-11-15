@@ -513,37 +513,3 @@ class ProtocolConverter:
         # Ignore other event types
         return None
 
-
-class OpenAIProtocolConverter:
-    """Helper class for OpenAI protocol conversions."""
-
-    @staticmethod
-    def create_streaming_chunk(
-        chunk_id: str,
-        model: str,
-        content: Optional[str] = None,
-        tool_calls: Optional[List[Dict]] = None,
-        finish_reason: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Create an OpenAI streaming chunk."""
-        import time
-
-        delta: Dict[str, Any] = {}
-        if content:
-            delta["content"] = content
-        if tool_calls:
-            delta["tool_calls"] = tool_calls
-        if not delta and not finish_reason:
-            delta = {"role": "assistant"}
-
-        return {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": delta,
-                "finish_reason": finish_reason,
-            }]
-        }

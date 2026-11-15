@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -474,11 +473,6 @@ class ConversationStore:
     # ------------------------------------------------------------------ #
     # File path helpers
     # ------------------------------------------------------------------ #
-    async def append_raw(self, file_path: Path, payload: dict[str, Any]) -> None:
-        """Direct append bypassing the worker — retained for ad-hoc use."""
-        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
-        await self._append_raw(file_path, line)
-
     async def _append_raw(self, file_path: Path, line: str) -> None:
         def _write() -> None:
             file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -495,7 +489,3 @@ class ConversationStore:
         day = now.strftime("%Y-%m-%d")
         return Path(settings.CONVERSATION_STORE_DIR) / month / f"{day}.jsonl"
 
-    @staticmethod
-    def _safe_component(value: object) -> str:
-        cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
-        return cleaned[:128] or "unknown"

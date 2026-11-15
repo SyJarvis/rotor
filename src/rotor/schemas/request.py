@@ -112,53 +112,6 @@ class Usage(BaseModel):
     prompt_tokens_details: Optional[Dict[str, Any]] = None
 
 
-class ChatMessageResponse(BaseModel):
-    """Chat message response."""
-    role: Role
-    content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = None
-
-
-class ChatCompletionChoice(BaseModel):
-    """Chat completion choice."""
-    index: int
-    message: ChatMessageResponse
-    finish_reason: Optional[str] = None
-
-
-class ChatCompletionResponse(BaseModel):
-    """OpenAI Chat Completion response."""
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: List[ChatCompletionChoice]
-    usage: Usage
-
-
-class ChatCompletionChunkDelta(BaseModel):
-    """Chat completion chunk delta."""
-    role: Optional[Role] = None
-    content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = None
-
-
-class ChatCompletionChunkChoice(BaseModel):
-    """Chat completion chunk choice."""
-    index: int
-    delta: ChatCompletionChunkDelta
-    finish_reason: Optional[str] = None
-
-
-class ChatCompletionChunk(BaseModel):
-    """Chat completion chunk for streaming."""
-    id: str
-    object: str = "chat.completion.chunk"
-    created: int
-    model: str
-    choices: List[ChatCompletionChunkChoice]
-
-
 class ModelInfo(BaseModel):
     """Model information."""
     id: str
@@ -179,11 +132,6 @@ class ModelsResponse(BaseModel):
     data: List[ModelInfo]
 
 
-class ErrorResponse(BaseModel):
-    """Error response."""
-    error: Dict[str, Any]
-
-
 # Anthropic Protocol Models
 
 
@@ -191,28 +139,6 @@ class AnthropicMessage(BaseModel):
     """Anthropic message."""
     role: Literal["user", "assistant"]
     content: Union[str, List[Dict[str, Any]]]
-
-
-class AnthropicToolUseBlock(BaseModel):
-    """Anthropic tool use block."""
-    type: Literal["tool_use"]
-    id: str
-    name: str
-    input: Dict[str, Any]
-
-
-class AnthropicToolResultBlock(BaseModel):
-    """Anthropic tool result block."""
-    type: Literal["tool_result"]
-    tool_use_id: str
-    content: Union[str, List[Dict[str, Any]]]
-    is_error: Optional[bool] = False
-
-
-class AnthropicTextBlock(BaseModel):
-    """Anthropic text block."""
-    type: Literal["text"]
-    text: str
 
 
 class AnthropicToolDefinition(BaseModel):

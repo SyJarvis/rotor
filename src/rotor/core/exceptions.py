@@ -540,22 +540,6 @@ class AuthenticationException(APIRouterException):
         )
 
 
-class PermissionException(APIRouterException):
-    """Permission denied exception."""
-
-    def __init__(self, detail: str = "Permission denied") -> None:
-        super().__init__(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": {
-                    "message": detail,
-                    "type": "permission_error",
-                    "code": "permission_denied"
-                }
-            }
-        )
-
-
 class QuotaExceededException(APIRouterException):
     """Quota exceeded exception."""
 
@@ -588,22 +572,6 @@ class ModelNotFoundException(APIRouterException):
         )
 
 
-class InvalidRequestException(APIRouterException):
-    """Invalid request exception."""
-
-    def __init__(self, detail: str = "Invalid request") -> None:
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": {
-                    "message": detail,
-                    "type": "invalid_request_error",
-                    "code": "invalid_request"
-                }
-            }
-        )
-
-
 class ChannelException(APIRouterException):
     """Channel exception."""
 
@@ -623,31 +591,6 @@ class ChannelException(APIRouterException):
         if original_error:
             error_detail["error"]["original_error"] = original_error
         super().__init__(status_code=status_code, detail=error_detail)
-
-
-class RateLimitException(APIRouterException):
-    """Gateway-side client rate limit.
-
-    Carries ``Retry-After`` (header and body) so coding agents back off to
-    a concrete deadline instead of retry-spinning.
-    """
-
-    def __init__(self, detail: str = "Rate limit exceeded", retry_after_seconds: int | None = None) -> None:
-        error: dict = {
-            "message": detail,
-            "type": "rate_limit_error",
-            "code": "rate_limit_exceeded",
-        }
-        headers = None
-        if retry_after_seconds is not None:
-            wait = max(1, int(retry_after_seconds))
-            error["retry_after_seconds"] = wait
-            headers = {"Retry-After": str(wait)}
-        super().__init__(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={"error": error},
-            headers=headers,
-        )
 
 
 class ChannelsTemporarilyUnavailable(APIRouterException):
