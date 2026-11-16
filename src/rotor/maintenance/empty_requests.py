@@ -108,10 +108,6 @@ class CleanupReport:
     archived_path: Path | None = None
     deleted_rows: dict[str, int] = field(default_factory=dict)
 
-    @property
-    def matched(self) -> int:
-        return self.matched_usage_ledger
-
 
 def inspect_empty_requests(database_path: str | Path) -> CleanupReport:
     """Return a read-only report for the incident-specific predicate."""

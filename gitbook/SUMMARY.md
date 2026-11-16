@@ -1,21 +1,35 @@
 # Summary
 
+- [概览](README.md)
+
 ## 开始使用
 
-- [Rotor 文档](README.md)
 - [安装与启动](getting-started/installation.md)
 - [完成第一次请求](getting-started/quickstart.md)
 
-## 使用指南
+## 基础
 
 - [配置与维护渠道](guides/channels.md)
-- [ChatGPT OAuth 渠道](guides/chatgpt-oauth.md)
 - [管理 API Key 与配额](guides/api-keys.md)
 - [选择路由策略](guides/routing.md)
+- [使用网页对话](guides/chat.md)
+- [管理账户与邀请](guides/accounts.md)
 - [接入 Codex、Claude Code 与 OpenCode](guides/client-integrations.md)
 - [客户端网页登录授权](guides/client-oauth.md)
+- [ChatGPT OAuth 渠道](guides/chatgpt-oauth.md)
 
-## 核心概念
+## 扩展
+
+- [MCP 诊断适配器](guides/mcp.md)
+
+## 参考手册
+
+- [客户端 API](reference/client-api.md)
+- [管理 API](reference/admin-api.md)
+- [Control API](reference/control-api.md)
+- [Channel 字段](reference/channel-schema.md)
+
+## 原理与架构
 
 - [系统架构](concepts/architecture.md)
 - [协议兼容与转换](concepts/protocols.md)
@@ -30,12 +44,7 @@
 - [部署](operations/deployment.md)
 - [日志、用量与数据存储](operations/observability.md)
 - [安全边界](operations/security.md)
-
-## 参考
-
-- [客户端 API](reference/client-api.md)
-- [管理 API](reference/admin-api.md)
-- [Channel 字段](reference/channel-schema.md)
+- [维护命令](operations/maintenance.md)
 
 ## 故障排查
 

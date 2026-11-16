@@ -11,7 +11,6 @@ from rotor.application_settings import application_settings
 from rotor.config import settings
 from rotor.core.exceptions import normalize_upstream_error
 from rotor.gateway.fallback import (
-    CONNECT_COOLDOWN_SECONDS,
     connect_cooldown_for_streak,
     is_connect_failure,
 )

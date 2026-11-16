@@ -1,7 +1,7 @@
 # 日志、用量与数据存储
 
 Rotor 的管理页提供渠道状态、API Key、用量和请求日志视图；相同数据也可通过
-管理 API 查询。
+管理 API 查询，机器调用的只读诊断走 [Control API](../reference/control-api.md)。
 
 ## 健康检查
 

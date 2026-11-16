@@ -28,9 +28,9 @@ Images 是独立的第四条请求路径（`/v1/images/generations`），不经�
 | `POST /anthropic/v1/messages` | `anthropic_messages` | Anthropic JSON 或 Anthropic SSE |
 
 这个值用于能力筛选、路由记录、attempt/usage 记账和错误包装；它不会因为选择了某个
-上游 Channel 而改变。Chat 路由在 [`chat_completions`](../../src/rotor/api/v1/chat.py)
-设置它，Responses 路由在 [`create_response`](../../src/rotor/api/v1/responses.py)
-设置它，Anthropic 路由在 [`messages`](../../src/rotor/api/v1/anthropic.py)
+上游 Channel 而改变。Chat 路由在 [`chat_completions`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/chat.py)
+设置它，Responses 路由在 [`create_response`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/responses.py)
+设置它，Anthropic 路由在 [`messages`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/anthropic.py)
 设置它。
 
 ### 1.2 `Channel.protocol`：上游 wire protocol
@@ -46,8 +46,8 @@ Channel 的 `protocol` 决定适配器向 provider 发出的 URL、鉴权、请�
 上述是常见默认值，最终以 provider preset、`extra.request_path`、`extra.auth_type` 和
 `extra.headers` 为准；`model_mapping` 只映射
 logical model 到 provider model。默认推导和请求头见
-[`presets.py`](../../src/rotor/channels/presets.py) 与
-[`base.py`](../../src/rotor/adapters/base.py)。
+[`presets.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/channels/presets.py) 与
+[`base.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/base.py)。
 
 例如 `zhipu` + Anthropic protocol 仍可使用 Bearer，而 `anthropic` type + Responses
 protocol 可按 `auth_type` 使用 `x-api-key`；组合不能只看协议名或 provider 名。
@@ -70,8 +70,8 @@ Responses/Anthropic protocol 会优先覆盖 type）：
 | `anthropic` | Anthropic adapter；常见 `/messages` + `x-api-key` |
 | `moonshot`、`minimax`、`zhipu`、`kimi` | 各自 provider 子类或 OpenAI-compatible |
 
-详见 [`AdapterFactory`](../../src/rotor/adapters/factory.py) 和
-[`PROVIDER_PRESETS`](../../src/rotor/channels/presets.py)。
+详见 [`AdapterFactory`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/factory.py) 和
+[`PROVIDER_PRESETS`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/channels/presets.py)。
 
 ### 1.4 native、pass-through 与 cross-protocol
 
@@ -92,7 +92,7 @@ Responses/Anthropic protocol 会优先覆盖 type）：
 入口为 `POST /v1/chat/completions`，Bearer 可携带 Rotor API Key 或客户端 OAuth
 access token；`x-api-key` 仅用于 API Key。授权码和 refresh token 不能用于推理。
 认证与登录流程见[客户端 API](../reference/client-api.md)。请求模型为
-[`ChatCompletionRequest`](../../src/rotor/schemas/request.py)：`model` 和
+[`ChatCompletionRequest`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/schemas/request.py)：`model` 和
 `messages` 必填，其余字段为可选子集。
 
 最小非流式请求：
@@ -126,13 +126,13 @@ access token；`x-api-key` 仅用于 API Key。授权码和 refresh token 不能
 生成接口则是独立路径。
 
 工具调用通过 `tools` function 定义、assistant `tool_calls` 和 `tool` 消息表达；
-模型定义见 [`request.py`](../../src/rotor/schemas/request.py)，通用 Chat 适配器序列化
-见 [`base.py`](../../src/rotor/adapters/base.py)。
+模型定义见 [`request.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/schemas/request.py)，通用 Chat 适配器序列化
+见 [`base.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/base.py)。
 
 ### 2.2 非流式响应
 
-成功响应是 `chat.completion` 子集，模型定义见
-[`ChatCompletionResponse`](../../src/rotor/schemas/request.py)：
+成功响应是 `chat.completion` 子集，由适配器和转换器直接构造 dict，见
+[`responses_response_to_chat`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py)：
 
 ```json
 {
@@ -160,8 +160,8 @@ access token；`x-api-key` 仅用于 API Key。授权码和 refresh token 不能
 
 失败的非流式响应由网关异常处理器包装为 `{"error": {...}}`；上游状态、错误类型和
 消息会进入记账，但具体 provider 错误字段不承诺完全保留。通用错误处理见
-[`exceptions.py`](../../src/rotor/core/exceptions.py) 及 Chat 路由错误分支
-[`chat.py`](../../src/rotor/api/v1/chat.py)。
+[`exceptions.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/core/exceptions.py) 及 Chat 路由错误分支
+[`chat.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/chat.py)。
 
 ### 2.3 Chat SSE
 
@@ -170,7 +170,7 @@ access token；`x-api-key` 仅用于 API Key。授权码和 refresh token 不能
 `object` 为 `chat.completion.chunk`，`choices[0].delta` 可含 `role`、`content` 或
 增量 `tool_calls`。流式 usage 若 provider 提供，会出现在最后的 usage chunk；通用
 OpenAI 适配器请求 `stream_options.include_usage=true`
-([`base.py`](../../src/rotor/adapters/base.py))。
+([`base.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/base.py))。
 
 典型文本流：
 
@@ -186,7 +186,7 @@ data: [DONE]
 
 如果流在没有文本、工具调用或 provider usage 的情况下结束，当前实现抛出
 `EmptyUpstreamResponse`，不会把它记录为成功的零 token 响应；实现见
-[`chat.py`](../../src/rotor/api/v1/chat.py)。
+[`chat.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/chat.py)。
 
 ## 3. OpenAI Responses
 
@@ -194,7 +194,7 @@ data: [DONE]
 
 创建入口为 `POST /v1/responses`。原生资源还包括 retrieve、delete、cancel、
 input_items、input_tokens 和 compact，路径表见[客户端 API](../reference/client-api.md#openai-responses)。
-模型为 [`ResponsesRequest`](../../src/rotor/schemas/responses.py)，使用
+模型为 [`ResponsesRequest`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/schemas/responses.py)，使用
 `extra="allow"` 保留未来字段。
 
 最小请求：
@@ -255,8 +255,9 @@ Responses，上述别名会在发送前转换。
 
 ### 3.2 非流式响应
 
-Responses 响应模型是宽松 envelope（`extra="allow"`），见
-[`ResponsesResponse`](../../src/rotor/schemas/responses.py)：
+Responses 响应是宽松 envelope（`extra="allow"`），由
+[`chat_response_to_response`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/responses.py) 和
+[`chat_response_to_responses`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py) 构造：
 
 ```json
 {
@@ -286,11 +287,11 @@ Responses 响应模型是宽松 envelope（`extra="allow"`），见
 
 函数输出 item 的形状为 `type=function_call`、`call_id`、`name`、字符串
 `arguments`。原生 Responses 响应会保留原生 JSON 字段（SSE framing 由网关重建）；Chat/Anthropic 上游的响应会由
-[`chat_response_to_responses`](../../src/rotor/adapters/protocol/responses.py)
+[`chat_response_to_responses`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py)
 构造上述 output item、usage 和 envelope。
 
 失败响应通常 `status="failed"` 并含 `error={"code", "message"}`；资源请求错误见
-[`responses.py`](../../src/rotor/api/v1/responses.py)。
+[`responses.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/responses.py)。
 
 ### 3.3 Responses SSE
 
@@ -314,7 +315,7 @@ data: {"type":"response.completed","response":{"id":"resp_abc","status":"complet
 `ResponsesStreamTransform`
 生成事件序列：`response.created`、`response.in_progress`、output item/content
 part added、text/tool delta、done，最后 `response.completed`
-([`responses.py`](../../src/rotor/api/v1/responses.py))。
+([`responses.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/responses.py))。
 
 跨协议 Chat→Responses 的文本事件示例：
 
@@ -340,7 +341,7 @@ data: {"type":"response.completed","sequence_number":8,"response":{"status":"com
 
 入口为 `POST /anthropic/v1/messages`，计数入口为
 `POST /anthropic/v1/messages/count_tokens`。Anthropic SDK 的 Base URL 应指向
-`/anthropic`。请求模型为 [`AnthropicMessageRequest`](../../src/rotor/schemas/request.py)，
+`/anthropic`。请求模型为 [`AnthropicMessageRequest`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/schemas/request.py)，
 允许额外字段。
 
 ```json
@@ -368,7 +369,7 @@ data: {"type":"response.completed","sequence_number":8,"response":{"status":"com
 
 消息 content block 支持 `text`、`image`（url 或 base64 source）、`tool_use` 和
 `tool_result` 的当前转换子集。含 `role=system` 的非标准 message 会被挪到顶层
-`system`，见 [`normalize_system_messages`](../../src/rotor/schemas/request.py)。
+`system`，见 [`normalize_system_messages`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/schemas/request.py)。
 
 ### 4.2 非流式响应
 
@@ -394,7 +395,7 @@ data: {"type":"response.completed","sequence_number":8,"response":{"status":"com
 
 工具调用使用 `content` 中的 `tool_use` block：`id`、`name`、JSON 对象 `input`，
 并以 `stop_reason="tool_use"` 结束。Chat/Responses 上游的返回由
-[`openai_to_anthropic_response`](../../src/rotor/api/v1/anthropic.py)
+[`openai_to_anthropic_response`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/anthropic.py)
 生成；空文本会生成一个空 `text` block。
 
 Anthropic 流失败事件的形状是 `{"type":"error","error":{"type":"stream_error","message"}}`；
@@ -411,7 +412,7 @@ Anthropic SSE 使用 `event: <type>` 加 `data: <JSON>`，空行分隔。原生 
 跨协议 Chat→Anthropic 会先发送合成 `message_start`，随后文本和工具 block 事件，流
 结束时发送 block stop、`message_delta`（含 `stop_reason`/usage）和 `message_stop`。
 `OpenAIToAnthropicStreamConverter` 会等到上游流结束，确保尾随 usage chunk 已看到
-后再发送终止事件，见 [`anthropic.py`](../../src/rotor/api/v1/anthropic.py)。
+后再发送终止事件，见 [`anthropic.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/anthropic.py)。
 
 Anthropic 路径不使用 `[DONE]` 作为正常终止标记；`message_stop` 只保证由转换流合成的
 正常终止。native 上游若以 EOF 或 `[DONE]` 结束且未带 `message_stop`，适配器不会补发。
@@ -441,10 +442,10 @@ Anthropic 路径不使用 `[DONE]` 作为正常终止标记；`message_stop` 只
 | response text | output message + `output_text` | `message.content` 拼接 | 仅读取 text/input_text/output_text/refusal；其他 output block 忽略，多 item 文本拼接 |
 | response function call | output function_call item | `tool_calls[]` | 缺 ID 时生成随机 ID |
 
-转换实现是 [`chat_request_to_responses_payload`](../../src/rotor/adapters/protocol/responses.py)、
-[`responses_request_to_chat`](../../src/rotor/adapters/protocol/responses.py)、
-[`responses_response_to_chat`](../../src/rotor/adapters/protocol/responses.py) 和
-[`chat_response_to_responses`](../../src/rotor/adapters/protocol/responses.py)。
+转换实现是 [`chat_request_to_responses_payload`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py)、
+[`responses_request_to_chat`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py)、
+[`responses_response_to_chat`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py) 和
+[`chat_response_to_responses`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py)。
 
 Chat→Responses 请求样例：
 
@@ -491,9 +492,9 @@ Responses→Chat 响应样例：
 | Chat usage | prompt details→cache 字段 | input/cache 字段→prompt details | 未知桶默认为 0 |
 | finish reason | — | end_turn→stop；max_tokens→length；tool_use→tool_calls | 映射表固定 |
 
-实现见 [`ProtocolConverter`](../../src/rotor/adapters/protocol/converter.py)、
-[`anthropic_to_openai_request`](../../src/rotor/api/v1/anthropic.py) 和
-[`openai_to_anthropic_response`](../../src/rotor/api/v1/anthropic.py)。
+实现见 [`ProtocolConverter`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/converter.py)、
+[`anthropic_to_openai_request`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/anthropic.py) 和
+[`openai_to_anthropic_response`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/anthropic.py)。
 
 Anthropic→Chat 遇到同一 user 消息混合文本与图片时，当前实现会拆成多个 user 消息；
 Anthropic system 的 billing/cache 扩展只在特定 Responses GPT-5.6 桥接中使用，普通
@@ -569,8 +570,8 @@ Responses，`OpenAIResponsesAdapter.convert_request` 深拷贝它，只覆盖映
 原始 payload 泄漏到另一协议。
 
 原生 Responses 非流式响应和 SSE 事件对象在
-[`OpenAIResponsesAdapter.convert_response`](../../src/rotor/adapters/protocol/responses.py)
-及 [`stream_convert_response`](../../src/rotor/adapters/protocol/responses.py)
+[`OpenAIResponsesAdapter.convert_response`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py)
+及 [`stream_convert_response`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py)
 中按 JSON event object 保留；创建流的客户端 framing 由网关重建为 `data:` 行。只有
 retrieve 等资源 relay 路径才可能逐字节转发上游流。
 
@@ -586,7 +587,7 @@ body 记录。
 `anthropic_headers`。原生 Anthropic adapter 深拷贝 payload，从而保留 `cache_control`、
 结构化 system、tool-result error state 和未来扩展；跨协议目标通常不会使用这些字段，唯一
 当前例外是上一节所述的 Anthropic `cache_control`→GPT-5.6 Responses breakpoint 有限桥接。
-实现见 [`AnthropicAdapter.convert_request`](../../src/rotor/adapters/protocol/anthropic.py)。
+实现见 [`AnthropicAdapter.convert_request`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/anthropic.py)。
 
 ### 6.3 Responses native-only 能力
 
@@ -607,8 +608,8 @@ body 记录。
 
 Responses 路由会用 `responses_required_capabilities` 标记
 `responses_native`，并优先 native candidate；函数工具等基础请求仍可使用转换候选。
-实现见 [`responses_required_capabilities`](../../src/rotor/adapters/protocol/responses.py)
-和 [`create_response`](../../src/rotor/api/v1/responses.py)。
+实现见 [`responses_required_capabilities`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py)
+和 [`create_response`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/responses.py)。
 
 ### 6.4 不可无损转换的字段
 
@@ -661,7 +662,7 @@ Anthropic 的 `thinking`/签名 block、cache_control 精细结构、beta 扩展
 | `error` | 适配器转为异常，入口生成 `event:error` 的 `stream_error` | overload 抛 `UpstreamOverloaded`，其他错误抛 RuntimeError |
 
 Chat/OpenAI 上游 → Anthropic 客户端则由
-[`OpenAIToAnthropicStreamConverter`](../../src/rotor/api/v1/anthropic.py)
+[`OpenAIToAnthropicStreamConverter`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/anthropic.py)
 反向生成 `content_block_*`、`message_delta` 和 `message_stop`；它不是 provider 原始
 事件的字节级转发。
 
@@ -675,7 +676,7 @@ Chat/OpenAI 上游 → Anthropic 客户端则由
 2. **Factory**：每次 attempt 调用 `AdapterFactory.create_adapter(channel, http_client)`。
    当 `channel.protocol` 为 `responses`/`openai_responses` 时，无论 `channel.type` 是
    什么都选择 `OpenAIResponsesAdapter`
-   ([`factory.py`](../../src/rotor/adapters/factory.py))。
+   ([`factory.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/factory.py))。
 3. **URL、headers、model**：适配器使用 `extra.request_path` 或 `/responses`，通过
    `join_api_url` 拼接 `base_url`；`provider_headers` 生成 Bearer（或显式 auth_type），
    `model_mapping[logical_model]` 得到 provider model。流式请求加
@@ -683,7 +684,7 @@ Chat/OpenAI 上游 → Anthropic 客户端则由
 4. **请求转换**：`OpenAIResponsesAdapter.convert_request` 调用
    `chat_request_to_responses_payload`，把 system→developer、消息→message item、
    tool call→function_call、tool→function_call_output，并映射 tools/choice/max tokens。
-   实现见 [`responses.py`](../../src/rotor/adapters/protocol/responses.py)。
+   实现见 [`responses.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py)。
 5. **上游调用**：`BaseAdapter.make_request` POST 配置的 `request_path`（默认
    `/responses`）；非流式读取 JSON，流式保持 response stream。
 6. **非流式响应**：Responses adapter 的 `convert_response` 看到请求没有
@@ -700,9 +701,9 @@ Chat/OpenAI 上游 → Anthropic 客户端则由
    流失败包装，不会透明重放已发送内容。Responses 资源型状态请求则必须返回原生
    Channel，不能靠跨 provider fallback 维持状态链。
 
-对照源码：入口和 attempt 在 [`chat.py`](../../src/rotor/api/v1/chat.py)，
-非流式/流式公共处理在 [`chat.py`](../../src/rotor/api/v1/chat.py) 与
-[`chat.py`](../../src/rotor/api/v1/chat.py)。
+对照源码：入口和 attempt 在 [`chat.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/chat.py)，
+非流式/流式公共处理在 [`chat.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/chat.py) 与
+[`chat.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/chat.py)。
 
 ## 9. 错误、终止、fallback 与原始 SSE 日志
 
@@ -716,13 +717,13 @@ Chat/OpenAI 上游 → Anthropic 客户端则由
 
 Native Responses 还可能出现 `response.failed`、`response.cancelled`、
 `response.incomplete`；网关会延迟 terminal event，先完成 usage 记账再发出，避免
-客户端在 SQLite 清理前断开，见 [`chat.py`](../../src/rotor/api/v1/chat.py)。
+客户端在 SQLite 清理前断开，见 [`chat.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/chat.py)。
 
 ### 9.2 `Responses upstream stream failed` 来源
 
 `OpenAIResponsesAdapter._stream_error_details` 在 Responses `error` 或
 `response.failed` 事件没有可读 message 时使用固定文本 `Responses upstream stream failed`
-([`responses.py`](../../src/rotor/adapters/protocol/responses.py))。它还会读取
+([`responses.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py))。它还会读取
 顶层或嵌套的 `code`/`type`，overload 信号会抛出 `UpstreamOverloaded`，其他错误抛
 带 `error_type` 属性的 `RuntimeError`。这不是 provider 原始错误的规范化保证。
 向上层格式化时，`format_error_message` 可能显示为 `RuntimeError: Responses upstream stream failed`。
@@ -777,7 +778,7 @@ data: {"type":"error","error":{"type":"stream_error","message":"upstream failed"
   `event:error`），不会重放已经发出的文本或工具副作用。
 - **流式已向客户端发出部分内容后**：不再换 Channel；客户端应把错误视为本次流失败。
 
-具体 fallback 判定由 [`fallback.py`](../../src/rotor/gateway/fallback.py) 的
+具体 fallback 判定由 [`fallback.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/gateway/fallback.py) 的
 `should_fallback` 决定，不能仅凭 HTTP 状态码推断所有结果。
 
 ### 9.4 Responses 原始逐行日志范围
@@ -787,7 +788,7 @@ Responses adapter 的 `_logged_sse_lines` 在解析前以 INFO 记录 `aiter_lin
 和 `[DONE]`；收到 `[DONE]` 后停止消费，因此后续行不会记录；并记录 start、正常 EOF
 （`reason=eof`）或迭代异常。日志包含 request/channel/model/provider_model/
 request_protocol/provider_protocol 上下文，测试见
-[`test_responses_stream_logs_each_raw_sse_line_at_info`](../../tests/test_responses_protocol.py)。
+[`test_responses_stream_logs_each_raw_sse_line_at_info`](https://github.com/SyJarvis/rotor/blob/main/tests/test_responses_protocol.py)。
 
 该日志只覆盖 `OpenAIResponsesAdapter.stream_convert_response` 创建流的路径：Chat→Responses、
 Responses 原生 create，以及 Anthropic 入站请求选到 Responses Channel 的转换流；不覆盖
@@ -799,8 +800,8 @@ Responses retrieve 的 relay、Images、普通 Chat adapter 或 Anthropic adapte
 
 这只是当前诊断实现：日志级别、采样、保留周期、敏感字段脱敏和完整性都未形成协议
 保证；不要把“已记录原始行”解释为通用抓包或合规审计存档。迭代断开时对应的
-`Responses SSE exception` 由 [`responses.py`](../../src/rotor/adapters/protocol/responses.py)
-记录，测试见 [`test_responses_stream_logs_upstream_iteration_exception`](../../tests/test_responses_protocol.py)。
+`Responses SSE exception` 由 [`responses.py`](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py)
+记录，测试见 [`test_responses_stream_logs_upstream_iteration_exception`](https://github.com/SyJarvis/rotor/blob/main/tests/test_responses_protocol.py)。
 
 解析器按单行 `data:` JSON 处理，不保证把多行 SSE data 合并；因此“完整”仅指已消费的
 逻辑行诊断，不是原始字节或完整事件抓包。
@@ -812,31 +813,31 @@ relay 增加同类记录；当前实现不是全链路完整日志。
 
 ### Schema 与适配器
 
-- [Chat/Anthropic schema](../../src/rotor/schemas/request.py)
-- [Responses schema](../../src/rotor/schemas/responses.py)
-- [Responses adapter 与转换器](../../src/rotor/adapters/protocol/responses.py)
-- [Chat↔Anthropic converter](../../src/rotor/adapters/protocol/converter.py)
-- [Anthropic adapter](../../src/rotor/adapters/protocol/anthropic.py)
-- [Adapter Factory](../../src/rotor/adapters/factory.py)
-- [Base adapter 与 headers/URL](../../src/rotor/adapters/base.py)
-- [Provider presets](../../src/rotor/channels/presets.py)
+- [Chat/Anthropic schema](https://github.com/SyJarvis/rotor/blob/main/src/rotor/schemas/request.py)
+- [Responses schema](https://github.com/SyJarvis/rotor/blob/main/src/rotor/schemas/responses.py)
+- [Responses adapter 与转换器](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/responses.py)
+- [Chat↔Anthropic converter](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/converter.py)
+- [Anthropic adapter](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/protocol/anthropic.py)
+- [Adapter Factory](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/factory.py)
+- [Base adapter 与 headers/URL](https://github.com/SyJarvis/rotor/blob/main/src/rotor/adapters/base.py)
+- [Provider presets](https://github.com/SyJarvis/rotor/blob/main/src/rotor/channels/presets.py)
 
 ### API 路由
 
-- [Chat route](../../src/rotor/api/v1/chat.py)
-- [Responses route](../../src/rotor/api/v1/responses.py)
-- [Anthropic route](../../src/rotor/api/v1/anthropic.py)
+- [Chat route](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/chat.py)
+- [Responses route](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/responses.py)
+- [Anthropic route](https://github.com/SyJarvis/rotor/blob/main/src/rotor/api/v1/anthropic.py)
 - [客户端 API 参考](../reference/client-api.md)
 - [Channel 字段参考](../reference/channel-schema.md)
 
 ### 关键测试
 
-- [Responses protocol tests](../../tests/test_responses_protocol.py)
-- [Anthropic protocol tests](../../tests/test_anthropic_protocol.py)
-- [Channel preset/URL/header tests](../../tests/test_channel_presets.py)
-- [OpenAI SDK compatibility tests](../../tests/test_openai_sdk.py)
-- [Client session/header tests](../../tests/test_client_session.py)
-- [Chat/Responses/Anthropic API tests](../../tests)
+- [Responses protocol tests](https://github.com/SyJarvis/rotor/blob/main/tests/test_responses_protocol.py)
+- [Anthropic protocol tests](https://github.com/SyJarvis/rotor/blob/main/tests/test_anthropic_protocol.py)
+- [Channel preset/URL/header tests](https://github.com/SyJarvis/rotor/blob/main/tests/test_channel_presets.py)
+- [OpenAI SDK compatibility tests](https://github.com/SyJarvis/rotor/blob/main/tests/test_openai_sdk.py)
+- [Client session/header tests](https://github.com/SyJarvis/rotor/blob/main/tests/test_client_session.py)
+- [Chat/Responses/Anthropic API tests](https://github.com/SyJarvis/rotor/blob/main/tests)
 
 ## 限制与维护提示
 

@@ -32,17 +32,6 @@ class AdapterFactory:
     }
 
     @classmethod
-    def register_adapter(cls, provider_type: str, adapter_class: Type[BaseAdapter]) -> None:
-        """
-        Register a new adapter type.
-
-        Args:
-            provider_type: The provider type identifier
-            adapter_class: The adapter class
-        """
-        cls._adapters[provider_type] = adapter_class
-
-    @classmethod
     def create_adapter(
         cls,
         channel: Channel,

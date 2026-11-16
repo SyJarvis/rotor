@@ -53,18 +53,3 @@ class ResponsesUsage(BaseModel):
     input_tokens_details: dict[str, Any] | None = None
     output_tokens_details: dict[str, Any] | None = None
 
-
-class ResponsesResponse(BaseModel):
-    """Loose response envelope used for contract validation in tests/tools."""
-
-    model_config = ConfigDict(extra="allow")
-
-    id: str
-    object: str = "response"
-    created_at: int
-    status: str
-    model: str | None = None
-    output: list[dict[str, Any]] = Field(default_factory=list)
-    usage: ResponsesUsage | None = None
-    error: dict[str, Any] | None = None
-    incomplete_details: dict[str, Any] | None = None

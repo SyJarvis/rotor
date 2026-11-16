@@ -337,6 +337,15 @@ pytest -q
 - [日志、用量与数据存储](gitbook/operations/observability.md)
 - [数据库与迁移](gitbook/development/database-migrations.md)
 
+文档站位于 `site/`，直接以 `gitbook/` 为内容源：
+
+```bash
+cd site
+npm install
+npm run dev      # 本地预览
+npm run build    # 产物写入 site/dist
+```
+
 ## License
 
 [MIT](LICENSE)
